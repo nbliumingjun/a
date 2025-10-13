@@ -1,3 +1,5 @@
+import queue
+import traceback
 import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,hashlib,importlib,glob,shutil,math,zlib
 from pathlib import Path
 os.environ["QT_ENABLE_HIGHDPI_SCALING"]="1"
@@ -76,6 +78,29 @@ def deps_check():
         json.dump(d,f,ensure_ascii=False,indent=2)
         f.flush()
         os.fsync(f.fileno())
+def ensure_models():
+    try:
+        if not os.path.exists(models_dir):
+            os.makedirs(models_dir,exist_ok=True)
+        files=[p for p in os.listdir(models_dir) if p.lower().endswith('.npz') or p.lower().endswith('.pt') or p.lower().endswith('.pth')]
+        if files:
+            return
+        p=default_model_path()
+        cm=ClickModel()
+        try:
+            cm.W1=None
+            cm.save(p)
+        except:
+            pass
+        try:
+            m=ModelMeta.read()
+            m['version']=int(m.get('version',0))+1
+            m['updated_at']=time.strftime('%Y-%m-%d %H:%M:%S')
+            ModelMeta.write(m)
+        except:
+            pass
+    except:
+        pass
 deps_check()
 import numpy as np
 import cv2
@@ -115,8 +140,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-if not os.path.exists(models_dir) or len(os.listdir(models_dir))==0:
-    _msgbox("模型提示","models 目录不存在或为空")
+ensure_models()
 def today_dir():
     d=time.strftime("%Y%m%d")
     td=os.path.join(exp_dir,d)
@@ -178,7 +202,7 @@ class JSONLWriter:
                         s=line.decode("utf-8")
                         obj=json.loads(s)
                         c=obj.get("crc",None)
-                        if c is not None and int(c)!=JSONLWriter._crc_of(obj):
+                        if c is not None and str(c)!=JSONLWriter._crc_of(obj):
                             break
                         okoff=off
                     except:
@@ -247,6 +271,24 @@ class DiskManager:
             t=DiskManager.total_bytes()
             if t<=cap*0.85:
                 break
+        if t>cap:
+            files=[]
+            for r,_,fs in os.walk(exp_dir):
+                for n in fs:
+                    try:
+                        p=os.path.join(r,n)
+                        files.append((os.path.getmtime(p),p))
+                    except:
+                        pass
+            files.sort()
+            for _,p in files:
+                try:
+                    os.remove(p)
+                except:
+                    pass
+                t=DiskManager.total_bytes()
+                if t<=cap*0.85:
+                    break
 class ClickModel:
     def __init__(self):
         self.W1=None
@@ -589,6 +631,11 @@ class State(QObject):
     MARK=0x22ACE777
     def __init__(self):
         super().__init__()
+        self.io_q=queue.Queue(maxsize=1024)
+        self.io_thread=threading.Thread(target=self._io_worker,daemon=True)
+        self.io_thread.start()
+        self.prev_lock=threading.Lock()
+        self.rect_lock=threading.Lock()
         self.mode="learning"
         self.last_user_activity=time.time()
         self.selected_hwnd=None
@@ -786,6 +833,19 @@ class State(QObject):
         x=int(max(x1+self.block_margin_px,min(x2-1-self.block_margin_px,x)))
         y=int(max(y1+self.block_margin_px,min(y2-1-self.block_margin_px,y)))
         return x,y
+    def _io_worker(self):
+        while True:
+            it=self.io_q.get()
+            if it is None:
+                break
+            p,buf=it
+            try:
+                with open(p,"wb") as f:
+                    buf.tofile(f)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except:
+                pass
     def _scale2560(self,x,y,cw,ch):
         sx=int(max(0,min(2560,round(x*2560.0/max(1,cw)))))
         sy=int(max(0,min(1600,round(y*1600.0/max(1,ch)))))
@@ -816,15 +876,13 @@ class State(QObject):
             ok,buf=cv2.imencode(".png",resized,[int(cv2.IMWRITE_PNG_COMPRESSION),self.png_comp])
             if not ok:
                 return None
-            with open(path,"wb") as f:
-                buf.tofile(f)
-                f.flush()
-                os.fsync(f.fileno())
+            self.io_q.put((path,buf))
             dx,dy=_dpi_for_hwnd(self.selected_hwnd if self.selected_hwnd else 0)
             src="user" if mode=="learning" else "ai"
             rec={"id":fid,"ts":now,"source":src,"mode":mode,"window_title":self.selected_title,"rect":[0,0,2560,1600],"dpi":[int(dx),int(dy)],"path":path,"filename":f"{fid}.png","w":2560,"h":1600,"session_id":self.session_id}
             self.frames_writer.append(rec)
-            self.prev_img=img.copy()
+            with self.prev_lock:
+                self.prev_img=img.copy()
             self._last_f_ts=now
             return fid
         except:
@@ -1053,7 +1111,8 @@ class MouseInjector:
                 except:
                     pass
                 return False
-            self.move_abs(x,y)
+            bx,by=self.st.clamp_abs(int(x),int(y))
+            self.move_abs(bx,by)
             time.sleep(step_delay)
         return True
 class LowLevelHook(threading.Thread):
@@ -1136,11 +1195,6 @@ class LowLevelHook(threading.Thread):
                         btn="middle"
                         pressed=False
                     elif wParam==self.WM_MOUSEWHEEL:
-                        if not injected and self.within(x,y) and self.st.mode=="training":
-                            delta=ctypes.c_short(ms.mouseData>>16).value
-                            img=self.st.capture_client()
-                            rid=self.st.record_frame(img,"training",force=True)
-                            self.st.record_op("user","wheel",time.time(),x,y,time.time(),x,y,[("scroll",0,int(delta),1)],rid,1,1,[rid] if rid else [])
                         return self.user32.CallNextHookEx(self.hMouse,nCode,wParam,lParam)
                     if btn is not None and pressed is not None and not injected:
                         if pressed:
@@ -1288,14 +1342,31 @@ class TrainerThread(threading.Thread):
                 try:
                     if self.st.interrupt_ai:
                         break
-                    steps=max(6,int(self.st.fps*0.4))
-                    path=[(int(bx),int(by)) for _ in range(steps)]
+                    try:
+                        cx,cy=win32api.GetCursorPos()
+                    except:
+                        cx,cy=bx,by
+                    n=max(10,int(self.st.fps*0.6))
                     t0=time.time()
-                    self.inj.move_path(path,step_delay=max(0.005,0.25/self.st.fps))
-                    if self.st.interrupt_ai:
+                    mv=[]
+                    import random
+                    c1x=cx+(bx-cx)*0.3+random.uniform(-12,12)
+                    c1y=cy+(by-cy)*0.3+random.uniform(-12,12)
+                    c2x=cx+(bx-cx)*0.7+random.uniform(-12,12)
+                    c2y=cy+(by-cy)*0.7+random.uniform(-12,12)
+                    pts=[]
+                    for i in range(1,n+1):
+                        u=i/float(n)
+                        ux= (1-u)**3*cx + 3*(1-u)**2*u*c1x + 3*(1-u)*u**2*c2x + u**3*bx
+                        uy= (1-u)**3*cy + 3*(1-u)**2*u*c1y + 3*(1-u)*u**2*c2y + u**3*by
+                        pts.append((int(ux),int(uy)))
+                    ok=self.inj.move_path(pts,step_delay=max(0.004,0.2/self.st.fps))
+                    for (px,py) in pts:
+                        mv.append((time.time(),px,py,1))
+                    if not ok or self.st.interrupt_ai:
                         break
                     self.inj.down(btn)
-                    mv=[(time.time(),bx,by,1)]
+                    mv.append((time.time(),bx,by,1))
                     time.sleep(0.02)
                     self.inj.up(btn)
                     t1=time.time()
@@ -1407,6 +1478,7 @@ class Main(QMainWindow):
     finish_opt=Signal(bool)
     def __init__(self):
         super().__init__()
+self.last_model_prompt=0
         self.setWindowTitle("智能学习与训练")
         self.state=State()
         self.selector=WindowSelector()
@@ -1429,6 +1501,14 @@ class Main(QMainWindow):
         self.progress=QProgressBar()
         self.progress.setRange(0,100)
         self.progress.setValue(0)
+        self.pcpu=QProgressBar()
+        self.pmem=QProgressBar()
+        self.pgpu=QProgressBar()
+        self.pvram=QProgressBar()
+        for pb in [self.pcpu,self.pmem,self.pgpu,self.pvram]:
+            pb.setRange(0,100)
+            pb.setFixedHeight(8)
+            pb.setTextVisible(False)
         self.preview_label=QLabel()
         self.preview_label.setFixedSize(QSize(640,400))
         lt=QHBoxLayout(top)
@@ -1453,6 +1533,10 @@ class Main(QMainWindow):
         lb.addStretch(1)
         lb.addWidget(self.lbl_tip,2)
         lb.addWidget(self.progress,2)
+        lb.addWidget(self.pcpu,1)
+        lb.addWidget(self.pmem,1)
+        lb.addWidget(self.pgpu,1)
+        lb.addWidget(self.pvram,1)
         root=QVBoxLayout()
         root.addWidget(top)
         root.addWidget(mid,1)
@@ -1481,6 +1565,9 @@ class Main(QMainWindow):
         self.fps_timer=QTimer(self)
         self.fps_timer.timeout.connect(self.on_tick_fps)
         self.fps_timer.start(500)
+        self.usage_timer=QTimer(self)
+        self.usage_timer.timeout.connect(self.on_usage)
+        self.usage_timer.start(1000)
         self.learning_thread=None
         self.training_thread=None
         self._optim_flag=threading.Event()
@@ -1529,6 +1616,8 @@ class Main(QMainWindow):
         if hwnd:
             self.state.set_window(hwnd,key)
     def set_mode(self,mode):
+        if self.state.optimizing:
+            return
         if mode==self.state.mode and self.state.running:
             return
         self.state.stop_event.set()
@@ -1552,20 +1641,63 @@ class Main(QMainWindow):
             self.state.signal_mode.emit("训练")
             self.training_thread=TrainerThread(self.state,self)
             self.training_thread.start()
-    def on_tick_mode(self):
-        if not self.state.running or self.state.optimizing:
-            return
-        t=time.time()-self.state.last_user_activity
-        if self.state.mode=="learning":
-            if t>=self.state.idle_timeout and self.state.selected_hwnd:
-                self.set_mode("training")
-        else:
-            if self.state.interrupt_ai:
-                self.state.interrupt_ai=False
-                self.set_mode("learning")
+    def _poll_user_activity(self):
+    try:
+        cx,cy=win32api.GetCursorPos()
+    except:
+        return
+    if not hasattr(self,"_last_pos"):
+        self._last_pos=(cx,cy)
+    if self._last_pos!=(cx,cy):
+        self.state.last_user_activity=time.time()
+        if self.state.mode=="training":
+            self.state.interrupt_ai=True
+            self.state.signal_mode.emit("学习")
+    self._last_pos=(cx,cy)
+    ks=[0x01,0x02,0x04,0x05,0x06,0x0D,0x10,0x11,0x12,0x1B,0x20,0x25,0x26,0x27,0x28]
+    for vk in ks:
+        try:
+            if ctypes.windll.user32.GetAsyncKeyState(vk)&0x8000:
+                self.state.last_user_activity=time.time()
+                if self.state.mode=="training":
+                    self.state.interrupt_ai=True
+                    self.state.signal_mode.emit("学习")
+                break
+        except:
+            break
+def on_tick_mode(self):
+    if not self.state.running or self.state.optimizing:
+        return
+    self._poll_user_activity()
+    t=time.time()-self.state.last_user_activity
+    if self.state.mode=="learning":
+        if t>=self.state.idle_timeout and self.state.selected_hwnd and self.state.model_exists():
+            self.set_mode("training")
+    else:
+        if self.state.interrupt_ai:
+            self.state.interrupt_ai=False
+            self.set_mode("learning")
     def on_tick_fps(self):
         self.lbl_fps.setText(f"FPS:{int(self.state.fps)}")
+    def on_usage(self):
+        try:
+            import psutil
+            cpu=int(psutil.cpu_percent())
+            mem=int(psutil.virtual_memory().percent)
+        except:
+            cpu=0
+            mem=0
+        gu,gm=_gpu_util_mem()
+        gpu=int(gu if isinstance(gu,int) else (0 if gu is None else int(gu)))
+        vram=int(gm if isinstance(gm,(int,float)) else (0 if gm is None else int(gm)))
+        self.pcpu.setValue(cpu)
+        self.pmem.setValue(mem)
+        self.pgpu.setValue(gpu)
+        self.pvram.setValue(vram)
     def on_toggle(self):
+        if self.state.optimizing:
+            QMessageBox.information(self,"提示","优化进行中，无法切换")
+            return
         if self.state.running:
             self.state.running=False
             self.state.stop_event.set()
@@ -1596,86 +1728,36 @@ class Main(QMainWindow):
         self.state.running=True
         self.set_mode("learning")
     def on_ui(self):
-        if not self.state.selected_hwnd:
-            QMessageBox.information(self,"提示","未选择窗口")
-            return
-        img=self.state.capture_client()
-        if img is None:
-            QMessageBox.information(self,"提示","无法获取窗口画面")
-            return
-        out=cv2.resize(img,(1280,800))
-        hm=self.state.heat_from_events(2560,1600)
-        if hm is not None:
-            hmn=cv2.resize((hm*255).astype(np.uint8),(1280,800))
-            hmc=cv2.applyColorMap(hmn,cv2.COLORMAP_JET)
-            out=cv2.addWeighted(out,0.65,hmc,0.35,0)
-        pts=self.state.salient_points(cv2.resize(img,(2560,1600)))
-        for i,(x,y,_) in enumerate(pts[:100]):
-            xx=int(x*1280/2560)
-            yy=int(y*800/1600)
-            cv2.circle(out,(xx,yy),3,(0,255,0),-1)
-        d=os.path.join(exp_dir,self.state.day_tag,"ui_summary.json")
-        zones=[]
-        clicks=0
-        tm0=None
-        tm1=None
-        if hm is not None:
-            thr=np.percentile(hm[hm>0],90) if np.any(hm>0) else 0.0
-            mask=(hm>=thr).astype(np.uint8)*255
-            cnts,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-            evs=[]
-            try:
-                with open(self.state.events_path,"r",encoding="utf-8") as f:
-                    for line in f:
-                        try:
-                            e=json.loads(line)
-                            if e.get("source")!="user":
-                                continue
-                            if e.get("window_title")!=self.state.selected_title:
-                                continue
-                            if e.get("type") not in ["left","right","middle"]:
-                                continue
-                            evs.append(e)
-                        except:
-                            pass
-            except:
-                pass
-            for c in cnts:
-                x,y,w,h=cv2.boundingRect(c)
-                if w*h<50:
-                    continue
-                cx0=float(x)/2560.0
-                cy0=float(y)/1600.0
-                cx1=float(x+w)/2560.0
-                cy1=float(y+h)/1600.0
-                hot=float(np.mean(hm[y:y+h,x:x+w]))
-                cnt=0
-                tmin=None
-                tmax=None
-                for e in evs:
-                    px=int(e.get("press_lx",0))
-                    py=int(e.get("press_ly",0))
-                    if px>=x and px<x+w and py>=y and py<y+h:
-                        cnt+=1
-                        tt=e.get("press_t") or e.get("ts") or 0
-                        tmin=tt if tmin is None else min(tmin,tt)
-                        tmax=tt if tmax is None else max(tmax,tt)
-                clicks+=cnt
-                if tm0 is None or (tmin is not None and tmin<tm0):
-                    tm0=tmin
-                if tm1 is None or (tmax is not None and tmax>tm1):
-                    tm1=tmax
-                zones.append({"bbox_abs":[int(x),int(y),int(x+w),int(y+h)],"bbox_rel":[cx0,cy0,cx1,cy1],"hot":hot,"clicks":int(cnt)})
-                cv2.rectangle(out,(int(x*1280/2560),int(y*800/1600)),(int((x+w)*1280/2560),int((y+h)*800/1600)),(0,255,255),1)
-        with open(d,"w",encoding="utf-8") as f:
-            json.dump({"window":self.state.selected_title,"zones":zones,"time":time.time(),"total_clicks":int(clicks),"time_span":[tm0,tm1]},f,ensure_ascii=False,indent=2)
-        ok,buf=cv2.imencode(".png",out,[int(cv2.IMWRITE_PNG_COMPRESSION),3])
-        if ok:
-            outdir=os.path.join(exp_dir,self.state.day_tag)
-            p=os.path.join(outdir,f"ui_{int(time.time())}.png")
-            with open(p,"wb") as f:
-                buf.tofile(f)
-        QMessageBox.information(self,"提示","UI识别完成")
+    if not self.state.selected_hwnd:
+        QMessageBox.information(self,"提示","未选择窗口")
+        return
+    img=self.state.capture_client()
+    if img is None:
+        QMessageBox.information(self,"提示","无法获取窗口画面")
+        return
+    base=cv2.resize(img,(1280,800))
+    over=base.copy()
+    hm=self.state.heat_from_events(2560,1600)
+    if hm is not None:
+        hmn=cv2.resize((hm*255).astype(np.uint8),(1280,800))
+        hmc=cv2.applyColorMap(hmn,cv2.COLORMAP_JET)
+        over=cv2.addWeighted(over,0.6,hmc,0.4,0)
+    rsz=cv2.resize(img,(2560,1600))
+    mh=self.state.model_click.heatmap(rsz)
+    if mh is not None:
+        mhn=cv2.resize((mh*255).astype(np.uint8),(1280,800))
+        mhc=cv2.applyColorMap(mhn,cv2.COLORMAP_TURBO)
+        over=cv2.addWeighted(over,0.7,mhc,0.3,0)
+    pts=self.state.local_maxima(mh if mh is not None else self.state.spectral_saliency(rsz),top=40,dist=12)
+    for (px,py,_) in pts[:40]:
+        x=int(px*1280/2560)
+        y=int(py*800/1600)
+        cv2.circle(over,(x,y),6,(255,255,255),1)
+        cv2.circle(over,(x,y),3,(0,0,0),-1)
+    h,w=over.shape[:2]
+    qi=QImage(over.data,w,h,3*w,QImage.Format_BGR888)
+    self.preview_label.setPixmap(QPixmap.fromImage(qi).scaled(self.preview_label.size(),Qt.KeepAspectRatio,Qt.SmoothTransformation))
+    self.lbl_tip.setText("UI识别完成")
 def main():
     app=QApplication(sys.argv)
     w=Main()
