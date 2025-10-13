@@ -1379,18 +1379,21 @@ class OptimizerThread(threading.Thread):
                 return
             cm=ClickModel()
             ok1,stat1=cm.fit_from_logs(events,frames,where_title=self.st.selected_title)
-            self.st.signal_optprog.emit(85,"训练点击模型")
             if self.cancel_flag.is_set():
                 self._done(False)
                 return
-            if ok1:
-                p=self.st.title_model_path()
-                npz_tmp=p+".tmp"
-                try:
-                    cm.save(npz_tmp)
-                    shutil.move(npz_tmp,p)
-                except:
-                    pass
+            if not ok1:
+                self.st.signal_optprog.emit(100,"训练失败")
+                self._done(False)
+                return
+            self.st.signal_optprog.emit(85,"训练点击模型")
+            p=self.st.title_model_path()
+            npz_tmp=p+".tmp"
+            try:
+                cm.save(npz_tmp)
+                shutil.move(npz_tmp,p)
+            except:
+                pass
             self.st.load_model_hot()
             ModelMeta.update([self.st.title_model_path()],{"start":tsmin,"end":tsmax})
             self.st.signal_optprog.emit(100,"完成")
@@ -1413,7 +1416,7 @@ class Main(QMainWindow):
         mid=QWidget()
         bot=QWidget()
         self.cmb=QComboBox()
-        self.btn_toggle=QPushButton("开始")
+        self.btn_toggle=QPushButton("停止" if self.state.running else "开始")
         self.btn_opt=QPushButton("优化")
         self.btn_ui=QPushButton("UI识别")
         self.chk_preview=QCheckBox("预览")
@@ -1668,28 +1671,15 @@ class Main(QMainWindow):
             json.dump({"window":self.state.selected_title,"zones":zones,"time":time.time(),"total_clicks":int(clicks),"time_span":[tm0,tm1]},f,ensure_ascii=False,indent=2)
         ok,buf=cv2.imencode(".png",out,[int(cv2.IMWRITE_PNG_COMPRESSION),3])
         if ok:
-            prev=os.path.join(exp_dir,self.state.day_tag,"ui_preview.png")
-            with open(prev,"wb") as f:
+            outdir=os.path.join(exp_dir,self.state.day_tag)
+            p=os.path.join(outdir,f"ui_{int(time.time())}.png")
+            with open(p,"wb") as f:
                 buf.tofile(f)
-        QMessageBox.information(self,"提示","UI识别完成，已输出ui_summary.json")
-    def closeEvent(self,e):
-        try:
-            self.state.stop_event.set()
-            self.state.running=False
-            self.hook.stop()
-            if self.learning_thread and self.learning_thread.is_alive():
-                self.learning_thread.join(timeout=1.2)
-            if self.training_thread and self.training_thread.is_alive():
-                self.training_thread.join(timeout=1.2)
-            if self.hook and self.hook.is_alive():
-                self.hook.join(timeout=1.2)
-        except:
-            pass
-        e.accept()
+        QMessageBox.information(self,"提示","UI识别完成")
 def main():
     app=QApplication(sys.argv)
     w=Main()
-    w.resize(980,720)
+    w.resize(900,640)
     w.show()
     sys.exit(app.exec())
 if __name__=="__main__":
