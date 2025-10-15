@@ -850,7 +850,7 @@ class State(QObject):
         self.selected_hwnd=None
         self.selected_title=""
         self.session_id=str(uuid.uuid4())
-        self.running=True
+        self.running=False
         self.training_thread=None
         self.learning_thread=None
         self.optimizing=False
@@ -2134,7 +2134,6 @@ class Main(QMainWindow):
         mid=QWidget()
         bot=QWidget()
         self.cmb=QComboBox()
-        self.btn_toggle=QPushButton("停止" if self.state.running else "开始")
         self.btn_opt=QPushButton("优化")
         self.btn_ui=QPushButton("UI识别")
         self.chk_preview=QCheckBox("预览")
@@ -2148,17 +2147,18 @@ class Main(QMainWindow):
         self.progress.setRange(0,100)
         self.progress.setValue(0)
         self.progress.setTextVisible(True)
+        self.progress.setFormat("0%")
         self.model_progress=QProgressBar()
         self.model_progress.setRange(0,100)
         self.model_progress.setValue(0)
         self.model_progress.setTextVisible(True)
+        self.model_progress.setFormat("0%")
         self.preview_label=QLabel()
         self.preview_label.setFixedSize(QSize(640,400))
         self.ui_list=QListWidget()
         self.ui_list.setMaximumHeight(140)
         lt=QHBoxLayout(top)
         lt.addWidget(self.cmb,1)
-        lt.addWidget(self.btn_toggle)
         lt.addWidget(self.btn_opt)
         lt.addWidget(self.btn_ui)
         lt.addWidget(self.chk_preview)
@@ -2187,7 +2187,6 @@ class Main(QMainWindow):
         box=QWidget()
         box.setLayout(root)
         self.setCentralWidget(box)
-        self.btn_toggle.clicked.connect(self.on_toggle)
         self.btn_opt.clicked.connect(self.on_opt)
         self.btn_ui.clicked.connect(self.on_ui)
         self.chk_preview.stateChanged.connect(self.on_preview_changed)
@@ -2246,10 +2245,16 @@ class Main(QMainWindow):
         self.lbl_tip.setText(s)
     def on_optprog(self,val,txt):
         self.progress.setValue(int(val))
-        self.progress.setFormat(str(txt))
+        info=f"{int(val)}%"
+        if txt:
+            info=f"{info} {txt}"
+        self.progress.setFormat(info)
     def on_modelprog(self,val,txt):
         self.model_progress.setValue(int(val))
-        self.model_progress.setFormat(str(txt))
+        info=f"{int(val)}%"
+        if txt:
+            info=f"{info} {txt}"
+        self.model_progress.setFormat(info)
     def on_ui_ready(self,items):
         self.ui_list.clear()
         for it in items[:30]:
@@ -2273,13 +2278,17 @@ class Main(QMainWindow):
         hwnd=self.selector.map.get(key)
         if hwnd:
             self.state.set_window(hwnd,key)
-    def set_mode(self,mode):
+    def set_mode(self,mode,force=False):
         if not self.state.model_ready_event.is_set():
             return
         if self.state.optimizing:
             return
-        if mode==self.state.mode and self.state.running:
+        if not self.state.running:
             return
+        if mode==self.state.mode and not force:
+            thread=self.learning_thread if mode=="learning" else self.training_thread
+            if thread and thread.is_alive():
+                return
         self.state.stop_event.set()
         time.sleep(0.05)
         self.state.stop_event.clear()
@@ -2351,26 +2360,6 @@ class Main(QMainWindow):
         if gu is not None:
             info+=f" GPU:{int(gu)}% VRAM:{int(gm)}%"
         self.statusBar().showMessage(info)
-    def on_toggle(self):
-        if self.state.optimizing:
-            QMessageBox.information(self,"提示","优化进行中，无法切换")
-            return
-        if self.state.running:
-            self.state.running=False
-            self.state.stop_event.set()
-            self.btn_toggle.setText("开始")
-            self.lbl_tip.setText("已停止")
-        else:
-            try:
-                self.state.wait_model()
-            except ModelIntegrityError as e:
-                QMessageBox.critical(self,"错误",str(e))
-                return
-            self.state.running=True
-            self.state.stop_event.clear()
-            self.btn_toggle.setText("停止")
-            self.lbl_tip.setText("运行中")
-            self.set_mode("learning")
     def on_opt(self):
         if self.state.optimizing:
             return
@@ -2381,12 +2370,13 @@ class Main(QMainWindow):
             return
         self.state.stop_event.set()
         self.state.running=False
-        self.btn_toggle.setText("开始")
         self.btn_opt.setEnabled(False)
         self.progress.setValue(0)
+        self.progress.setFormat("0%")
         self.lbl_mode.setText("优化中")
         self.state.signal_mode.emit("优化中")
         self._optim_flag.clear()
+        self.lbl_tip.setText("正在离线优化")
         th=OptimizerThread(self.state,self,self._on_opt_done,self._optim_flag)
         th.start()
     def _on_opt_done(self,ok):
@@ -2396,15 +2386,11 @@ class Main(QMainWindow):
         QMessageBox.information(self,"提示",msg)
         self.btn_opt.setEnabled(True)
         self.progress.setValue(0)
-        if ok:
-            self.state.stop_event.clear()
-            self.state.running=True
-            self.btn_toggle.setText("停止")
-            self.lbl_tip.setText("运行中")
-            self.set_mode("learning")
-        else:
-            self.lbl_tip.setText("优化失败")
-            self.btn_toggle.setText("开始")
+        self.progress.setFormat("0%")
+        self.state.stop_event.clear()
+        self.state.running=True
+        self.lbl_tip.setText("优化完成，已恢复学习" if ok else "优化失败，继续使用现有模型")
+        self.set_mode("learning",force=True)
     def on_ui(self):
         if not self.state.selected_hwnd:
             QMessageBox.information(self,"提示","未选择窗口")
@@ -2425,7 +2411,10 @@ class Main(QMainWindow):
             self.lbl_tip.setText(f"模型错误:{self.state.model_error}")
             QMessageBox.critical(self,"错误",self.state.model_error)
             return
-        self.set_mode("learning")
+        self.state.running=True
+        self.state.stop_event.clear()
+        self.lbl_tip.setText("资源已就绪，进入学习模式")
+        self.set_mode("learning",force=True)
     def closeEvent(self,event):
         self.state.stop_event.set()
         self.state.running=False
