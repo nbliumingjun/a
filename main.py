@@ -1092,7 +1092,8 @@ class State(QObject):
     def record_frame(self,img,mode,force=False):
         try:
             self._init_day_files()
-            now=time.time()
+            now_ns=time.time_ns()
+            now=now_ns/1_000_000_000.0
             save=False
             if self.prev_img is None:
                 save=True
@@ -1105,7 +1106,7 @@ class State(QObject):
                     save=True
             if not save:
                 return None
-            fid=str(int(now*1000))
+            fid=str(now_ns)
             base=os.path.join(exp_dir,self.day_tag,"frames")
             path=os.path.join(base,f"{fid}.png")
             while os.path.exists(path):
@@ -1117,7 +1118,7 @@ class State(QObject):
                 return None
             self.io_q.put((path,buf))
             src="user" if mode=="learning" else ("ai" if mode=="training" else mode)
-            rec={"id":fid,"ts":now,"source":src,"mode":mode,"window_title":self.selected_title,"rect":[0,0,2560,1600],"path":path,"filename":f"{fid}.png","w":2560,"h":1600,"session_id":self.session_id}
+            rec={"id":fid,"ts":now,"ts_ns":now_ns,"source":src,"mode":mode,"window_title":self.selected_title,"rect":[0,0,2560,1600],"path":path,"filename":f"{fid}.png","w":2560,"h":1600,"session_id":self.session_id}
             self.frames_writer.append(rec)
             with self.prev_lock:
                 self.prev_img=img.copy()
@@ -1133,8 +1134,28 @@ class State(QObject):
             ch=max(1,self.client_rect[3]-self.client_rect[1])
             plx,ply=self._scale2560(px-cx,py-cy,cw,ch)
             rlx,rly=self._scale2560(rx-cx,ry-cy,cw,ch)
-            mm=[(float(t),int(self._scale2560(x-cx,y-cy,cw,ch)[0]),int(self._scale2560(x-cx,y-cy,cw,ch)[1]),int(ins)) for (t,x,y,ins) in moves] if moves else []
-            obj={"id":str(uuid.uuid4()),"source":source,"mode":mode or "unknown","type":typ,"press_t":press_t,"press_x":px,"press_y":py,"press_lx":plx,"press_ly":ply,"release_t":release_t,"release_x":rx,"release_y":ry,"release_lx":rlx,"release_ly":rly,"moves":mm,"window_title":self.selected_title,"rect":[0,0,2560,1600],"frame_id":frame_id,"ins_press":int(ins_press),"ins_release":int(ins_release),"clip_ids":clip_ids or [],"session_id":self.session_id,"duration":float(release_t-press_t) if release_t and press_t else 0.0}
+            def norm_ts(ts):
+                if not ts:
+                    return 0,0.0
+                if isinstance(ts,(int,float)) and ts>1e10:
+                    ns=int(ts)
+                    sec=ns/1_000_000_000.0
+                    return ns,sec
+                sec=float(ts)
+                ns=int(sec*1_000_000_000)
+                return ns,sec
+            press_ns,press_sec=norm_ts(press_t)
+            release_ns,release_sec=norm_ts(release_t)
+            mm=[]
+            mm_ns=[]
+            if moves:
+                for (t,x,y,ins) in moves:
+                    ns,sec=norm_ts(t)
+                    sx,sy=self._scale2560(x-cx,y-cy,cw,ch)
+                    mm.append((sec,int(sx),int(sy),int(ins)))
+                    mm_ns.append(ns)
+            duration=release_sec-press_sec if release_sec and press_sec else 0.0
+            obj={"id":str(uuid.uuid4()),"source":source,"mode":mode or "unknown","type":typ,"press_t":press_sec,"press_t_ns":press_ns,"press_x":px,"press_y":py,"press_lx":plx,"press_ly":ply,"release_t":release_sec,"release_t_ns":release_ns,"release_x":rx,"release_y":ry,"release_lx":rlx,"release_ly":rly,"moves":mm,"moves_ns":mm_ns,"window_title":self.selected_title,"rect":[0,0,2560,1600],"frame_id":frame_id,"ins_press":int(ins_press),"ins_release":int(ins_release),"clip_ids":clip_ids or [],"session_id":self.session_id,"duration":float(duration)}
             self.events_writer.append(obj)
             self.event_count+=1
             self.signal_counts.emit(self.event_count)
@@ -1142,14 +1163,10 @@ class State(QObject):
             pass
     def record_kbd(self,ts):
         try:
-            if ts-self.last_kbd_log_ts<0.3:
+            sec=ts/1_000_000_000.0 if isinstance(ts,(int,float)) and ts>1e6 else float(ts)
+            if sec-self.last_kbd_log_ts<0.3:
                 return
-            self._init_day_files()
-            obj={"id":str(uuid.uuid4()),"source":"user","mode":"learning","type":"kbd","ts":float(ts),"window_title":self.selected_title,"rect":[0,0,2560,1600],"session_id":self.session_id}
-            self.events_writer.append(obj)
-            self.event_count+=1
-            self.signal_counts.emit(self.event_count)
-            self.last_kbd_log_ts=ts
+            self.last_kbd_log_ts=sec
         except:
             pass
     def heat_from_events(self,w,h,source=None):
@@ -1376,10 +1393,11 @@ class LowLevelHook(threading.Thread):
                         self.st.interrupt_ai=True
                         self.st.signal_mode.emit("学习")
                 if wParam==self.WM_MOUSEMOVE:
+                    stamp=time.time_ns()
                     for k,v in list(self.mouse_pressed.items()):
                         if k in self.mouse_pressed:
                             inside=1 if self.within(x,y) else 0
-                            v["moves"].append((time.time(),x,y,inside))
+                            v["moves"].append((stamp,x,y,inside))
                 else:
                     btn=None
                     pressed=None
@@ -1409,7 +1427,8 @@ class LowLevelHook(threading.Thread):
                                 self.st.interrupt_ai=True
                                 self.st.signal_mode.emit("学习")
                             if self.within(x,y):
-                                self.mouse_pressed[btn]={"t":time.time(),"x":x,"y":y,"moves":[(time.time(),x,y,1)],"pre":[]}
+                                press_ns=time.time_ns()
+                                self.mouse_pressed[btn]={"t":press_ns,"x":x,"y":y,"moves":[(press_ns,x,y,1)],"pre":[]}
                                 for im in list(self.st.prev_imgs)[-self.st.pre_post_K:]:
                                     rid=self.st.record_frame(im,"learning",force=True)
                                     if rid:
@@ -1427,7 +1446,8 @@ class LowLevelHook(threading.Thread):
                                         pre.append(rid)
                                     ip=1 if self.within(d["x"],d["y"]) else 0
                                     ir=1 if inside_release==1 else 0
-                                    self.st.record_op("user",btn,d["t"],d["x"],d["y"],time.time(),x,y,d["moves"],rid,ip,ir,pre,"learning")
+                                    release_ns=time.time_ns()
+                                    self.st.record_op("user",btn,d["t"],d["x"],d["y"],release_ns,x,y,d["moves"],rid,ip,ir,pre,"learning")
                                 if btn in self.mouse_pressed:
                                     del self.mouse_pressed[btn]
                 return self.user32.CallNextHookEx(self.hMouse,nCode,wParam,lParam)
@@ -1439,8 +1459,8 @@ class LowLevelHook(threading.Thread):
                 ex=int(ks.dwExtraInfo or 0)
                 injected=((flags & 0x00000010)!=0) or (ex==self.st.MARK)
                 if not injected:
-                    t=time.time()
-                    self.st.last_user_activity=t
+                    t=time.time_ns()
+                    self.st.last_user_activity=time.time()
                     self.st.record_kbd(t)
                     if self.st.mode=="training":
                         self.st.interrupt_ai=True
@@ -1566,7 +1586,7 @@ class TrainerThread(threading.Thread):
                     except:
                         cx,cy=bx,by
                     n=max(10,int(self.st.fps*0.6))
-                    t0=time.time()
+                    t0=time.time_ns()
                     mv=[]
                     c1x=cx+(bx-cx)*0.3+random.uniform(-12,12)
                     c1y=cy+(by-cy)*0.3+random.uniform(-12,12)
@@ -1580,14 +1600,14 @@ class TrainerThread(threading.Thread):
                         pts.append((int(ux),int(uy)))
                     ok=self.inj.move_path(pts,step_delay=max(0.004,0.2/self.st.fps))
                     for (px,py) in pts:
-                        mv.append((time.time(),px,py,1))
+                        mv.append((time.time_ns(),px,py,1))
                     if not ok or self.st.interrupt_ai:
                         break
                     self.inj.down(btn)
-                    mv.append((time.time(),bx,by,1))
+                    mv.append((time.time_ns(),bx,by,1))
                     time.sleep(0.02)
                     self.inj.up(btn)
-                    t1=time.time()
+                    t1=time.time_ns()
                     self.st.record_op("ai",btn,t0,bx,by,t1,bx,by,mv,fid,1,1,[],"training")
                 except:
                     pass
@@ -1701,9 +1721,19 @@ class OptimizerThread(threading.Thread):
     def _sort_events(self,events):
         return sorted(events,key=lambda e:self._event_time(e) or 0)
     def _event_time(self,e):
+        if "press_t_ns" in e and e.get("press_t_ns"):
+            try:
+                return float(e.get("press_t_ns",0))/1_000_000_000.0
+            except:
+                return None
         if "press_t" in e:
             try:
                 return float(e.get("press_t",0))
+            except:
+                return None
+        if "ts_ns" in e and e.get("ts_ns"):
+            try:
+                return float(e.get("ts_ns",0))/1_000_000_000.0
             except:
                 return None
         if "ts" in e:
@@ -1841,10 +1871,18 @@ class OptimizerThread(threading.Thread):
         base["press_y"]=float(e.get("press_y",0))+random.uniform(-16,16)
         base["release_x"]=base["press_x"]
         base["release_y"]=base["press_y"]
-        base["press_t"]=float(e.get("press_t",time.time()))+random.uniform(-0.2,0.2)
-        base["release_t"]=base["press_t"]+max(0.01,float(e.get("duration",0.05))+random.uniform(-0.02,0.02))
-        base["duration"]=float(base["release_t"]-base["press_t"])
+        press_sec=float(e.get("press_t",time.time()))+random.uniform(-0.2,0.2)
+        press_ns=int(press_sec*1_000_000_000)
+        dur=max(0.01,float(e.get("duration",0.05))+random.uniform(-0.02,0.02))
+        release_sec=press_sec+dur
+        release_ns=int(release_sec*1_000_000_000)
+        base["press_t"]=press_sec
+        base["press_t_ns"]=press_ns
+        base["release_t"]=release_sec
+        base["release_t_ns"]=release_ns
+        base["duration"]=float(dur)
         base["moves"]=e.get("moves",[])
+        base["moves_ns"]=e.get("moves_ns",[])
         base["source"]=e.get("source","user")
         base["mode"]=e.get("mode","learning")
         base["type"]=e.get("type","left")
@@ -1874,8 +1912,12 @@ class OptimizerThread(threading.Thread):
             btn=act[2]
             press_lx=int(max(0,min(2560,round(x))))
             press_ly=int(max(0,min(1600,round(y))))
-            now=time.time()
-            synth.append({"id":str(uuid.uuid4()),"source":"ai","mode":"training","type":btn,"press_t":now,"press_x":0.0,"press_y":0.0,"press_lx":press_lx,"press_ly":press_ly,"release_t":now+0.03,"release_x":0.0,"release_y":0.0,"release_lx":press_lx,"release_ly":press_ly,"moves":[],"window_title":rec.get("window_title",self.st.selected_title),"rect":[0,0,2560,1600],"frame_id":rec.get("id"),"ins_press":1,"ins_release":1,"clip_ids":[],"session_id":self.st.session_id,"duration":0.03})
+            now_ns=time.time_ns()
+            now_sec=now_ns/1_000_000_000.0
+            dur=0.03
+            release_ns=int(now_ns+dur*1_000_000_000)
+            release_sec=release_ns/1_000_000_000.0
+            synth.append({"id":str(uuid.uuid4()),"source":"ai","mode":"training","type":btn,"press_t":now_sec,"press_t_ns":now_ns,"press_x":0.0,"press_y":0.0,"press_lx":press_lx,"press_ly":press_ly,"release_t":release_sec,"release_t_ns":release_ns,"release_x":0.0,"release_y":0.0,"release_lx":press_lx,"release_ly":press_ly,"moves":[],"moves_ns":[],"window_title":rec.get("window_title",self.st.selected_title),"rect":[0,0,2560,1600],"frame_id":rec.get("id"),"ins_press":1,"ins_release":1,"clip_ids":[],"session_id":self.st.session_id,"duration":dur})
         return synth
     def _create_default_batches(self):
         img=torch.zeros((4,3,200,320),dtype=torch.float32)
@@ -2216,6 +2258,7 @@ class Main(QMainWindow):
         self.learning_thread=None
         self.training_thread=None
         self._optim_flag=threading.Event()
+        self._ui_busy=False
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
         self.start_wait_timer.start(200)
@@ -2282,6 +2325,8 @@ class Main(QMainWindow):
         if not self.state.model_ready_event.is_set():
             return
         if self.state.optimizing:
+            return
+        if self._ui_busy:
             return
         if not self.state.running:
             return
@@ -2363,6 +2408,8 @@ class Main(QMainWindow):
     def on_opt(self):
         if self.state.optimizing:
             return
+        if self._ui_busy:
+            return
         try:
             self.state.wait_model()
         except ModelIntegrityError as e:
@@ -2371,6 +2418,7 @@ class Main(QMainWindow):
         self.state.stop_event.set()
         self.state.running=False
         self.btn_opt.setEnabled(False)
+        self.btn_ui.setEnabled(False)
         self.progress.setValue(0)
         self.progress.setFormat("0%")
         self.lbl_mode.setText("优化中")
@@ -2385,6 +2433,7 @@ class Main(QMainWindow):
         msg="优化完成" if ok else "优化失败"
         QMessageBox.information(self,"提示",msg)
         self.btn_opt.setEnabled(True)
+        self.btn_ui.setEnabled(True)
         self.progress.setValue(0)
         self.progress.setFormat("0%")
         self.state.stop_event.clear()
@@ -2392,6 +2441,8 @@ class Main(QMainWindow):
         self.lbl_tip.setText("优化完成，已恢复学习" if ok else "优化失败，继续使用现有模型")
         self.set_mode("learning",force=True)
     def on_ui(self):
+        if self.state.optimizing or self._ui_busy:
+            return
         if not self.state.selected_hwnd:
             QMessageBox.information(self,"提示","未选择窗口")
             return
@@ -2399,10 +2450,30 @@ class Main(QMainWindow):
         if img is None:
             QMessageBox.information(self,"提示","无法获取窗口画面")
             return
-        events=self.state._recent_events(source="user",mode="learning")
-        res=self.inspector.analyze(img,events)
-        self.state.signal_ui_ready.emit(res)
-        QMessageBox.information(self,"提示","UI识别完成，结果已列出")
+        self._ui_busy=True
+        self.btn_opt.setEnabled(False)
+        self.btn_ui.setEnabled(False)
+        self.lbl_tip.setText("正在执行UI识别")
+        ok=False
+        err=""
+        try:
+            events=self.state._recent_events(source="user",mode="learning")
+            res=self.inspector.analyze(img,events)
+            self.state.signal_ui_ready.emit(res)
+            ok=True
+        except Exception as e:
+            err=str(e)
+            log(f"ui detect error:{e}")
+        if ok:
+            QMessageBox.information(self,"提示","UI识别完成，结果已列出")
+            self.lbl_tip.setText("UI识别完成，已恢复学习")
+        else:
+            QMessageBox.warning(self,"提示","UI识别失败"+(f":{err}" if err else ""))
+            self.lbl_tip.setText("UI识别失败，保持学习")
+        self.btn_opt.setEnabled(True)
+        self.btn_ui.setEnabled(True)
+        self._ui_busy=False
+        self.set_mode("learning",force=True)
     def on_model_ready_check(self):
         if not self.state.model_ready_event.is_set():
             return
