@@ -76,12 +76,12 @@ def deps_check():
         attempt+=1
         pkg_names=sorted(set(pkg for _,pkg in miss))
         _msgbox("依赖准备","检测到缺失依赖:\n"+"\n".join(pkg_names)+"\n系统将自动安装")
-        for pkg in pkg_names:
-            try:
-                print(f"installing dependency {pkg}")
-                subprocess.check_call([sys.executable,"-m","pip","install",pkg],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"install {pkg} failed:{e}")
+        cmd=[sys.executable,"-m","pip","install"]+pkg_names
+        try:
+            print("installing dependency bundle:"+" ".join(pkg_names))
+            subprocess.check_call(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"install bundle failed:{e}")
         if attempt>=max_attempts:
             remain=sorted(set(mod for mod,_ in miss))
             msg="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)
@@ -118,7 +118,7 @@ try:
     _nv.nvmlInit()
 except:
     _nv=None
-from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QListWidget,QDialog,QDialogButtonBox,QListWidgetItem
+from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QTableWidget,QDialog,QDialogButtonBox,QTableWidgetItem,QHeaderView,QAbstractItemView
 from PySide6.QtCore import QTimer,Qt,Signal,QObject,QSize
 from PySide6.QtGui import QImage,QPixmap
 log_path=os.path.join(logs_dir,"app.log")
@@ -172,17 +172,16 @@ class ModelManifest:
                 pass
         if progress_cb:
             progress_cb(5,"下载模型")
-        buf=self._download_with_progress(progress_cb)
-        if buf is None:
+        tmp=self._download_with_progress(progress_cb)
+        if not tmp:
+            try:
+                os.remove(path+".tmp")
+            except:
+                pass
             fall=self._recover_fallback(progress_cb)
             if fall:
                 return fall
             raise RuntimeError("模型下载失败")
-        tmp=path+".tmp"
-        with open(tmp,"wb") as f:
-            f.write(buf.getbuffer())
-            f.flush()
-            os.fsync(f.fileno())
         calc=self._hash(tmp)
         if self.sha_value:
             if calc!=self.sha_value:
@@ -199,26 +198,56 @@ class ModelManifest:
             progress_cb(100,"模型准备完成")
         return path
     def _download_with_progress(self,cb):
-        try:
-            req=urllib.request.Request(self.url(),headers={"User-Agent":"Mozilla/5.0"})
-            with urllib.request.urlopen(req,timeout=60) as r:
-                total=r.length or 0
-                buf=io.BytesIO()
-                chunk=262144
-                done=0
-                while True:
-                    data=r.read(chunk)
-                    if not data:
-                        break
-                    buf.write(data)
-                    done+=len(data)
-                    if cb and total>0:
-                        cb(min(90,int(done*80/total)+10),"下载中")
-                buf.seek(0)
-                return buf
-        except Exception as e:
-            log(f"model download error:{e}")
-            return None
+        url=self.url()
+        target=self.target_path()
+        tmp=target+".tmp"
+        attempts=0
+        while attempts<3:
+            try:
+                existing=os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                headers={"User-Agent":"Mozilla/5.0"}
+                if existing>0:
+                    headers["Range"]=f"bytes={existing}-"
+                req=urllib.request.Request(url,headers=headers)
+                with urllib.request.urlopen(req,timeout=60) as r:
+                    total=r.length or 0
+                    cr=r.headers.get("Content-Range")
+                    if cr:
+                        try:
+                            total=int(cr.split("/")[-1])
+                        except:
+                            total=0
+                    status=getattr(r,"status",200)
+                    if existing>0 and (status!=206 or not cr):
+                        existing=0
+                        with open(tmp,"wb") as f:
+                            f.truncate(0)
+                    mode="ab" if existing>0 else "wb"
+                    done=existing
+                    chunk=262144
+                    with open(tmp,mode) as f:
+                        if existing>0:
+                            f.seek(0,os.SEEK_END)
+                        while True:
+                            data=r.read(chunk)
+                            if not data:
+                                break
+                            f.write(data)
+                            done+=len(data)
+                            if cb and total>0:
+                                cb(min(90,int(done*80/max(1,total))+10),"下载中")
+                        f.flush()
+                        os.fsync(f.fileno())
+                if total and done<total:
+                    raise IOError("incomplete download")
+                if cb:
+                    cb(95,"下载完成")
+                return tmp
+            except Exception as e:
+                log(f"model download error:{e}")
+                attempts+=1
+                time.sleep(1)
+        return None
     def _hash(self,path):
         h=hashlib.sha256()
         with open(path,"rb") as f:
@@ -2384,8 +2413,8 @@ class Main(QMainWindow):
         self.btn_ui=QPushButton("UI识别")
         self.chk_preview=QCheckBox("预览")
         self.chk_preview.setChecked(self.state.preview_on)
-        self.lbl_mode=QLabel("学习")
-        self.lbl_fps=QLabel("FPS:0")
+        self.lbl_mode=QLabel("模式:学习")
+        self.lbl_fps=QLabel("帧率:0")
         self.lbl_rec=QLabel("0B")
         self.lbl_ver=QLabel("v0")
         self.lbl_tip=QLabel("初始化")
@@ -2401,8 +2430,17 @@ class Main(QMainWindow):
         self.model_progress.setFormat("0%")
         self.preview_label=QLabel()
         self.preview_label.setFixedSize(QSize(640,400))
-        self.ui_list=QListWidget()
-        self.ui_list.setMaximumHeight(140)
+        self.preview_label.setVisible(self.state.preview_on)
+        self.ui_table=QTableWidget()
+        self.ui_table.setColumnCount(4)
+        self.ui_table.setHorizontalHeaderLabels(["类型","区域","置信度","交互强度"])
+        self.ui_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.ui_table.verticalHeader().setVisible(False)
+        self.ui_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.ui_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.ui_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.ui_table.setMaximumHeight(180)
+        self.ui_table.setFocusPolicy(Qt.NoFocus)
         lt=QHBoxLayout(top)
         lt.addWidget(self.cmb,1)
         lt.addWidget(self.btn_opt)
@@ -2410,7 +2448,7 @@ class Main(QMainWindow):
         lt.addWidget(self.chk_preview)
         lm=QVBoxLayout(mid)
         lm.addWidget(self.preview_label,1)
-        lm.addWidget(self.ui_list)
+        lm.addWidget(self.ui_table)
         lh=QHBoxLayout()
         lh.addWidget(self.lbl_mode)
         lh.addStretch(1)
@@ -2472,8 +2510,10 @@ class Main(QMainWindow):
     def preview_enabled(self):
         return self.chk_preview.isChecked()
     def on_preview_changed(self,_):
-        self.state.save_cfg("preview_on",self.chk_preview.isChecked())
-        if not self.chk_preview.isChecked():
+        enabled=self.chk_preview.isChecked()
+        self.state.save_cfg("preview_on",enabled)
+        self.preview_label.setVisible(enabled)
+        if not enabled:
             self.preview_label.clear()
     def on_preview(self,px):
         if not self.preview_enabled():
@@ -2483,7 +2523,7 @@ class Main(QMainWindow):
         except:
             pass
     def on_mode(self,s):
-        self.lbl_mode.setText(s)
+        self.lbl_mode.setText(f"模式:{s}")
     def on_window(self,s):
         self.lbl_tip.setText(f"当前窗口: {s}")
     def on_recsize(self,s):
@@ -2505,10 +2545,22 @@ class Main(QMainWindow):
             info=f"{info} {txt}"
         self.model_progress.setFormat(info)
     def on_ui_ready(self,items):
-        self.ui_list.clear()
-        for it in items[:30]:
-            item=QListWidgetItem(f"{it['type']}|{it['bounds']}|置信:{it.get('confidence',0):.2f}|交互:{it.get('interaction',0):.2f}")
-            self.ui_list.addItem(item)
+        self.ui_table.setRowCount(0)
+        limited=items[:60]
+        self.ui_table.setRowCount(len(limited))
+        for idx,it in enumerate(limited):
+            t=str(it.get("type",""))
+            b=str(it.get("bounds",""))
+            c=f"{float(it.get("confidence",0)):.2f}"
+            inter=f"{float(it.get("interaction",0)):.2f}"
+            self.ui_table.setItem(idx,0,QTableWidgetItem(t))
+            self.ui_table.setItem(idx,1,QTableWidgetItem(b))
+            ci=QTableWidgetItem(c)
+            ci.setTextAlignment(Qt.AlignCenter)
+            self.ui_table.setItem(idx,2,ci)
+            ii=QTableWidgetItem(inter)
+            ii.setTextAlignment(Qt.AlignCenter)
+            self.ui_table.setItem(idx,3,ii)
     def refresh_windows(self):
         m=self.selector.refresh()
         keys=sorted(list(m.keys()))
@@ -2545,7 +2597,7 @@ class Main(QMainWindow):
         self.state.stop_event.clear()
         self.state.mode=mode
         if mode=="learning":
-            self.lbl_mode.setText("学习")
+            self.lbl_mode.setText("模式:学习")
             self.state.signal_mode.emit("学习")
             self.learning_thread=LearningThread(self.state,self)
             self.learning_thread.start()
@@ -2553,11 +2605,11 @@ class Main(QMainWindow):
             if not self.state.model_loaded:
                 QMessageBox.information(self,"提示","模型不可用，保持学习模式")
                 self.state.mode="learning"
-                self.lbl_mode.setText("学习")
+                self.lbl_mode.setText("模式:学习")
                 self.learning_thread=LearningThread(self.state,self)
                 self.learning_thread.start()
                 return
-            self.lbl_mode.setText("训练")
+            self.lbl_mode.setText("模式:训练")
             self.state.signal_mode.emit("训练")
             self.training_thread=TrainerThread(self.state,self)
             self.training_thread.start()
@@ -2602,7 +2654,7 @@ class Main(QMainWindow):
                 self.state.interrupt_ai=False
                 self.set_mode("learning")
     def on_tick_fps(self):
-        self.lbl_fps.setText(f"FPS:{int(self.state.fps)}")
+        self.lbl_fps.setText(f"帧率:{int(self.state.fps)}")
     def on_usage(self):
         cpu=int(psutil.cpu_percent())
         mem=int(psutil.virtual_memory().percent)
@@ -2627,7 +2679,7 @@ class Main(QMainWindow):
         self.btn_ui.setEnabled(False)
         self.progress.setValue(0)
         self.progress.setFormat("0%")
-        self.lbl_mode.setText("优化中")
+        self.lbl_mode.setText("模式:优化中")
         self.state.signal_mode.emit("优化中")
         self._optim_flag.clear()
         self.lbl_tip.setText("正在离线优化")
