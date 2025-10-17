@@ -788,19 +788,17 @@ class Foreground:
                     py=int(y1+(y2-y1)*ry)
                     pts.append((px,py))
             th=Foreground.top(hwnd)
-            blocked=0
             for (px,py) in pts:
                 hw=ctypes.windll.user32.WindowFromPoint(ctypes.wintypes.POINT(px,py))
                 if hw==0:
-                    blocked+=1
-                    continue
+                    return True
                 rt=Foreground.top(hw)
                 if rt==th:
-                    return False
+                    continue
                 if Foreground._ignore(rt):
-                    return False
-                blocked+=1
-            return blocked==len(pts)
+                    continue
+                return True
+            return False
         except:
             return True
     @staticmethod
