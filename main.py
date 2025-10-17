@@ -27,6 +27,13 @@ meta_path=os.path.join(models_dir,"model_meta.json")
 ui_cache_path=os.path.join(base_dir,"ui_elements.json")
 for d in [base_dir,exp_dir,models_dir,logs_dir]:
     os.makedirs(d,exist_ok=True)
+log_path=os.path.join(logs_dir,"app.log")
+def log(s):
+    try:
+        with open(log_path,"a",encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
+    except:
+        pass
 cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":""}
 def ensure_config():
     if not os.path.exists(cfg_path):
@@ -79,8 +86,17 @@ def deps_check():
         cmd=[sys.executable,"-m","pip","install"]+pkg_names
         try:
             print("installing dependency bundle:"+" ".join(pkg_names))
-            subprocess.check_call(cmd,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,bufsize=1)
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    msg=line.rstrip()
+                    if msg:
+                        log("pip:"+msg)
+            code=proc.wait()
+            if code!=0:
+                raise subprocess.CalledProcessError(code,cmd)
         except Exception as e:
+            log(f"install bundle failed:{e}")
             print(f"install bundle failed:{e}")
         if attempt>=max_attempts:
             remain=sorted(set(mod for mod,_ in miss))
@@ -121,13 +137,6 @@ except:
 from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QTableWidget,QDialog,QDialogButtonBox,QTableWidgetItem,QHeaderView,QAbstractItemView
 from PySide6.QtCore import QTimer,Qt,Signal,QObject,QSize
 from PySide6.QtGui import QImage,QPixmap
-log_path=os.path.join(logs_dir,"app.log")
-def log(s):
-    try:
-        with open(log_path,"a",encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
-    except:
-        pass
 def _gpu_util_mem():
     try:
         if _nv is None:
@@ -446,29 +455,46 @@ class DiskManager:
         t=DiskManager.total_bytes()
         if t<=cap:
             return
-        subs=sorted([p for p in glob.glob(os.path.join(exp_dir,"*")) if os.path.isdir(p)])
-        for d in subs:
-            shutil.rmtree(d,ignore_errors=True)
-            t=DiskManager.total_bytes()
-            if t<=cap*0.85:
-                break
-        if t>cap:
-            files=[]
-            for r,_,fs in os.walk(exp_dir):
-                for n in fs:
-                    try:
-                        p=os.path.join(r,n)
-                        files.append((os.path.getmtime(p),p))
-                    except:
-                        pass
-            files.sort()
-            for _,p in files:
+        target=cap*0.9
+        files=[]
+        for r,_,fs in os.walk(exp_dir):
+            for n in fs:
                 try:
-                    os.remove(p)
+                    p=os.path.join(r,n)
+                    files.append((os.path.getmtime(p),p,os.path.getsize(p)))
                 except:
                     pass
+        files.sort()
+        for _,p,size in files:
+            if t<=target:
+                break
+            try:
+                os.remove(p)
+                t-=size
+            except:
+                pass
+        for r,ds,_ in os.walk(exp_dir,topdown=False):
+            if ds:
+                continue
+            try:
+                if not os.listdir(r):
+                    os.rmdir(r)
+            except:
+                pass
+        if t>cap:
+            dirs=[]
+            for d in glob.glob(os.path.join(exp_dir,"*")):
+                if not os.path.isdir(d):
+                    continue
+                try:
+                    dirs.append((os.path.getmtime(d),d))
+                except:
+                    pass
+            dirs.sort()
+            for _,d in dirs:
+                shutil.rmtree(d,ignore_errors=True)
                 t=DiskManager.total_bytes()
-                if t<=cap*0.85:
+                if t<=target:
                     break
 class VisionBackbone(nn.Module):
     def __init__(self):
@@ -1731,6 +1757,8 @@ class OptimizerThread(threading.Thread):
         self.ui=ui
         self.cb=cb
         self.cancel_flag=cancel_flag
+        self.frame_cache=collections.OrderedDict()
+        self.cache_limit=256
     def run(self):
         self.st.optimizing=True
         try:
@@ -1797,6 +1825,23 @@ class OptimizerThread(threading.Thread):
     def _done(self,ok):
         self.st.optimizing=False
         self.cb(ok)
+    def _get_frame_image(self,path):
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            if path in self.frame_cache:
+                img=self.frame_cache.pop(path)
+                self.frame_cache[path]=img
+                return img
+            buf=np.fromfile(path,dtype=np.uint8)
+            img=cv2.imdecode(buf,cv2.IMREAD_COLOR)
+            if img is not None:
+                self.frame_cache[path]=img
+                if len(self.frame_cache)>self.cache_limit:
+                    self.frame_cache.popitem(last=False)
+            return img
+        except:
+            return None
     def _count_samples(self,days):
         total=0
         tsmin=None
@@ -1916,11 +1961,7 @@ class OptimizerThread(threading.Thread):
                     fr=frames.get(fid)
                     if not fr:
                         continue
-                    try:
-                        buf=np.fromfile(fr.get("path"),dtype=np.uint8)
-                    except:
-                        continue
-                    img=cv2.imdecode(buf,cv2.IMREAD_COLOR)
+                    img=self._get_frame_image(fr.get("path"))
                     if img is None:
                         continue
                     label=self._make_label(e,img.shape[1],img.shape[0])
@@ -1995,7 +2036,7 @@ class OptimizerThread(threading.Thread):
             fr=frames.get(fid)
             if not fr:
                 continue
-            img=cv2.imdecode(np.fromfile(fr["path"],dtype=np.uint8),cv2.IMREAD_COLOR)
+            img=self._get_frame_image(fr.get("path"))
             if img is None:
                 continue
             img=cv2.resize(img,(320,200))
@@ -2130,7 +2171,7 @@ class OptimizerThread(threading.Thread):
             path=rec.get("path")
             if not path or not os.path.exists(path):
                 continue
-            img=cv2.imdecode(np.fromfile(path,dtype=np.uint8),cv2.IMREAD_COLOR)
+            img=self._get_frame_image(path)
             if img is None:
                 continue
             try:
