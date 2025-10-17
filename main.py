@@ -328,6 +328,10 @@ class JSONLWriter:
         self.path=path
         self.f=open(self.path,"a",encoding="utf-8")
         self.lock=threading.Lock()
+        self.buffer=[]
+        self.flush_limit=48
+        self.flush_interval=0.5
+        self.last_flush=time.time()
     @staticmethod
     def _crc_of(obj):
         if isinstance(obj,dict) and "crc" in obj:
@@ -374,17 +378,25 @@ class JSONLWriter:
                 o=obj
             line=json.dumps(o,ensure_ascii=False,separators=(",",":"))+"\n"
             with self.lock:
-                self.f.write(line)
-                self.f.flush()
-                os.fsync(self.f.fileno())
+                self.buffer.append(line)
+                now=time.time()
+                if len(self.buffer)>=self.flush_limit or now-self.last_flush>=self.flush_interval:
+                    self._flush_locked()
             return True
         except:
             return False
+    def _flush_locked(self,force=False):
+        if not self.buffer and not force:
+            return
+        self.f.writelines(self.buffer)
+        self.buffer.clear()
+        self.f.flush()
+        os.fsync(self.f.fileno())
+        self.last_flush=time.time()
     def close(self):
         try:
             with self.lock:
-                self.f.flush()
-                os.fsync(self.f.fileno())
+                self._flush_locked(True)
                 self.f.close()
         except:
             pass
@@ -658,11 +670,15 @@ class StrategyEngine:
             return ("idle",None,None,score)
         btn="left" if conf>0.55 else "right"
         return ("click",(x,y),btn,score)
-    def train_incremental(self,batches,progress_cb=None):
+    def train_incremental(self,batches,progress_cb=None,total=None):
         self.model.train()
         opt=optim.AdamW(list(self.model.parameters())+list(self.semantic.parameters())+list(self.planner.parameters()),lr=1e-4,weight_decay=1e-4)
-        total=len(batches)
-        for i,(img,ctx,label,hist) in enumerate(batches):
+        counted=total
+        if counted is None:
+            counted=len(batches) if hasattr(batches,"__len__") else 0
+        processed=0
+        for (img,ctx,label,hist) in batches:
+            processed+=1
             img=img.to(self.device)
             ctx=ctx.to(self.device).float()
             hist=hist.to(self.device).float()
@@ -678,7 +694,9 @@ class StrategyEngine:
             nn.utils.clip_grad_norm_(self.planner.parameters(),1.0)
             opt.step()
             if progress_cb:
-                progress_cb(60+int(35*(i+1)/max(1,total)),f"训练进度 {i+1}/{total}")
+                denom=counted if counted else max(processed*2,1)
+                msg_total=counted if counted else "?"
+                progress_cb(60+int(35*processed/max(1,denom)),f"训练进度 {processed}/{msg_total}")
         self.model.eval()
         self.semantic.eval()
         self.planner.eval()
@@ -899,6 +917,9 @@ class State(QObject):
         self.metric_history=collections.deque(maxlen=180)
         self.resource_history=collections.deque(maxlen=120)
         self.trend_window=collections.deque(maxlen=36)
+        self._pending_window=None
+        self._pending_waiter=None
+        self._pending_lock=threading.Lock()
         self._init_day_files()
         threading.Thread(target=self._ensure_model_bg,daemon=True).start()
     def _ensure_model_bg(self):
@@ -910,6 +931,7 @@ class State(QObject):
             self.model_ready_event.set()
             ModelMeta.update([path],{"start":None,"end":None},{"note":"初始化校验"})
             self.signal_modelver.emit(f"v{ModelMeta.read().get('version',0)}")
+            self._apply_pending_window()
         except Exception as e:
             self.model_error=str(e)
             log(f"model ensure error:{e}")
@@ -963,7 +985,34 @@ class State(QObject):
         except:
             return 0
     def set_window(self,hwnd,title):
-        self.wait_model()
+        with self._pending_lock:
+            self._pending_window=(hwnd,title)
+        self.selected_hwnd=None
+        self.selected_title=title
+        if self.model_ready_event.is_set() and not self.model_error:
+            self._apply_pending_window()
+            return
+        self.signal_window.emit(f"{title}(待模型)")
+        if self._pending_waiter and self._pending_waiter.is_alive():
+            return
+        self._pending_waiter=threading.Thread(target=self._await_model_then_bind,daemon=True)
+        self._pending_waiter.start()
+        self.signal_tip.emit("等待模型准备后绑定窗口")
+    def _await_model_then_bind(self):
+        try:
+            self.model_ready_event.wait()
+            if self.model_error:
+                return
+            self._apply_pending_window()
+        except:
+            pass
+    def _apply_pending_window(self):
+        with self._pending_lock:
+            pending=self._pending_window
+            self._pending_window=None
+        if not pending:
+            return
+        hwnd,title=pending
         self.selected_hwnd=hwnd
         self.selected_title=title
         self.signal_window.emit(title)
@@ -1660,54 +1709,33 @@ class OptimizerThread(threading.Thread):
         try:
             self.st.signal_optprog.emit(10,"收集数据")
             all_days=sorted([p for p in glob.glob(os.path.join(exp_dir,"*")) if os.path.isdir(p)])
-            frames={}
-            events=[]
-            tsmin=None
-            tsmax=None
-            total=max(1,len(all_days))
-            done=0
-            for d in all_days:
-                if self.cancel_flag.is_set():
-                    self._done(False)
-                    return
-                fp=os.path.join(d,"frames.jsonl")
-                ep=os.path.join(d,"events.jsonl")
-                if os.path.exists(fp):
-                    JSONLWriter.repair(fp)
-                    with open(fp,"r",encoding="utf-8") as f:
-                        for line in f:
-                            try:
-                                r=json.loads(line)
-                                frames[r["id"]]=r
-                            except:
-                                pass
-                if os.path.exists(ep):
-                    JSONLWriter.repair(ep)
-                    with open(ep,"r",encoding="utf-8") as f:
-                        for line in f:
-                            try:
-                                e=json.loads(line)
-                                t=self._event_time(e)
-                                if t is not None:
-                                    if tsmin is None or t<tsmin:
-                                        tsmin=t
-                                    if tsmax is None or t>tsmax:
-                                        tsmax=t
-                                events.append(e)
-                            except:
-                                pass
-                done+=1
-                self.st.signal_optprog.emit(20+int(20*done/total),"解析数据")
-            events=self._enrich_events(events,frames)
-            sorted_events=self._sort_events(events)
-            batches=self._build_batches(sorted_events,frames)
-            if len(batches)==0:
-                self.st.signal_optprog.emit(100,"生成数据")
-                batches=self._build_batches(self._sort_events(self._synthesize_from_frames(frames,limit=48)),frames)
-            if len(batches)==0:
-                batches=self._create_default_batches()
-            self.st.signal_optprog.emit(55,"准备训练")
-            self.st.strategy.train_incremental(batches,lambda p,t:self.st.signal_optprog.emit(p,t))
+            sample_count,tsmin,tsmax=self._count_samples(all_days)
+            if self.cancel_flag.is_set():
+                self._done(False)
+                return
+            trained_batches_count=0
+            trained_sample_count=0
+            if sample_count>0:
+                total_batches=max(1,(sample_count+5)//6)
+                self.st.signal_optprog.emit(45,"整理样本")
+                self.st.signal_optprog.emit(50,"构建批次")
+                batch_iter=self._stream_batches(all_days,total_batches)
+                self.st.signal_optprog.emit(55,"准备训练")
+                self.st.strategy.train_incremental(batch_iter,lambda p,t:self.st.signal_optprog.emit(p,t),total_batches)
+                trained_batches_count=total_batches
+                trained_sample_count=sample_count
+            else:
+                frames_pool=self._collect_frames(all_days,limit=256)
+                events=self._enrich_events([],frames_pool)
+                if len(events)==0:
+                    batches=self._create_default_batches()
+                else:
+                    synth=self._sort_events(events)
+                    batches=self._build_batches(synth,frames_pool)
+                self.st.signal_optprog.emit(55,"准备训练")
+                self.st.strategy.train_incremental(batches,lambda p,t:self.st.signal_optprog.emit(p,t),len(batches))
+                trained_batches_count=len(batches)
+                trained_sample_count=sum(int(b[0].shape[0]) for b in batches) if batches else 0
             path=self.st.manifest.target_path()
             ModelIO.save(self.st.strategy.model,path)
             stamp=time.strftime("%Y%m%d_%H%M%S")
@@ -1732,7 +1760,7 @@ class OptimizerThread(threading.Thread):
             files=[path]
             if backup_path and os.path.exists(backup_path):
                 files.append(backup_path)
-            ModelMeta.update(files,{"start":tsmin,"end":tsmax},{"samples":len(batches)})
+            ModelMeta.update(files,{"start":tsmin,"end":tsmax},{"samples":trained_sample_count,"batches":trained_batches_count})
             self.st.strategy.ensure_loaded(lambda p,t:None)
             self.st.model_loaded=True
             self._done(True)
@@ -1742,6 +1770,169 @@ class OptimizerThread(threading.Thread):
     def _done(self,ok):
         self.st.optimizing=False
         self.cb(ok)
+    def _count_samples(self,days):
+        total=0
+        tsmin=None
+        tsmax=None
+        total_days=max(1,len(days))
+        processed=0
+        for d in days:
+            if self.cancel_flag.is_set():
+                break
+            frames=self._load_frames_meta(d)
+            ep=os.path.join(d,"events.jsonl")
+            if os.path.exists(ep):
+                JSONLWriter.repair(ep)
+                hist=collections.deque(maxlen=64)
+                with open(ep,"r",encoding="utf-8") as f:
+                    for line in f:
+                        try:
+                            e=json.loads(line)
+                        except:
+                            continue
+                        hist.append(e)
+                        t=self._event_time(e)
+                        if t is not None:
+                            if tsmin is None or t<tsmin:
+                                tsmin=t
+                            if tsmax is None or t>tsmax:
+                                tsmax=t
+                        if self._qualify_event(e) and self._valid_label(e,frames):
+                            total+=1
+                hist.clear()
+            processed+=1
+            self.st.signal_optprog.emit(20+int(20*processed/max(1,total_days)),"解析数据")
+        return total,tsmin,tsmax
+    def _load_frames_meta(self,day,limit=None):
+        frames={}
+        fp=os.path.join(day,"frames.jsonl")
+        if os.path.exists(fp):
+            JSONLWriter.repair(fp)
+            with open(fp,"r",encoding="utf-8") as f:
+                for line in f:
+                    if limit is not None and len(frames)>=limit:
+                        break
+                    try:
+                        r=json.loads(line)
+                        frames[r["id"]]=r
+                    except:
+                        pass
+        return frames
+    def _collect_frames(self,days,limit=None):
+        collected={}
+        for d in days:
+            if self.cancel_flag.is_set():
+                break
+            remain=None
+            if limit is not None:
+                remain=max(0,limit-len(collected))
+                if remain<=0:
+                    break
+            frames=self._load_frames_meta(d,remain)
+            collected.update(frames)
+            if limit is not None and len(collected)>=limit:
+                break
+        return collected
+    def _qualify_event(self,e):
+        if e.get("type") not in ["left","right","middle"]:
+            return False
+        if e.get("mode") not in ["learning","training"]:
+            return False
+        return True
+    def _valid_label(self,e,frames):
+        fid=e.get("frame_id")
+        if not fid:
+            return False
+        fr=frames.get(fid)
+        if not fr:
+            return False
+        try:
+            w=int(fr.get("w",0))
+            h=int(fr.get("h",0))
+        except:
+            return False
+        if w<=0 or h<=0:
+            return False
+        try:
+            x=int(float(e.get("press_lx",0))/2560.0*w)
+            y=int(float(e.get("press_ly",0))/1600.0*h)
+        except:
+            return False
+        if x<0 or x>=w or y<0 or y>=h:
+            return False
+        return True
+    def _stream_batches(self,days,total_batches):
+        bs=6
+        pending=[]
+        produced=0
+        for d in days:
+            if self.cancel_flag.is_set():
+                return
+            frames=self._load_frames_meta(d)
+            ep=os.path.join(d,"events.jsonl")
+            if not os.path.exists(ep):
+                continue
+            JSONLWriter.repair(ep)
+            hist=collections.deque(maxlen=64)
+            with open(ep,"r",encoding="utf-8") as f:
+                for line in f:
+                    if self.cancel_flag.is_set():
+                        return
+                    try:
+                        e=json.loads(line)
+                    except:
+                        continue
+                    hist.append(e)
+                    if not self._qualify_event(e):
+                        continue
+                    fid=e.get("frame_id")
+                    fr=frames.get(fid)
+                    if not fr:
+                        continue
+                    try:
+                        buf=np.fromfile(fr.get("path"),dtype=np.uint8)
+                    except:
+                        continue
+                    img=cv2.imdecode(buf,cv2.IMREAD_COLOR)
+                    if img is None:
+                        continue
+                    label=self._make_label(e,img.shape[1],img.shape[0])
+                    if label is None:
+                        continue
+                    ctx=self._context_tensor(list(hist),len(hist)-1)
+                    hist_t=self._history_tensor(list(hist),len(hist)-1)
+                    tensor_img=torch.from_numpy(cv2.resize(img,(320,200))).permute(2,0,1).float()/255.0
+                    pending.append((tensor_img,ctx,label,hist_t))
+                    if len(pending)>=bs:
+                        produced+=1
+                        yield self._stack_batch(pending[:bs])
+                        del pending[:bs]
+                        if total_batches>0:
+                            prog=45+int(5*min(produced,total_batches)/total_batches)
+                            self.st.signal_optprog.emit(min(prog,55),"构建批次")
+            hist.clear()
+        if pending:
+            yield self._stack_batch(pending)
+    def _stack_batch(self,samples):
+        imgs=[]
+        ctxs=[]
+        labels=[]
+        hists=[]
+        for (img,ctx,label,hist) in samples:
+            imgs.append(img.float())
+            if isinstance(ctx,torch.Tensor):
+                ctxs.append(ctx.to(torch.float32))
+            else:
+                ctxs.append(torch.tensor(ctx,dtype=torch.float32))
+            if isinstance(label,torch.Tensor):
+                labels.append(label.to(torch.float32))
+            else:
+                labels.append(torch.tensor(label,dtype=torch.float32))
+            if isinstance(hist,torch.Tensor):
+                hists.append(hist.to(torch.float32))
+            else:
+                hists.append(torch.tensor(hist,dtype=torch.float32))
+        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(labels,dim=0),torch.stack(hists,dim=0))
     def _sort_events(self,events):
         return sorted(events,key=lambda e:self._event_time(e) or 0)
     def _event_time(self,e):
@@ -1792,22 +1983,12 @@ class OptimizerThread(threading.Thread):
         bs=6
         for i in range(0,len(seqs),bs):
             chunk=seqs[i:i+bs]
-            imgs=[]
-            ctxs=[]
-            labels=[]
-            hists=[]
+            samples=[]
             for (img,ctx,label,hist) in chunk:
-                imgs.append(torch.from_numpy(img).permute(2,0,1).float()/255.0)
-                ctxs.append(ctx)
-                labels.append(label)
-                hists.append(hist)
-            if not imgs:
+                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,hist))
+            if not samples:
                 continue
-            img_t=torch.stack(imgs,dim=0)
-            ctx_t=torch.stack(ctxs,dim=0)
-            labels_t=torch.stack(labels,dim=0)
-            hist_t=torch.stack(hists,dim=0)
-            batches.append((img_t,ctx_t,labels_t,hist_t))
+            batches.append(self._stack_batch(samples))
         return batches
     def _make_label(self,e,w,h):
         x=int(float(e.get("press_lx",0))/2560.0*w)
