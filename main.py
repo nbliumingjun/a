@@ -65,6 +65,7 @@ def _ver(name,modname=None):
 def deps_check():
     core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml")]
     attempt=0
+    max_attempts=3
     while True:
         miss=[]
         for mod,pkg in core:
@@ -72,6 +73,7 @@ def deps_check():
                 miss.append((mod,pkg))
         if not miss:
             break
+        attempt+=1
         pkg_names=sorted(set(pkg for _,pkg in miss))
         _msgbox("依赖准备","检测到缺失依赖:\n"+"\n".join(pkg_names)+"\n系统将自动安装")
         for pkg in pkg_names:
@@ -80,12 +82,21 @@ def deps_check():
                 subprocess.check_call([sys.executable,"-m","pip","install",pkg],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             except Exception as e:
                 print(f"install {pkg} failed:{e}")
-        attempt+=1
-        if attempt>=3:
-            _msgbox("依赖安装","自动安装多次失败，请手动安装缺失依赖后点击确定继续")
-            attempt=0
-            time.sleep(3)
+        if attempt>=max_attempts:
+            remain=sorted(set(mod for mod,_ in miss))
+            msg="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)
+            print(msg)
+            _msgbox("依赖安装",msg)
+            break
         time.sleep(1)
+    miss_final=[]
+    for mod,_ in core:
+        if importlib.util.find_spec(mod) is None:
+            miss_final.append(mod)
+    if miss_final:
+        msg="依赖未满足:"+",".join(miss_final)
+        _msgbox("依赖检查",msg)
+        raise RuntimeError(msg)
     d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml")}
     with open(deps_path,"w",encoding="utf-8") as f:
         json.dump(d,f,ensure_ascii=False,indent=2)
@@ -1699,16 +1710,29 @@ class OptimizerThread(threading.Thread):
             self.st.strategy.train_incremental(batches,lambda p,t:self.st.signal_optprog.emit(p,t))
             path=self.st.manifest.target_path()
             ModelIO.save(self.st.strategy.model,path)
+            stamp=time.strftime("%Y%m%d_%H%M%S")
+            suffix=Path(path).suffix or ".npz"
+            backup_name=f"{Path(path).stem}_{stamp}_{time.time_ns()%1000000:06d}{suffix}"
+            backup_path=os.path.join(models_dir,backup_name)
+            try:
+                shutil.copy2(path,backup_path)
+            except:
+                backup_path=None
             calc=self.st.manifest._hash(path)
             self.st.manifest.sha_value=calc
             self.st.manifest._update_cfg_hash(calc)
             self.st.cfg["model_sha256"]=calc
             self.st.cfg["model_sha256_backup"]=calc
+            if backup_path:
+                self.st.cfg["model_fallback"]=backup_path
             with open(cfg_path,"w",encoding="utf-8") as f:
                 json.dump(self.st.cfg,f,ensure_ascii=False,indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            ModelMeta.update([path],{"start":tsmin,"end":tsmax},{"samples":len(batches)})
+            files=[path]
+            if backup_path and os.path.exists(backup_path):
+                files.append(backup_path)
+            ModelMeta.update(files,{"start":tsmin,"end":tsmax},{"samples":len(batches)})
             self.st.strategy.ensure_loaded(lambda p,t:None)
             self.st.model_loaded=True
             self._done(True)
@@ -2164,6 +2188,7 @@ class UIInspector:
         return merged
 class Main(QMainWindow):
     finish_opt=Signal(bool)
+    finish_ui=Signal(bool,str,object)
     def __init__(self):
         super().__init__()
         self.setWindowTitle("智能学习与训练")
@@ -2243,6 +2268,7 @@ class Main(QMainWindow):
         self.state.signal_modelprog.connect(self.on_modelprog)
         self.state.signal_ui_ready.connect(self.on_ui_ready)
         self.finish_opt.connect(self._handle_opt_finished)
+        self.finish_ui.connect(self._handle_ui_finished)
         self.refresh_timer=QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_windows)
         self.refresh_timer.start(2000)
@@ -2258,6 +2284,7 @@ class Main(QMainWindow):
         self.learning_thread=None
         self.training_thread=None
         self._optim_flag=threading.Event()
+        self._ui_thread=None
         self._ui_busy=False
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
@@ -2450,21 +2477,27 @@ class Main(QMainWindow):
         if img is None:
             QMessageBox.information(self,"提示","无法获取窗口画面")
             return
+        events=self.state._recent_events(source="user",mode="learning")
         self._ui_busy=True
         self.btn_opt.setEnabled(False)
         self.btn_ui.setEnabled(False)
         self.lbl_tip.setText("正在执行UI识别")
-        ok=False
-        err=""
-        try:
-            events=self.state._recent_events(source="user",mode="learning")
-            res=self.inspector.analyze(img,events)
-            self.state.signal_ui_ready.emit(res)
-            ok=True
-        except Exception as e:
-            err=str(e)
-            log(f"ui detect error:{e}")
+        def task():
+            ok=False
+            err=""
+            res=[]
+            try:
+                res=self.inspector.analyze(img,events)
+                ok=True
+            except Exception as e:
+                err=str(e)
+                log(f"ui detect error:{e}")
+            self.finish_ui.emit(ok,err,res)
+        self._ui_thread=threading.Thread(target=task,daemon=True)
+        self._ui_thread.start()
+    def _handle_ui_finished(self,ok,err,res):
         if ok:
+            self.state.signal_ui_ready.emit(res)
             QMessageBox.information(self,"提示","UI识别完成，结果已列出")
             self.lbl_tip.setText("UI识别完成，已恢复学习")
         else:
@@ -2473,6 +2506,7 @@ class Main(QMainWindow):
         self.btn_opt.setEnabled(True)
         self.btn_ui.setEnabled(True)
         self._ui_busy=False
+        self._ui_thread=None
         self.set_mode("learning",force=True)
     def on_model_ready_check(self):
         if not self.state.model_ready_event.is_set():
