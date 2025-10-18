@@ -782,12 +782,12 @@ class AdaptiveHyperParams:
         self.values=vals
         self.pref_map={}
         self.prefers_high=True
+        self.save_cb=None
         self.set_preferences(cfg.get("ui_preferences"))
         self.metrics=collections.deque(maxlen=240)
         self.ai_history=collections.deque(maxlen=360)
         self.resource=collections.deque(maxlen=240)
         self.last_update=time.time()
-        self.save_cb=None
         self._last_snapshot=None
     def snapshot(self):
         data=dict(self.values)
@@ -894,11 +894,12 @@ class AdaptiveHyperParams:
         lo,hi=self.bounds[key]
         self.values[key]=float(min(hi,max(lo,self.values[key]+delta)))
     def _notify(self):
-        if self.save_cb:
+        cb=getattr(self,"save_cb",None)
+        if cb:
             snap=tuple((k,self.values[k]) for k in sorted(self.values.keys()))
             if snap!=self._last_snapshot:
                 self._last_snapshot=snap
-                self.save_cb(self.values)
+                cb(self.values)
 class StrategyEngine:
     def __init__(self,manifest):
         self.manifest=manifest
