@@ -96,11 +96,13 @@ def deps_check():
             if code!=0:
                 raise subprocess.CalledProcessError(code,cmd)
         except Exception as e:
-            log(f"install bundle failed:{e}")
-            print(f"install bundle failed:{e}")
+            hint=f"install bundle failed:{e}"
+            log(hint)
+            log("suggestion:verify network connectivity, pip index accessibility, and administrator permissions")
+            print(hint)
         if attempt>=max_attempts:
             remain=sorted(set(mod for mod,_ in miss))
-            msg="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)
+            msg="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)+f"\n请检查网络或权限设置，并查看日志:{log_path}"
             print(msg)
             _msgbox("依赖安装",msg)
             break
@@ -591,6 +593,27 @@ class SemanticAggregator(nn.Module):
         out,_=self.gru(seq)
         pooled=out.mean(dim=1)
         return self.proj(pooled)
+class GameSceneInterpreter(nn.Module):
+    def __init__(self,hidden=192):
+        super().__init__()
+        self.spatial=nn.Sequential(nn.Conv2d(3,32,3,2,1),nn.GELU(),nn.Conv2d(32,64,3,2,1),nn.GELU(),nn.Conv2d(64,128,3,2,1),nn.GELU(),nn.Conv2d(128,hidden,3,2,1),nn.GELU())
+        self.temporal=nn.GRU(hidden,hidden,batch_first=True)
+        self.proj=nn.Linear(hidden,hidden)
+    def forward(self,x,state=None):
+        if state is not None:
+            state=state.detach()
+        feat=self.spatial(x)
+        pooled=F.adaptive_avg_pool2d(feat,(1,1)).view(feat.shape[0],1,feat.shape[1])
+        out,state=self.temporal(pooled,state)
+        emb=self.proj(out[:, -1, :])
+        return emb,state
+class MultiTargetDecision(nn.Module):
+    def __init__(self,dim=192):
+        super().__init__()
+        self.net=nn.Sequential(nn.LayerNorm(dim*3),nn.Linear(dim*3,dim),nn.GELU(),nn.Linear(dim,dim//2),nn.GELU(),nn.Linear(dim//2,3))
+    def forward(self,scene,plan,ui):
+        joined=torch.cat([scene,plan,ui],dim=-1)
+        return torch.softmax(self.net(joined),dim=-1)
 class StrategyEngine:
     def __init__(self,manifest):
         self.manifest=manifest
@@ -605,6 +628,9 @@ class StrategyEngine:
         self.semantic=SemanticAggregator()
         self.semantic.to(self.device)
         self.planner=TemporalPlanner().to(self.device)
+        self.scene=GameSceneInterpreter().to(self.device)
+        self.decision=MultiTargetDecision(self.context_dim).to(self.device)
+        self.scene_state=None
         self.loaded_path=None
     def ensure_loaded(self,progress_cb=None):
         path=self.manifest.ensure(progress_cb)
@@ -703,13 +729,23 @@ class StrategyEngine:
         frame_embed=self.embed_frame(img)
         self.update_temporal(frame_embed)
         plan_in=torch.stack(list(self.temporal_memory),dim=1) if len(self.temporal_memory)>0 else torch.zeros((1,0,self.context_dim),dtype=torch.float32,device=self.device)
+        scene_tensor=torch.from_numpy(inp).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
+        with torch.no_grad():
+            scene_vec,self.scene_state=self.scene(scene_tensor,self.scene_state)
         if plan_in.shape[1]>0:
             with torch.no_grad():
                 plan=self.planner(plan_in)
                 plan_vec=plan.mean(dim=1)
-                gate=float(torch.sigmoid(plan_vec.mean()).item())
+                gate_plan=float(torch.sigmoid(plan_vec.mean()).item())
         else:
-            gate=0.5
+            plan_vec=torch.zeros((1,self.context_dim),dtype=torch.float32,device=self.device)
+            gate_plan=0.5
+        ui_summary=self._ui_summary_tensor(ui_elements,w,h)
+        with torch.no_grad():
+            decision=self.decision(scene_vec,plan_vec,ui_summary)
+        multi_factor=float(decision[0,1].item())
+        risk_factor=float(decision[0,2].item())
+        gate=float(min(1.0,max(0.0,0.4*gate_plan+0.4*multi_factor+0.2*risk_factor)))
         score=cv2.resize(left,(w,h),interpolation=cv2.INTER_CUBIC)
         goal=self.synthesize_goal_map(ui_elements,w,h)
         if goal is not None:
@@ -719,13 +755,14 @@ class StrategyEngine:
         if event_prior is not None:
             score=score*(0.6+0.2*gate)+event_prior*(0.4-0.2*gate)
         score=np.clip(score,0,1)
+        tactical=self._multi_target_plan(score,ui_elements,multi_factor,risk_factor)
         y,x=np.unravel_index(np.argmax(score),score.shape)
         conf=float(score[y,x])
         grid=(score.shape[1],score.shape[0])
-        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid}
+        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical}
         if conf<0.18:
             return base
-        btn="left" if conf>0.55 else "right"
+        btn="left" if conf>0.55 or risk_factor>0.45 else "right"
         gy,gx=np.gradient(score)
         vx=float(gx[y,x])
         vy=float(gy[y,x])
@@ -755,16 +792,18 @@ class StrategyEngine:
             act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":0.18+0.22*gate,"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey))}
         else:
             act=make_tap(x,y,btn,conf)
-        peaks=self.local_maxima(score,top=6,dist=40)
+        peaks=self.local_maxima(score,top=8,dist=36)
         extra=[]
+        budget=1+int(multi_factor>0.35)+int(multi_factor>0.62)
         for (px,py,pv) in peaks:
-            if len(extra)>=2:
+            if len(extra)>=budget:
                 break
             if px==x and py==y:
                 continue
-            if pv<0.62:
+            if pv<0.5+0.1*multi_factor:
                 continue
-            extra.append(make_tap(px,py,"left" if pv>0.7 else "right",pv))
+            choice="left" if pv>0.65 or risk_factor>0.55 else "right"
+            extra.append(make_tap(px,py,choice,pv))
         if extra:
             seq=[dict(act)]
             for item in extra:
@@ -776,6 +815,65 @@ class StrategyEngine:
         act["heat"]=score
         act["heat_shape"]=grid
         return act
+    def _ui_summary_tensor(self,ui_elements,w,h):
+        vec=torch.zeros((1,self.context_dim),dtype=torch.float32,device=self.device)
+        if not ui_elements:
+            return vec
+        total=len(ui_elements)
+        conf=sum(float(el.get("confidence",0)) for el in ui_elements)
+        interact=sum(float(el.get("interaction",0)) for el in ui_elements)
+        areas=[]
+        for el in ui_elements:
+            b=el.get("bounds",[0,0,0,0])
+            width=max(1.0,float(b[2])-float(b[0]))
+            height=max(1.0,float(b[3])-float(b[1]))
+            areas.append(width*height/(max(1.0,w)*max(1.0,h)))
+        avg_area=sum(areas)/len(areas) if areas else 0.0
+        vec[0,0]=min(1.0,total/64.0)
+        vec[0,1]=min(1.0,conf/max(1,total))
+        vec[0,2]=min(1.0,interact/max(1,total))
+        vec[0,3]=min(1.0,avg_area)
+        vec[0,4]=min(1.0,max(areas) if areas else 0.0)
+        vec[0,5]=min(1.0,min(areas) if areas else 0.0)
+        vec[0,6]=float(sum(1 for el in ui_elements if el.get("type")=="button"))/max(1,total)
+        vec[0,7]=float(sum(1 for el in ui_elements if el.get("type")=="panel"))/max(1,total)
+        vec[0,8]=float(sum(1 for el in ui_elements if el.get("type")=="input"))/max(1,total)
+        vec[0,9]=float(sum(1 for el in ui_elements if el.get("interaction",0)>0.5))/max(1,total)
+        return vec
+    def _multi_target_plan(self,score,ui_elements,multi_factor,risk_factor):
+        h,w=score.shape
+        flat=score.reshape(-1)
+        indices=np.argpartition(-flat,min(len(flat)-1,8))[:8]
+        coords=[]
+        for idx in indices:
+            y=idx//w
+            x=idx%w
+            coords.append((int(x),int(y),float(score[y,x])))
+        coords.sort(key=lambda t:t[2],reverse=True)
+        plan=[]
+        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)
+        used=set()
+        for x,y,val in coords:
+            if len(plan)>=budget:
+                break
+            key=(x//32,y//32)
+            if key in used:
+                continue
+            used.add(key)
+            plan.append({"x":x,"y":y,"confidence":val})
+        if ui_elements and plan:
+            for item in plan:
+                best=None
+                best_score=0.0
+                for el in ui_elements:
+                    b=el.get("bounds",[0,0,0,0])
+                    if item["x"]>=b[0] and item["x"]<=b[2] and item["y"]>=b[1] and item["y"]<=b[3]:
+                        score=float(el.get("confidence",0))*0.6+float(el.get("interaction",0))*0.4
+                        if score>best_score:
+                            best_score=score
+                            best=el.get("type","unknown")
+                item["ui_type"]=best or "unknown"
+        return plan
     def train_incremental(self,batches,progress_cb=None,total=None):
         self.model.train()
         opt=optim.AdamW(list(self.model.parameters())+list(self.semantic.parameters())+list(self.planner.parameters()),lr=1e-4,weight_decay=1e-4)
