@@ -1436,16 +1436,20 @@ class Foreground:
             total=0
             for (px,py) in pts:
                 total+=1
-                hw=ctypes.windll.user32.WindowFromPoint(ctypes.wintypes.POINT(px,py))
+                try:
+                    hw=win32gui.WindowFromPoint((px,py))
+                except:
+                    hw=0
                 if hw==0:
-                    blocked+=1
-                else:
-                    rt=Foreground.top(hw)
-                    if rt==th:
-                        continue
-                    if Foreground._ignore(rt,target_pid):
-                        continue
-                    blocked+=1
+                    continue
+                rt=Foreground.top(hw)
+                if rt==th:
+                    continue
+                if Foreground._ignore(rt,target_pid):
+                    continue
+                if not Foreground._above(rt,th):
+                    continue
+                blocked+=1
                 if blocked>total//2:
                     return True
             return False
@@ -1493,6 +1497,21 @@ class Foreground:
                 if ctypes.windll.user32.GetLayeredWindowAttributes(ctypes.wintypes.HWND(hwnd),ctypes.byref(color),ctypes.byref(alpha),ctypes.byref(flags)):
                     if alpha.value==0:
                         return True
+            return False
+        except:
+            return False
+    @staticmethod
+    def _above(candidate,target):
+        try:
+            if candidate==0 or target==0:
+                return False
+            cur=win32gui.GetWindow(target,win32con.GW_HWNDPREV)
+            steps=0
+            while cur and steps<512:
+                if cur==candidate:
+                    return True
+                cur=win32gui.GetWindow(cur,win32con.GW_HWNDPREV)
+                steps+=1
             return False
         except:
             return False
@@ -3912,18 +3931,31 @@ class UIInspector:
             return None
         crop=orig_img[ay1:ay2,ax1:ax2]
         screen=self._to_screen_bounds((ax1,ay1,ax2,ay2))
-        text=self._normalize_text(self.uia.text(screen,self.window_hwnd)) if hasattr(self,"uia") and self.uia else ""
-        qual=0.6 if text else 0.0
-        if not text or not any(ch.isdigit() for ch in text):
+        raw=self.uia.text(screen,self.window_hwnd) if hasattr(self,"uia") and self.uia else ""
+        display=self._sanitize_text(raw)
+        numeric=self._numeric_text(display)
+        qual=0.5 if display else 0.0
+        if not display or (not numeric):
             ocr_text,prob=self._ocr_digits(crop)
-            text=self._normalize_text(ocr_text)
+            alt_display=self._sanitize_text(ocr_text)
+            if len(alt_display)>len(display):
+                display=alt_display
+            if not numeric:
+                numeric=self._numeric_text(alt_display)
             qual=max(qual,prob)
-        if not text or not any(ch.isdigit() for ch in text):
+        if not display:
+            estimate=self._estimate_region_value(crop)
+            display=f"亮度{int(round(estimate))}"
+            if not numeric:
+                numeric=self._numeric_text(str(int(round(estimate))))
+            qual=max(qual,0.2)
+        if numeric:
+            if not self._validate_numeric_patch(crop,numeric,qual):
+                numeric=""
+        value=self._parse_numeric(numeric) if numeric else None
+        if not display:
             return None
-        if not self._validate_numeric_patch(crop,text,qual):
-            return None
-        value=self._parse_numeric(text)
-        return text,value,max(qual,0.05)
+        return display,value,max(qual,0.05)
     def _validate_numeric_patch(self,img,text,qual):
         if img is None or img.size==0:
             return False
@@ -3973,10 +4005,29 @@ class UIInspector:
     def _to_screen_bounds(self,bounds):
         left,top,_,_=self.st.client_rect if hasattr(self.st,"client_rect") else (0,0,0,0)
         return (left+bounds[0],top+bounds[1],left+bounds[2],top+bounds[3])
-    def _normalize_text(self,text):
+    def _sanitize_text(self,text):
+        if not text:
+            return ""
+        cleaned=re.sub(r"[\r\n\t]+"," ",str(text))
+        cleaned=re.sub(r"\s+"," ",cleaned).strip()
+        if len(cleaned)>48:
+            cleaned=cleaned[:45]+"..."
+        return cleaned
+    def _numeric_text(self,text):
         if not text:
             return ""
         return re.sub(r"[^0-9\.\-]+","",str(text))
+    def _estimate_region_value(self,img):
+        if img is None or img.size==0:
+            return 0.0
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        mean=float(np.mean(gray))
+        contrast=float(np.std(gray))
+        score=min(100.0,max(0.0,mean/255.0*100.0+contrast/255.0*45.0))
+        return score
     def _parse_numeric(self,text):
         if not text:
             return None
