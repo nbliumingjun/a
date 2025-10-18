@@ -1764,25 +1764,10 @@ class State(QObject):
         overlay=np.zeros_like(base)
         outlines=[]
         for it in items:
-            nb=it.get("norm_bounds")
-            if not nb or len(nb)!=4:
-                bounds=it.get("bounds")
-                if not bounds or len(bounds)!=4:
-                    continue
-                nb=[float(bounds[0])/1280.0,float(bounds[1])/800.0,float(bounds[2])/1280.0,float(bounds[3])/800.0]
-            try:
-                nx1=float(nb[0])
-                ny1=float(nb[1])
-                nx2=float(nb[2])
-                ny2=float(nb[3])
-            except:
+            rect=self._preview_rect(it,w,h)
+            if rect is None:
                 continue
-            if nx2<=nx1 or ny2<=ny1:
-                continue
-            x1=int(max(0,min(w-1,math.floor(nx1*w))))
-            y1=int(max(0,min(h-1,math.floor(ny1*h))))
-            x2=int(max(x1+1,min(w,math.ceil(nx2*w))))
-            y2=int(max(y1+1,min(h,math.ceil(ny2*h))))
+            x1,y1,x2,y2=rect
             color=it.get("color")
             key=it.get("key")
             if key and (not color or len(color)!=3):
@@ -1799,6 +1784,69 @@ class State(QObject):
         for x1,y1,x2,y2,col in outlines:
             cv2.rectangle(blended,(x1,y1),(x2-1,y2-1),col,2)
         return blended
+    def _preview_rect(self,item,w,h):
+        win=item.get("window_size")
+        if isinstance(win,list) and len(win)==2:
+            try:
+                dw=max(1,int(win[0]))
+                dh=max(1,int(win[1]))
+            except:
+                dw=w
+                dh=h
+        else:
+            dw=w
+            dh=h
+        nb=item.get("norm_bounds")
+        ax1=ay1=ax2=ay2=None
+        if nb and len(nb)==4:
+            try:
+                nx1=float(nb[0])
+                ny1=float(nb[1])
+                nx2=float(nb[2])
+                ny2=float(nb[3])
+            except:
+                nx1=ny1=nx2=ny2=None
+            if nx1 is not None and nx2 is not None and ny1 is not None and ny2 is not None and nx2>nx1 and ny2>ny1:
+                ax1=nx1*dw
+                ay1=ny1*dh
+                ax2=nx2*dw
+                ay2=ny2*dh
+        if ax1 is None:
+            absb=item.get("abs_bounds")
+            if absb and len(absb)==4:
+                try:
+                    ax1=float(absb[0])
+                    ay1=float(absb[1])
+                    ax2=float(absb[2])
+                    ay2=float(absb[3])
+                except:
+                    return None
+            else:
+                bounds=item.get("bounds")
+                if not bounds or len(bounds)!=4:
+                    return None
+                try:
+                    ax1=float(bounds[0])
+                    ay1=float(bounds[1])
+                    ax2=float(bounds[2])
+                    ay2=float(bounds[3])
+                except:
+                    return None
+                base_w=1280.0
+                base_h=800.0
+                ax1=ax1*dw/base_w
+                ay1=ay1*dh/base_h
+                ax2=ax2*dw/base_w
+                ay2=ay2*dh/base_h
+        sx=w/float(dw)
+        sy=h/float(dh)
+        x1=int(max(0,min(w-1,math.floor(ax1*sx))))
+        y1=int(max(0,min(h-1,math.floor(ay1*sy))))
+        x2=int(max(x1+1,min(w,math.ceil(ax2*sx))))
+        y2=int(max(y1+1,min(h,math.ceil(ay2*sy))))
+        if x2<=x1 or y2<=y1:
+            return None
+        return x1,y1,x2,y2
     def _align_dim(self,val,step):
         if step<=0:
             return int(val)
@@ -3775,18 +3823,30 @@ class UIInspector:
             q=lambda v:int(round(v/4.0)*4)
             key=f"{q(x1)}_{q(y1)}_{q(x2)}_{q(y2)}"
             name=f"数据{idx+1}"
-            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key,base_shape)
+            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key,base_shape,orig_img.shape)
             if len(data)>=32:
                 break
         return data
-    def _append_data(self,data,name,bounds,value,text,confidence,key,base_shape):
+    def _append_data(self,data,name,bounds,value,text,confidence,key,base_shape,orig_shape):
         pref=self.st.preference_for_data(name)
         trend=self._trend(key,value)
         color=self.st.ensure_data_color(key)
         bw=max(1,base_shape[1])
         bh=max(1,base_shape[0])
-        norm=[max(0.0,min(1.0,float(bounds[0])/bw)),max(0.0,min(1.0,float(bounds[1])/bh)),max(0.0,min(1.0,float(bounds[2])/bw)),max(0.0,min(1.0,float(bounds[3])/bh))]
-        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
+        if orig_shape is None or len(orig_shape)<2:
+            ow=bw
+            oh=bh
+        else:
+            ow=max(1,orig_shape[1])
+            oh=max(1,orig_shape[0])
+        sx=float(ow)/float(bw)
+        sy=float(oh)/float(bh)
+        ax1=int(max(0,min(ow-1,round(bounds[0]*sx))))
+        ay1=int(max(0,min(oh-1,round(bounds[1]*sy))))
+        ax2=int(max(ax1+1,min(ow,round(bounds[2]*sx))))
+        ay2=int(max(ay1+1,min(oh,round(bounds[3]*sy))))
+        norm=[max(0.0,min(1.0,float(ax1)/float(ow))),max(0.0,min(1.0,float(ay1)/float(oh))),max(0.0,min(1.0,float(ax2)/float(ow))),max(0.0,min(1.0,float(ay2)/float(oh)))]
+        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
         data.append(entry)
     def _trend(self,key,val):
         hist=self.data_history[key]
