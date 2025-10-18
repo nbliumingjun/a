@@ -1650,6 +1650,118 @@ class State(QObject):
             json.dump(self.cfg,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
+    def _sanitize_data_points(self,items,cw,ch):
+        sanitized=[]
+        idx=0
+        for it in items:
+            if not isinstance(it,dict):
+                continue
+            val=it.get("value")
+            try:
+                val_int=int(val)
+            except:
+                continue
+            if val_int<=0:
+                continue
+            nb=it.get("norm_bounds")
+            if not isinstance(nb,list) or len(nb)!=4:
+                absb=it.get("abs_bounds")
+                win=it.get("window_size")
+                if isinstance(absb,list) and len(absb)==4 and isinstance(win,list) and len(win)==2:
+                    try:
+                        ow=max(1,int(win[0]))
+                        oh=max(1,int(win[1]))
+                        nb=[float(absb[0])/ow,float(absb[1])/oh,float(absb[2])/ow,float(absb[3])/oh]
+                    except:
+                        nb=None
+            if not isinstance(nb,list) or len(nb)!=4:
+                continue
+            try:
+                nx1=float(nb[0])
+                ny1=float(nb[1])
+                nx2=float(nb[2])
+                ny2=float(nb[3])
+            except:
+                continue
+            nx1=max(0.0,min(1.0,nx1))
+            ny1=max(0.0,min(1.0,ny1))
+            nx2=max(0.0,min(1.0,nx2))
+            ny2=max(0.0,min(1.0,ny2))
+            if nx2<=nx1 or ny2<=ny1:
+                continue
+            dw=cw if cw>0 else int((it.get("window_size") or [0,0])[0] or 0)
+            dh=ch if ch>0 else int((it.get("window_size") or [0,0])[1] or 0)
+            if dw<=0 or dh<=0:
+                continue
+            ax1=int(max(0,min(dw-1,round(nx1*dw))))
+            ay1=int(max(0,min(dh-1,round(ny1*dh))))
+            ax2=int(max(ax1+1,min(dw,round(nx2*dw))))
+            ay2=int(max(ay1+1,min(dh,round(ny2*dh))))
+            name=str(it.get("name") or f"数据{idx+1}")
+            key=str(it.get("key") or f"dp_{idx}")
+            color=it.get("color")
+            if not isinstance(color,(list,tuple)) or len(color)!=3:
+                color=self.ensure_data_color(key)
+            else:
+                color=tuple(int(c) for c in color)
+            conf=float(max(0.0,min(1.0,it.get("confidence",0.0))))
+            trend=it.get("trend")
+            try:
+                trend_val=float(trend)
+            except:
+                trend_val=None
+            pref=str(it.get("preference") or self.preference_for_data(name))
+            if pref not in ["higher","lower","ignore"]:
+                pref=self.preference_for_data(name)
+            raw_bounds=it.get("bounds")
+            if isinstance(raw_bounds,(list,tuple)) and len(raw_bounds)==4:
+                try:
+                    bounds_val=[int(raw_bounds[0]),int(raw_bounds[1]),int(raw_bounds[2]),int(raw_bounds[3])]
+                except:
+                    bounds_val=[ax1,ay1,ax2,ay2]
+            else:
+                bounds_val=[ax1,ay1,ax2,ay2]
+            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":str(val_int),"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":[nx1,ny1,nx2,ny2]}
+            sanitized.append(entry)
+            idx+=1
+        return sanitized
+    def set_data_points(self,items):
+        try:
+            cw=max(0,int(self.client_rect[2]-self.client_rect[0]))
+            ch=max(0,int(self.client_rect[3]-self.client_rect[1]))
+        except:
+            cw=0
+            ch=0
+        sanitized=self._sanitize_data_points(items if isinstance(items,list) else [],cw,ch)
+        with self.rect_lock:
+            self.data_points=[dict(p) for p in sanitized]
+        return [dict(p) for p in sanitized]
+    def _rescale_data_points(self,cr):
+        try:
+            cw=max(0,int(cr[2]-cr[0]))
+            ch=max(0,int(cr[3]-cr[1]))
+        except:
+            cw=0
+            ch=0
+        if cw<=0 or ch<=0:
+            return
+        with self.rect_lock:
+            current=[dict(p) for p in self.data_points] if isinstance(self.data_points,list) else []
+        if not current:
+            return
+        sanitized=self._sanitize_data_points(current,cw,ch)
+        with self.rect_lock:
+            self.data_points=[dict(p) for p in sanitized]
+    def update_rects(self,wr,cr):
+        if not isinstance(wr,tuple):
+            wr=tuple(wr) if wr else (0,0,0,0)
+        if not isinstance(cr,tuple):
+            cr=tuple(cr) if cr else (0,0,0,0)
+        changed=cr!=self.client_rect
+        self.rect=wr
+        self.client_rect=cr
+        if changed:
+            self._rescale_data_points(cr)
     def _save_hparams(self,vals):
         serial={}
         for k,v in vals.items():
@@ -1779,7 +1891,8 @@ class State(QObject):
         if img is None or not isinstance(img,np.ndarray):
             return img
         base=np.ascontiguousarray(img.copy())
-        items=self.data_points if isinstance(self.data_points,list) else []
+        with self.rect_lock:
+            items=[dict(p) for p in self.data_points] if isinstance(self.data_points,list) else []
         if not items:
             return base
         h,w=base.shape[:2]
@@ -1807,17 +1920,27 @@ class State(QObject):
             cv2.rectangle(blended,(x1,y1),(x2-1,y2-1),col,2)
         return blended
     def _preview_rect(self,item,w,h):
-        win=item.get("window_size")
-        if isinstance(win,list) and len(win)==2:
-            try:
-                dw=max(1,int(win[0]))
-                dh=max(1,int(win[1]))
-            except:
+        try:
+            cw=max(0,int(self.client_rect[2]-self.client_rect[0]))
+            ch=max(0,int(self.client_rect[3]-self.client_rect[1]))
+        except:
+            cw=0
+            ch=0
+        if cw>0 and ch>0:
+            dw=cw
+            dh=ch
+        else:
+            win=item.get("window_size")
+            if isinstance(win,list) and len(win)==2:
+                try:
+                    dw=max(1,int(win[0]))
+                    dh=max(1,int(win[1]))
+                except:
+                    dw=w
+                    dh=h
+            else:
                 dw=w
                 dh=h
-        else:
-            dw=w
-            dh=h
         nb=item.get("norm_bounds")
         ax1=ay1=ax2=ay2=None
         if nb and len(nb)==4:
@@ -2669,8 +2792,7 @@ class LearningThread(threading.Thread):
         prev=None
         while (self.st.mode=="learning") and (not self.st.stop_event.is_set()):
             wr,cr=self.st.get_rects()
-            self.st.rect=wr
-            self.st.client_rect=cr
+            self.st.update_rects(wr,cr)
             if cr==(0,0,0,0) or not self.st.selected_hwnd or not Foreground.ready(self.st.selected_hwnd,cr):
                 self.st.update_visibility(False,"学习暂停：窗口不可见或被遮挡")
                 time.sleep(0.12)
@@ -2710,8 +2832,7 @@ class TrainerThread(threading.Thread):
             if self.st.interrupt_ai:
                 break
             wr,cr=self.st.get_rects()
-            self.st.rect=wr
-            self.st.client_rect=cr
+            self.st.update_rects(wr,cr)
             if cr==(0,0,0,0) or not self.st.selected_hwnd or not Foreground.ready(self.st.selected_hwnd,cr):
                 self.st.update_visibility(False,"训练暂停：窗口不可见或被遮挡")
                 time.sleep(0.10)
@@ -3660,16 +3781,16 @@ class UIInspector:
             results=sorted(results,key=lambda item:item.get("confidence",0),reverse=True)[:limit]
         data_points=self._collect_data(base,img,events,results)
         self.st.ui_elements=results
-        self.st.data_points=data_points
+        cleaned=self.st.set_data_points(data_points)
         with open(ui_cache_path,"w",encoding="utf-8") as f:
             json.dump(results,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
         with open(data_cache_path,"w",encoding="utf-8") as f:
-            json.dump(data_points,f,ensure_ascii=False,indent=2)
+            json.dump(cleaned,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
-        return {"ui":results,"data":data_points}
+        return {"ui":results,"data":cleaned}
     def _refresh_schema(self,force=False):
         try:
             mtime=os.path.getmtime(schema_path)
@@ -3928,7 +4049,7 @@ class UIInspector:
             key=f"{q(x1)}_{q(y1)}_{q(x2)}_{q(y2)}"
             name=f"数据{idx+1}"
             entry=self._build_data_entry(name,(x1,y1,x2,y2),value,text,conf,key,base_shape,orig_img.shape)
-            if entry is None:
+            if entry is None or entry.get("value") is None:
                 continue
             uniq=(entry["key"],entry.get("text",""))
             prev=buckets.get(uniq)
@@ -3959,7 +4080,14 @@ class UIInspector:
         ax2=int(max(ax1+1,min(ow,round(bounds[2]*sx))))
         ay2=int(max(ay1+1,min(oh,round(bounds[3]*sy))))
         norm=[max(0.0,min(1.0,float(ax1)/float(ow))),max(0.0,min(1.0,float(ay1)/float(oh))),max(0.0,min(1.0,float(ax2)/float(ow))),max(0.0,min(1.0,float(ay2)/float(oh)))]
-        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
+        val_entry=None
+        if value is not None:
+            try:
+                val_entry=int(value)
+            except:
+                val_entry=None
+        txt=str(val_entry) if val_entry is not None else (text or "")
+        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":val_entry,"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
         return entry
     def _dedupe_data_entries(self,items):
         result=[]
@@ -3992,29 +4120,41 @@ class UIInspector:
         screen=self._to_screen_bounds((ax1,ay1,ax2,ay2))
         raw=self.uia.text(screen,self.window_hwnd) if hasattr(self,"uia") and self.uia else ""
         display=self._sanitize_text(raw)
-        numeric=self._numeric_text(display)
-        qual=0.5 if display else 0.0
-        if not display or (not numeric):
-            ocr_text,prob=self._ocr_digits(crop)
-            alt_display=self._sanitize_text(ocr_text)
-            if len(alt_display)>len(display):
-                display=alt_display
-            if not numeric:
-                numeric=self._numeric_text(alt_display)
-            qual=max(qual,prob)
-        if not display:
-            estimate=self._estimate_region_value(crop)
-            display=f"亮度{int(round(estimate))}"
-            if not numeric:
-                numeric=self._numeric_text(str(int(round(estimate))))
-            qual=max(qual,0.2)
-        if numeric:
-            if not self._validate_numeric_patch(crop,numeric,qual):
-                numeric=""
-        value=self._parse_numeric(numeric) if numeric else None
-        if not display:
+        candidates=[]
+        if display:
+            digits=sum(1 for ch in display if ch.isdigit())
+            non_space=sum(1 for ch in display if not ch.isspace())
+            if non_space>0 and digits/non_space>=0.6:
+                filtered="".join(ch for ch in display if ch.isdigit() or ch.isspace())
+                strict=self._strict_positive_integer(filtered)
+                if strict:
+                    candidates.append((strict[0],strict[1],0.62))
+            numeric=self._numeric_text(display)
+            if numeric and "." not in numeric and "-" not in numeric:
+                strict=self._strict_positive_integer(numeric)
+                if strict and all(strict[0]!=c[0] for c in candidates):
+                    candidates.append((strict[0],strict[1],0.58))
+        ocr_text,prob=self._ocr_digits(crop)
+        if ocr_text:
+            oclean=self._sanitize_text(ocr_text)
+            onumeric=self._numeric_text(oclean)
+            if onumeric and "." not in onumeric and "-" not in onumeric:
+                strict=self._strict_positive_integer(onumeric)
+                if strict:
+                    candidates.append((strict[0],strict[1],max(prob,0.65)))
+        best_txt=None
+        best_val=None
+        best_conf=0.0
+        for cand_txt,cand_val,cand_conf in candidates:
+            if not self._validate_numeric_patch(crop,cand_txt,max(cand_conf,0.4)):
+                continue
+            if cand_conf>best_conf:
+                best_conf=cand_conf
+                best_txt=cand_txt
+                best_val=cand_val
+        if best_txt is None:
             return None
-        return display,value,max(qual,0.05)
+        return best_txt,best_val,max(best_conf,0.5)
     def _validate_numeric_patch(self,img,text,qual):
         if img is None or img.size==0:
             return False
@@ -4108,6 +4248,31 @@ class UIInspector:
             return float(m.group(0))
         except:
             return None
+    def _strict_positive_integer(self,text):
+        if not text:
+            return None
+        raw=str(text)
+        if any(ch in raw for ch in ["-","."]):
+            return None
+        if re.search(r"[^0-9\s]",raw):
+            filtered="".join(ch for ch in raw if ch.isdigit() or ch.isspace())
+        else:
+            filtered=raw
+        digits=re.findall(r"\d+",filtered)
+        if not digits:
+            return None
+        joined="".join(digits)
+        if not joined:
+            return None
+        if len(joined)>9:
+            return None
+        try:
+            value=int(joined)
+        except:
+            return None
+        if value<=0:
+            return None
+        return joined,value
     def _ocr_digits(self,img):
         if img is None or img.size==0:
             return "",0.0
@@ -4437,12 +4602,17 @@ class Main(QMainWindow):
         mapping={"higher":0,"lower":1,"ignore":2}
         for idx,it in enumerate(limited):
             name=str(it.get("name",""))
-            raw_text=str(it.get("text",""))
-            if raw_text:
-                val=raw_text
+            num=it.get("value",None)
+            val="--"
+            if isinstance(num,int) and num>0:
+                val=str(num)
             else:
-                num=it.get("value",None)
-                val="--" if num is None else f"{float(num):.3f}".rstrip("0").rstrip(".")
+                try:
+                    num_int=int(num)
+                    if num_int>0:
+                        val=str(num_int)
+                except:
+                    pass
             trend_val=it.get("trend",None)
             trend="--" if trend_val is None else f"{float(trend_val):+.2f}"
             conf_val=it.get("confidence",None)
