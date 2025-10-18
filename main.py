@@ -35,7 +35,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":""}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_value_orientation":"higher","hyperparam_state":{}}
 default_ui_labels=["button","input","panel","label","widget","menu","icon","ability","joystick","skill","toggle","minimap"]
 schema_defaults={"labels":default_ui_labels,"max_items":48}
 def ensure_config():
@@ -645,6 +645,109 @@ class MultiTargetDecision(nn.Module):
     def forward(self,scene,plan,ui):
         joined=torch.cat([scene,plan,ui],dim=-1)
         return torch.softmax(self.net(joined),dim=-1)
+class AdaptiveHyperParams:
+    def __init__(self,cfg):
+        self.bounds={"batch_size":(4,16),"gamma":(0.8,0.99),"lam":(0.5,0.95),"confidence_floor":(0.05,0.4),"primary_threshold":(0.3,0.85),"long_press_threshold":(0.45,0.95),"drag_threshold":(0.3,0.85),"multi_gate":(0.1,0.9),"confidence_margin":(0.05,0.35),"drag_steps":(8,64),"parallel_streams":(1,4),"entropy":(0.0,0.1)}
+        defaults={"batch_size":6,"gamma":0.92,"lam":0.85,"confidence_floor":0.18,"primary_threshold":0.55,"long_press_threshold":0.78,"drag_threshold":0.58,"multi_gate":0.5,"confidence_margin":0.1,"drag_steps":28,"parallel_streams":2,"entropy":0.02}
+        saved=cfg.get("hyperparam_state") if isinstance(cfg.get("hyperparam_state"),dict) else {}
+        vals=dict(defaults)
+        for k,v in saved.items():
+            if k in defaults:
+                lo,hi=self.bounds[k]
+                try:
+                    vals[k]=min(hi,max(lo,float(v)))
+                except:
+                    vals[k]=defaults[k]
+        self.values=vals
+        self.prefers_high=(cfg.get("ui_value_orientation","higher")!="lower")
+        self.metrics=collections.deque(maxlen=240)
+        self.ai_history=collections.deque(maxlen=360)
+        self.resource=collections.deque(maxlen=240)
+        self.last_update=time.time()
+        self.save_cb=None
+        self._last_snapshot=None
+    def snapshot(self):
+        data=dict(self.values)
+        data["prefers_high"]=self.prefers_high
+        return data
+    def set_save_callback(self,cb):
+        self.save_cb=cb
+    def set_orientation(self,prefer_high):
+        self.prefers_high=bool(prefer_high)
+        self._notify()
+    def observe_event(self,event):
+        if not isinstance(event,dict):
+            return
+        if event.get("source")!="ai":
+            return
+        duration=float(event.get("duration",0))
+        inside=float(event.get("ins_release",0))
+        coverage=float(event.get("ins_press",0))
+        self.ai_history.append((duration,inside,coverage,time.time()))
+    def observe_metrics(self,fps,motion,resource,mode):
+        self.metrics.append((float(fps),float(motion),float(resource),time.time(),mode))
+    def observe_resource(self,cpu,mem,gpu,vram):
+        self.resource.append((float(cpu),float(mem),float(gpu),float(vram),time.time()))
+    def adaptive_entropy(self):
+        vals=[max(item[0],item[1],item[2],item[3]) for item in self.resource] if self.resource else []
+        if not vals:
+            return self.values["entropy"]
+        avg=sum(vals)/len(vals)
+        target=0.02 if avg<70 else (0.06 if avg<85 else 0.08)
+        self.values["entropy"]=min(self.bounds["entropy"][1],max(self.bounds["entropy"][0],target))
+        return self.values["entropy"]
+    def adjust(self):
+        if time.time()-self.last_update<2.5:
+            return
+        self.last_update=time.time()
+        if self.metrics:
+            recent=[m for m in self.metrics if time.time()-m[3]<30]
+            if recent:
+                avg_motion=sum(m[1] for m in recent)/len(recent)
+                avg_fps=sum(m[0] for m in recent)/len(recent)
+                pressure=sum(m[2] for m in recent)/len(recent)
+                if avg_motion>24 and avg_fps<self.values["drag_steps"]:
+                    self._shift("drag_steps",3)
+                if avg_motion<10 and avg_fps>self.values["drag_steps"]*1.8:
+                    self._shift("drag_steps",-2)
+                if pressure>90:
+                    self._shift("batch_size",-1)
+                    self._shift_float("gamma",-0.01)
+                elif pressure<70:
+                    self._shift("batch_size",1)
+                    self._shift_float("gamma",0.005)
+        if self.ai_history:
+            recent=[h for h in self.ai_history if time.time()-h[3]<45]
+            if recent:
+                avg_inside=sum(h[1] for h in recent)/len(recent)
+                avg_duration=sum(h[0] for h in recent)/len(recent)
+                avg_start=sum(h[2] for h in recent)/len(recent)
+                if avg_inside<0.6:
+                    self._shift_float("primary_threshold",-0.02)
+                    self._shift_float("confidence_floor",0.01)
+                else:
+                    self._shift_float("primary_threshold",0.015)
+                if avg_duration>0.45:
+                    self._shift_float("long_press_threshold",0.02)
+                else:
+                    self._shift_float("long_press_threshold",-0.02)
+                if avg_start<0.4:
+                    self._shift_float("multi_gate",-0.03)
+                else:
+                    self._shift_float("multi_gate",0.02)
+        self._notify()
+    def _shift(self,key,delta):
+        lo,hi=self.bounds[key]
+        self.values[key]=int(min(hi,max(lo,self.values[key]+delta)))
+    def _shift_float(self,key,delta):
+        lo,hi=self.bounds[key]
+        self.values[key]=float(min(hi,max(lo,self.values[key]+delta)))
+    def _notify(self):
+        if self.save_cb:
+            snap=tuple((k,self.values[k]) for k in sorted(self.values.keys()))
+            if snap!=self._last_snapshot:
+                self._last_snapshot=snap
+                self.save_cb(self.values)
 class StrategyEngine:
     def __init__(self,manifest):
         self.manifest=manifest
@@ -664,6 +767,8 @@ class StrategyEngine:
         self.scene_state=None
         self.loaded_path=None
         self.last_value=0.0
+        self.hparams=None
+        self.prefers_high=True
     def ensure_loaded(self,progress_cb=None):
         path=self.manifest.ensure(progress_cb)
         ModelIO.load(self.model,path)
@@ -679,6 +784,10 @@ class StrategyEngine:
         for k,v in sd.items():
             if not torch.isfinite(v).all():
                 raise RuntimeError("模型参数包含无效值")
+    def attach_hparams(self,hparams):
+        self.hparams=hparams
+    def set_orientation(self,prefer_high):
+        self.prefers_high=bool(prefer_high)
     def set_context(self,events):
         ctx=[]
         for e in events[-8:]:
@@ -751,6 +860,7 @@ class StrategyEngine:
         h,w=img.shape[:2]
         inp=cv2.resize(img,(320,200))
         ten=torch.from_numpy(inp).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
+        hp_vals=self.hparams.values if self.hparams else {"confidence_floor":0.18,"primary_threshold":0.55,"long_press_threshold":0.78,"drag_threshold":0.58,"multi_gate":0.5,"confidence_margin":0.1,"drag_steps":28,"parallel_streams":1}
         ctx=self.set_context(events or [])
         hist=self._history_tensor()
         with torch.no_grad():
@@ -783,6 +893,8 @@ class StrategyEngine:
         score=cv2.resize(left,(w,h),interpolation=cv2.INTER_CUBIC)
         goal=self.synthesize_goal_map(ui_elements,w,h)
         if goal is not None:
+            if not self.prefers_high:
+                goal=1.0-np.clip(goal,0,1)
             score=self.integrate_ui(score,goal)
         if heat_prior is not None:
             score=score*(0.5+0.3*gate)+heat_prior*(0.5-0.3*gate)
@@ -794,9 +906,9 @@ class StrategyEngine:
         conf=float(score[y,x])
         grid=(score.shape[1],score.shape[0])
         base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical,"value":value_score}
-        if conf<0.18:
+        if conf<hp_vals.get("confidence_floor",0.18):
             return base
-        btn="left" if conf>0.55 or risk_factor>0.45 else "right"
+        btn="left" if conf>hp_vals.get("primary_threshold",0.55) or risk_factor>0.45 else "right"
         gy,gx=np.gradient(score)
         vx=float(gx[y,x])
         vy=float(gy[y,x])
@@ -805,9 +917,9 @@ class StrategyEngine:
         vy/=norm
         def make_tap(ix,iy,button,conf_level):
             return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":0.06+0.04*gate,"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy))}
-        if conf>0.78:
+        if conf>hp_vals.get("long_press_threshold",0.78):
             act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":0.35+0.45*gate,"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y))}
-        elif conf>0.58:
+        elif conf>hp_vals.get("drag_threshold",0.58):
             extent=max(score.shape[1],score.shape[0])*0.18*(0.6+conf)
             dx=vx*extent
             dy=vy*extent
@@ -816,7 +928,7 @@ class StrategyEngine:
             if ex==x and ey==y:
                 ex=int(max(0,min(score.shape[1]-1,round(x+(random.random()-0.5)*extent))))
                 ey=int(max(0,min(score.shape[0]-1,round(y+(random.random()-0.5)*extent))))
-            steps=max(8,int(20+gate*20))
+            steps=max(8,int(hp_vals.get("drag_steps",28)))
             drag_path=[]
             for i in range(steps):
                 u=i/max(steps-1,1)
@@ -828,22 +940,32 @@ class StrategyEngine:
             act=make_tap(x,y,btn,conf)
         peaks=self.local_maxima(score,top=8,dist=36)
         extra=[]
-        budget=1+int(multi_factor>0.35)+int(multi_factor>0.62)
+        budget=1+int(multi_factor>hp_vals.get("multi_gate",0.5))+int(multi_factor>0.62)
         for (px,py,pv) in peaks:
             if len(extra)>=budget:
                 break
             if px==x and py==y:
                 continue
-            if pv<0.5+0.1*multi_factor:
+            if pv<hp_vals.get("multi_gate",0.5)+hp_vals.get("confidence_margin",0.1)*multi_factor:
                 continue
-            choice="left" if pv>0.65 or risk_factor>0.55 else "right"
+            choice="left" if pv>hp_vals.get("primary_threshold",0.55) or risk_factor>0.55 else "right"
             extra.append(make_tap(px,py,choice,pv))
         if extra:
+            parallel=max(1,int(hp_vals.get("parallel_streams",1)))
             seq=[dict(act)]
             for item in extra:
                 seq.append(item)
             for item in seq:
                 item["heat_shape"]=grid
+            if parallel>1:
+                streams=[]
+                for idx,item in enumerate(seq):
+                    target=idx%parallel
+                    if len(streams)<=target:
+                        streams.append([])
+                    streams[target].append(item)
+                combo={"kind":"parallel","streams":streams,"grid":grid,"confidence":conf,"heat":score,"button":btn}
+                return combo
             combo={"kind":"combo","sequence":seq,"grid":grid,"confidence":conf,"heat":score,"button":btn}
             return combo
         act["heat"]=score
@@ -885,7 +1007,7 @@ class StrategyEngine:
             coords.append((int(x),int(y),float(score[y,x])))
         coords.sort(key=lambda t:t[2],reverse=True)
         plan=[]
-        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(value_score>0.62)
+        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(self.last_value>0.62)
         used=set()
         for x,y,val in coords:
             if len(plan)>=budget:
@@ -944,8 +1066,9 @@ class StrategyEngine:
             value_loss=F.smooth_l1_loss(value,val_t)
             prob=torch.sigmoid(logits)
             entropy=-(prob*torch.log(prob+1e-6)+(1-prob)*torch.log(1-prob+1e-6)).mean()
+            entropy_weight=self.hparams.adaptive_entropy() if self.hparams else 0.02
             neg_factor=torch.relu(-adv_t).mean()
-            loss=0.55*base_loss+0.35*rl_loss+0.5*value_loss-0.02*entropy+0.05*neg_factor
+            loss=0.55*base_loss+0.35*rl_loss+0.5*value_loss-entropy_weight*entropy+0.05*neg_factor
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(),1.0)
             nn.utils.clip_grad_norm_(self.semantic.parameters(),1.0)
@@ -1125,6 +1248,10 @@ class State(QObject):
                 f.flush()
                 os.fsync(f.fileno())
         self.strategy=StrategyEngine(self.manifest)
+        self.hyper=AdaptiveHyperParams(self.cfg)
+        self.hyper.set_save_callback(self._save_hparams)
+        self.strategy.attach_hparams(self.hyper)
+        self.validator=AutoValidator(self)
         self.io_q=queue.Queue(maxsize=1024)
         self.io_thread=threading.Thread(target=self._io_worker,daemon=True)
         self.io_thread.start()
@@ -1156,6 +1283,10 @@ class State(QObject):
         self.block_margin_px=int(self.cfg.get("block_margin_px",6))
         self.idle_timeout=int(self.cfg.get("idle_timeout",10))
         self.preview_on=bool(self.cfg.get("preview_on",True))
+        self.ui_value_orientation=str(self.cfg.get("ui_value_orientation","higher"))
+        self.ui_prefers_high=self.ui_value_orientation!="lower"
+        self.hyper.set_orientation(self.ui_prefers_high)
+        self.strategy.set_orientation(self.ui_prefers_high)
         self.stop_event=threading.Event()
         self.events_path=None
         self.frames_path=None
@@ -1209,6 +1340,27 @@ class State(QObject):
             json.dump(self.cfg,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
+    def _save_hparams(self,vals):
+        serial={}
+        for k,v in vals.items():
+            try:
+                serial[k]=float(v) if isinstance(v,(int,float)) else v
+            except:
+                serial[k]=v
+        self.save_cfg("hyperparam_state",serial)
+    def set_ui_orientation(self,mode):
+        txt=str(mode).lower()
+        val="lower" if txt.startswith("低") or txt.startswith("low") or txt=="lower" else "higher"
+        prefer=val!="lower"
+        if self.ui_value_orientation==val and self.ui_prefers_high==prefer:
+            return
+        self.ui_value_orientation=val
+        self.ui_prefers_high=prefer
+        self.hyper.set_orientation(prefer)
+        self.strategy.set_orientation(prefer)
+        self.save_cfg("ui_value_orientation",val)
+        hint="已更新为高优先" if prefer else "已更新为低优先"
+        self.signal_tip.emit(f"UI数据偏好{hint}")
     def _init_day_files(self):
         day=time.strftime("%Y%m%d")
         if self.day_tag==day and self.events_writer and self.frames_writer:
@@ -1372,6 +1524,10 @@ class State(QObject):
             if abs(new_fps-self.fps)<0.2:
                 new_fps=adaptive_target
             self.fps=max(self.min_fps,min(self.max_fps,new_fps))
+            if hasattr(self,"hyper"):
+                self.hyper.observe_metrics(self.fps,motion_score,resource_pressure,self.mode)
+                self.hyper.observe_resource(avg_cpu,avg_mem,avg_gpu,avg_vram)
+                self.hyper.adjust()
         except:
             pass
     def _window_weight(self):
@@ -1489,6 +1645,9 @@ class State(QObject):
             self.event_count+=1
             self.signal_counts.emit(self.event_count)
             self._update_activity(obj)
+            if hasattr(self,"hyper"):
+                self.hyper.observe_event(obj)
+                self.hyper.adjust()
         except:
             pass
     def _update_activity(self,event):
@@ -1987,6 +2146,8 @@ class TrainerThread(threading.Thread):
     def _execute_action(self,act,heat,fid):
         if not isinstance(act,dict):
             return None
+        if hasattr(self.st,"validator"):
+            self.st.validator.enqueue_strategy(act,fid)
         if act.get("kind")=="combo":
             total=0.0
             seq=act.get("sequence") or []
@@ -1998,6 +2159,22 @@ class TrainerThread(threading.Thread):
                     total+=cool
                 if idx<len(seq)-1:
                     time.sleep(max(0.02,min(0.12,float(item.get("duration",0.05)))))
+            return total if total>0 else 0.25
+        if act.get("kind")=="parallel":
+            streams=act.get("streams") or []
+            if not streams:
+                return None
+            total=0.0
+            longest=max(len(s) for s in streams)
+            for step in range(longest):
+                for seq in streams:
+                    if step>=len(seq):
+                        continue
+                    if self.st.interrupt_ai:
+                        return total if total>0 else 0.25
+                    cool=self._execute_single(seq[step],heat,fid)
+                    if cool is not None and cool>total:
+                        total=cool
             return total if total>0 else 0.25
         return self._execute_single(act,heat,fid)
     def _execute_single(self,act,heat,fid):
@@ -2085,8 +2262,10 @@ class OptimizerThread(threading.Thread):
         self.cancel_flag=cancel_flag
         self.frame_cache=collections.OrderedDict()
         self.cache_limit=256
-        self.gamma=0.92
-        self.lam=0.85
+        hp=getattr(self.st,"hyper",None)
+        self.gamma=hp.values.get("gamma",0.92) if hp else 0.92
+        self.lam=hp.values.get("lam",0.85) if hp else 0.85
+        self.batch_size=hp.values.get("batch_size",6) if hp else 6
         self.trace=0.0
         self.baseline=0.0
     def run(self):
@@ -2103,7 +2282,7 @@ class OptimizerThread(threading.Thread):
             trained_batches_count=0
             trained_sample_count=0
             if sample_count>0:
-                total_batches=max(1,(sample_count+5)//6)
+                total_batches=max(1,(sample_count+self.batch_size-1)//self.batch_size)
                 self.st.signal_optprog.emit(45,"整理样本")
                 self.st.signal_optprog.emit(50,"构建批次")
                 batch_iter=self._stream_batches(all_days,total_batches)
@@ -2266,7 +2445,7 @@ class OptimizerThread(threading.Thread):
             return False
         return True
     def _stream_batches(self,days,total_batches):
-        bs=6
+        bs=self.batch_size
         pending=[]
         produced=0
         for d in days:
@@ -2430,7 +2609,7 @@ class OptimizerThread(threading.Thread):
             seqs.append((img,ctx,label,hist,reward))
         random.shuffle(seqs)
         batches=[]
-        bs=6
+        bs=self.batch_size
         for i in range(0,len(seqs),bs):
             chunk=seqs[i:i+bs]
             samples=[]
@@ -2590,17 +2769,80 @@ class OptimizerThread(threading.Thread):
             synth.append({"id":str(uuid.uuid4()),"source":"ai","mode":"training","type":btn,"press_t":now_sec,"press_t_ns":now_ns,"press_x":0.0,"press_y":0.0,"press_lx":press_lx,"press_ly":press_ly,"release_t":release_sec,"release_t_ns":release_ns,"release_x":0.0,"release_y":0.0,"release_lx":relx,"release_ly":rely,"moves":[],"moves_ns":[],"window_title":rec.get("window_title",self.st.selected_title),"rect":[0,0,2560,1600],"frame_id":rec.get("id"),"ins_press":1,"ins_release":1,"clip_ids":[],"session_id":self.st.session_id,"duration":dur})
         return synth
     def _create_default_batches(self):
-        img=torch.zeros((4,3,200,320),dtype=torch.float32)
-        ctx=torch.zeros((4,8,self.st.strategy.context_dim),dtype=torch.float32)
-        hist=torch.zeros((4,12,self.st.strategy.context_dim),dtype=torch.float32)
-        label=torch.zeros((4,2,13,20),dtype=torch.float32)
+        hp=getattr(self.st,"hyper",None)
+        bs=int(max(2,hp.values.get("batch_size",6))) if hp else 4
+        img=torch.zeros((bs,3,200,320),dtype=torch.float32)
+        ctx=torch.zeros((bs,8,self.st.strategy.context_dim),dtype=torch.float32)
+        hist=torch.zeros((bs,12,self.st.strategy.context_dim),dtype=torch.float32)
+        label=torch.zeros((bs,2,13,20),dtype=torch.float32)
         cx=random.randint(2,17)
         cy=random.randint(1,11)
         label[:,0,cy,cx]=1.0
-        val=torch.zeros((4,1),dtype=torch.float32)
-        adv=torch.zeros((4,1),dtype=torch.float32)
-        weight=torch.ones((4,1),dtype=torch.float32)
+        val=torch.zeros((bs,1),dtype=torch.float32)
+        adv=torch.zeros((bs,1),dtype=torch.float32)
+        weight=torch.ones((bs,1),dtype=torch.float32)
         return [(img,ctx,label,hist,val,adv,weight)]
+class AutoValidator(threading.Thread):
+    def __init__(self,st):
+        super().__init__(daemon=True)
+        self.st=st
+        self.queue=queue.Queue()
+        self.start()
+    def enqueue_ui(self,items,img):
+        if items is None:
+            return
+        self.queue.put(("ui",(items,img)))
+    def enqueue_strategy(self,act,fid):
+        if act is None:
+            return
+        self.queue.put(("strategy",(act,fid)))
+    def run(self):
+        while True:
+            kind,payload=self.queue.get()
+            if kind=="stop":
+                break
+            if kind=="ui":
+                self._validate_ui(*payload)
+            elif kind=="strategy":
+                self._validate_strategy(*payload)
+    def _validate_ui(self,items,img):
+        try:
+            heat=self.st.heat_from_events(2560,1600,"user")
+            if heat is None:
+                return
+            mask=np.zeros_like(heat)
+            for el in items:
+                bounds=el.get("bounds",[0,0,0,0])
+                x1=int(max(0,min(2559,round(float(bounds[0])*2.0))))
+                y1=int(max(0,min(1599,round(float(bounds[1])*2.0))))
+                x2=int(max(x1+1,min(2560,round(float(bounds[2])*2.0))))
+                y2=int(max(y1+1,min(1600,round(float(bounds[3])*2.0))))
+                mask[y1:y2,x1:x2]+=1
+            total=float(mask.sum())
+            if total<=0:
+                return
+            focus=float((heat*mask).sum()/total)
+            conf_avg=sum(float(el.get("confidence",0)) for el in items)/max(1,len(items))
+            orient="high" if self.st.ui_prefers_high else "low"
+            adj=conf_avg if self.st.ui_prefers_high else 1.0-conf_avg
+            texture=0.0
+            if isinstance(img,np.ndarray) and img.size>0:
+                gray=cv2.cvtColor(cv2.resize(img,(256,160)),cv2.COLOR_BGR2GRAY)
+                texture=float(np.var(gray)/255.0)
+            log(f"ui_validation coverage={focus:.3f} confidence={conf_avg:.3f} adjusted={adj:.3f} texture={texture:.3f} pref={orient} items={len(items)}")
+        except Exception as e:
+            log(f"ui_validation_error:{e}")
+    def _validate_strategy(self,act,fid):
+        try:
+            heat=act.get("heat") if isinstance(act,dict) else None
+            variance=float(np.var(heat)) if isinstance(heat,np.ndarray) else 0.0
+            spread=float(np.std(heat)) if isinstance(heat,np.ndarray) else 0.0
+            streams=len(act.get("streams",[])) if isinstance(act,dict) and act.get("kind")=="parallel" else 0
+            combos=len(act.get("sequence",[])) if isinstance(act,dict) and act.get("kind")=="combo" else 0
+            conf=float(act.get("confidence",0)) if isinstance(act,dict) else 0.0
+            log(f"strategy_validation variance={variance:.4f} spread={spread:.4f} parallel={streams} combo={combos} confidence={conf:.3f} fid={fid}")
+        except Exception as e:
+            log(f"strategy_validation_error:{e}")
 class UIReasoner(nn.Module):
     def __init__(self,num_classes):
         super().__init__()
@@ -2651,6 +2893,8 @@ class UIInspector:
                 conf=float(prob[0,idx].item())
                 enhanced=self._refine(label,conf,inter.cpu().numpy().flatten())
                 score=float(max(0.0,min(1.0,enhanced)))
+                if not getattr(self.st,"ui_prefers_high",True):
+                    score=1.0-score
                 results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":float(inter[0,0].item()),"dynamics":inter[0].tolist(),"layout":layout[0].tolist()})
                 self._update_memory(label,rep)
         results=self._merge(results)
@@ -2901,6 +3145,9 @@ class Main(QMainWindow):
         self.btn_ui=QPushButton("UI识别")
         self.chk_preview=QCheckBox("预览")
         self.chk_preview.setChecked(self.state.preview_on)
+        self.cmb_pref=QComboBox()
+        self.cmb_pref.addItems(["数据偏好:高","数据偏好:低"])
+        self.cmb_pref.setCurrentIndex(0 if self.state.ui_prefers_high else 1)
         self.lbl_mode=QLabel("模式:学习")
         self.lbl_fps=QLabel("帧率:0")
         self.lbl_rec=QLabel("0B")
@@ -2934,6 +3181,7 @@ class Main(QMainWindow):
         lt.addWidget(self.btn_opt)
         lt.addWidget(self.btn_ui)
         lt.addWidget(self.chk_preview)
+        lt.addWidget(self.cmb_pref)
         lm=QVBoxLayout(mid)
         lm.addWidget(self.preview_label,1)
         lm.addWidget(self.ui_table)
@@ -2962,6 +3210,7 @@ class Main(QMainWindow):
         self.btn_opt.clicked.connect(self.on_opt)
         self.btn_ui.clicked.connect(self.on_ui)
         self.chk_preview.stateChanged.connect(self.on_preview_changed)
+        self.cmb_pref.currentIndexChanged.connect(self.on_pref_changed)
         self.cmb.currentIndexChanged.connect(self.on_sel_changed)
         self.state.signal_preview.connect(self.on_preview)
         self.state.signal_mode.connect(self.on_mode)
@@ -2992,6 +3241,7 @@ class Main(QMainWindow):
         self._ui_thread=None
         self._ui_busy=False
         self._ui_paused=False
+        self._ui_last_frame=None
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
         self.start_wait_timer.start(200)
@@ -3004,6 +3254,13 @@ class Main(QMainWindow):
         self.preview_label.setVisible(enabled)
         if not enabled:
             self.preview_label.clear()
+    def on_pref_changed(self,_):
+        idx=self.cmb_pref.currentIndex()
+        val="higher" if idx==0 else "lower"
+        self.state.set_ui_orientation(val)
+        self.cmb_pref.blockSignals(True)
+        self.cmb_pref.setCurrentIndex(0 if self.state.ui_prefers_high else 1)
+        self.cmb_pref.blockSignals(False)
     def on_preview(self,px):
         if not self.preview_enabled():
             return
@@ -3220,6 +3477,7 @@ class Main(QMainWindow):
         self.btn_opt.setEnabled(False)
         self.btn_ui.setEnabled(False)
         self.lbl_tip.setText("正在执行UI识别")
+        self._ui_last_frame=img.copy() if isinstance(img,np.ndarray) else None
         def task():
             ok=False
             err=""
@@ -3238,6 +3496,8 @@ class Main(QMainWindow):
             self.state.signal_ui_ready.emit(res)
             QMessageBox.information(self,"提示","UI识别完成，结果已列出")
             self.lbl_tip.setText("UI识别完成，已恢复学习")
+            if hasattr(self.state,"validator"):
+                self.state.validator.enqueue_ui(res,self._ui_last_frame)
         else:
             QMessageBox.warning(self,"提示","UI识别失败"+(f":{err}" if err else ""))
             self.lbl_tip.setText("UI识别失败，保持学习")
@@ -3248,6 +3508,7 @@ class Main(QMainWindow):
             self.state.stop_event.clear()
         self._ui_paused=False
         self._ui_thread=None
+        self._ui_last_frame=None
         self.set_mode("learning",force=True)
     def on_model_ready_check(self):
         if not self.state.model_ready_event.is_set():
@@ -3266,6 +3527,8 @@ class Main(QMainWindow):
         self.state.running=False
         self.hook.stop()
         self.state.io_q.put(None)
+        if hasattr(self.state,"validator"):
+            self.state.validator.queue.put(("stop",None))
         event.accept()
 def main():
     app=QApplication(sys.argv)
