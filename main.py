@@ -1656,6 +1656,7 @@ class State(QObject):
         for it in items:
             if not isinstance(it,dict):
                 continue
+            txt_src=it.get("text")
             raw_val=it.get("value")
             val_int=None
             if isinstance(raw_val,(int,float,str)):
@@ -1663,7 +1664,7 @@ class State(QObject):
                     val_int=int(str(raw_val).strip())
                 except:
                     val_int=None
-            if val_int is None or val_int<=0:
+            if val_int is None or val_int<0:1
                 txt_src=it.get("text")
                 if isinstance(txt_src,str):
                     digits=re.findall(r"\d+",txt_src)
@@ -1672,9 +1673,9 @@ class State(QObject):
                             cand=int("".join(digits))
                         except:
                             cand=None
-                        if cand and cand>0:
+                       if cand is not None and cand>=0:
                             val_int=cand
-            if val_int is None or val_int<=0:
+            if val_int is None or val_int<0:
                 continue
             nb=it.get("norm_bounds")
             if not isinstance(nb,list) or len(nb)!=4:
@@ -1734,7 +1735,8 @@ class State(QObject):
                     bounds_val=[ax1,ay1,ax2,ay2]
             else:
                 bounds_val=[ax1,ay1,ax2,ay2]
-            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":str(val_int),"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":[nx1,ny1,nx2,ny2]}
+            display_txt=str(txt_src) if isinstance(txt_src,str) and txt_src.strip() else str(val_int)
+            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":display_txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":[nx1,ny1,nx2,ny2]}
             sanitized.append(entry)
             idx+=1
         return sanitized
@@ -4139,12 +4141,12 @@ class UIInspector:
             non_space=sum(1 for ch in display if not ch.isspace())
             if non_space>0 and digits/non_space>=0.6:
                 filtered="".join(ch for ch in display if ch.isdigit() or ch.isspace())
-                strict=self._strict_positive_integer(filtered)
+                strict=self._non_negative_integer(filtered)
                 if strict:
                     candidates.append((strict[0],strict[1],0.62))
             numeric=self._numeric_text(display)
             if numeric and "." not in numeric and "-" not in numeric:
-                strict=self._strict_positive_integer(numeric)
+                strict=self._non_negative_integer(numeric)
                 if strict and all(strict[0]!=c[0] for c in candidates):
                     candidates.append((strict[0],strict[1],0.58))
         ocr_text,prob=self._ocr_digits(crop)
@@ -4152,7 +4154,7 @@ class UIInspector:
             oclean=self._sanitize_text(ocr_text)
             onumeric=self._numeric_text(oclean)
             if onumeric and "." not in onumeric and "-" not in onumeric:
-                strict=self._strict_positive_integer(onumeric)
+                strict=self._non_negative_integer(onumeric)
                 if strict:
                     candidates.append((strict[0],strict[1],max(prob,0.65)))
         best_txt=None
@@ -4261,7 +4263,7 @@ class UIInspector:
             return float(m.group(0))
         except:
             return None
-    def _strict_positive_integer(self,text):
+    def _non_negative_integer(self,text):
         if not text:
             return None
         raw=str(text)
@@ -4283,7 +4285,7 @@ class UIInspector:
             value=int(joined)
         except:
             return None
-        if value<=0:
+        if value<0:
             return None
         return joined,value
     def _ocr_digits(self,img):
@@ -4617,15 +4619,20 @@ class Main(QMainWindow):
             name=str(it.get("name",""))
             num=it.get("value",None)
             val="--"
-            if isinstance(num,int) and num>0:
-                val=str(num)
+            num_int=None
+            if isinstance(num,int):
+                num_int=num
             else:
                 try:
-                    num_int=int(num)
-                    if num_int>0:
-                        val=str(num_int)
+                    num_int=int(str(num).strip())
                 except:
-                    pass
+                    num_int=None
+            if isinstance(num_int,int) and num_int>=0:
+                val=str(num_int)
+            else:
+                txt=it.get("text","")
+                if isinstance(txt,str) and txt.strip():
+                    val=txt.strip()
             trend_val=it.get("trend",None)
             trend="--" if trend_val is None else f"{float(trend_val):+.2f}"
             conf_val=it.get("confidence",None)
