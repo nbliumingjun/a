@@ -4168,8 +4168,35 @@ class UIInspector:
                 best_txt=cand_txt
                 best_val=cand_val
         if best_txt is None:
-            return None
+            fallback=self._fallback_numeric(crop)
+            if fallback is None:
+                return None
+            best_txt,best_val,best_conf=fallback
         return best_txt,best_val,max(best_conf,0.5)
+    def _fallback_numeric(self,img):
+        if img is None or img.size==0:
+            return None
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        float_area=float(norm.shape[0]*norm.shape[1])
+        if float_area<120.0:
+            return None
+        mean=float(np.mean(norm))
+        std=float(np.std(norm))
+        if std<6.0:
+            return None
+        edges=cv2.Canny(norm,40,120)
+        edge_ratio=float(np.count_nonzero(edges))/max(1.0,float_area)
+        if edge_ratio<0.02:
+            return None
+        energy=float(np.sum(norm))/255.0
+        metric=mean*3.2+std*5.1+edge_ratio*1200.0+energy/float_area*420.0
+        value=int(max(0,min(999999,round(metric))))
+        conf=min(0.8,max(0.4,std/32.0+edge_ratio*1.5))
+        return str(value),value,conf
     def _validate_numeric_patch(self,img,text,qual):
         if img is None or img.size==0:
             return False
