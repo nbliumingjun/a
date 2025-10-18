@@ -25,6 +25,7 @@ cfg_path=os.path.join(base_dir,"config.json")
 deps_path=os.path.join(base_dir,"deps.json")
 meta_path=os.path.join(models_dir,"model_meta.json")
 ui_cache_path=os.path.join(base_dir,"ui_elements.json")
+data_cache_path=os.path.join(base_dir,"window_data.json")
 schema_path=os.path.join(base_dir,"ui_schema.json")
 for d in [base_dir,exp_dir,models_dir,logs_dir]:
     os.makedirs(d,exist_ok=True)
@@ -35,7 +36,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{}}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
 default_ui_labels=["button","input","panel","label","widget","menu","icon","ability","joystick","skill","toggle","minimap"]
 schema_defaults={"labels":default_ui_labels,"max_items":48}
 def ensure_config():
@@ -61,6 +62,10 @@ def ensure_config():
         if "__default__" not in prefs:
             prefs["__default__"]=cfg_defaults["ui_preferences"]["__default__"]
         merged["ui_preferences"]=prefs
+        data_prefs=dict(merged.get("data_preferences")) if isinstance(merged.get("data_preferences"),dict) else {}
+        if "__default__" not in data_prefs:
+            data_prefs["__default__"]=cfg_defaults["data_preferences"]["__default__"]
+        merged["data_preferences"]=data_prefs
         with open(cfg_path,"w",encoding="utf-8") as f:
             json.dump(merged,f,ensure_ascii=False,indent=2)
             f.flush()
@@ -1416,16 +1421,26 @@ class Foreground:
                     py=int(y1+(y2-y1)*ry)
                     pts.append((px,py))
             th=Foreground.top(hwnd)
+            try:
+                target_pid=win32process.GetWindowThreadProcessId(th)[1]
+            except:
+                target_pid=None
+            blocked=0
+            total=0
             for (px,py) in pts:
+                total+=1
                 hw=ctypes.windll.user32.WindowFromPoint(ctypes.wintypes.POINT(px,py))
                 if hw==0:
+                    blocked+=1
+                else:
+                    rt=Foreground.top(hw)
+                    if rt==th:
+                        continue
+                    if Foreground._ignore(rt,target_pid):
+                        continue
+                    blocked+=1
+                if blocked>total//2:
                     return True
-                rt=Foreground.top(hw)
-                if rt==th:
-                    continue
-                if Foreground._ignore(rt):
-                    continue
-                return True
             return False
         except:
             return True
@@ -1440,10 +1455,17 @@ class Foreground:
         except:
             return False
     @staticmethod
-    def _ignore(hwnd):
+    def _ignore(hwnd,target_pid=None):
         try:
             if hwnd==0:
                 return True
+            if target_pid is not None:
+                try:
+                    pid=win32process.GetWindowThreadProcessId(hwnd)[1]
+                    if pid==target_pid:
+                        return True
+                except:
+                    pass
             if not win32gui.IsWindow(hwnd):
                 return True
             if not win32gui.IsWindowVisible(hwnd):
@@ -1482,6 +1504,7 @@ class State(QObject):
     signal_optprog=Signal(int,str)
     signal_modelprog=Signal(int,str)
     signal_ui_ready=Signal(list)
+    signal_data_ready=Signal(list)
     signal_window_stats=Signal(list)
     MARK=0x22ACE777
     def __init__(self):
@@ -1532,7 +1555,9 @@ class State(QObject):
         self.idle_timeout=int(self.cfg.get("idle_timeout",10))
         self.preview_on=bool(self.cfg.get("preview_on",True))
         self.ui_preferences=self._normalize_preferences(self.cfg.get("ui_preferences"))
-        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences)
+        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences,self.ui_default_pref)
+        self.data_preferences=self._normalize_data_preferences(self.cfg.get("data_preferences"))
+        self.data_prefers_high=self._aggregate_preferences(self.data_preferences,self.data_default_pref)
         self.hyper.set_preferences(self.ui_preferences)
         self.strategy.update_preferences(self.ui_preferences)
         self.policy_base=(320,200)
@@ -1551,6 +1576,7 @@ class State(QObject):
         self.last_kbd_log_ts=0.0
         self.day_tag=None
         self.ui_elements=[]
+        self.data_points=[]
         self.model_ready_event=threading.Event()
         self.model_error=None
         self.metric_history=collections.deque(maxlen=180)
@@ -1617,8 +1643,7 @@ class State(QObject):
             if txt.startswith(token) or token in txt or raw.startswith(token) or token in raw:
                 return "higher"
         return default
-    def _normalize_preferences(self,prefs):
-        default=cfg_defaults["ui_preferences"]["__default__"]
+    def _normalize_pref_bundle(self,prefs,default,attr):
         data={"__default__":default}
         if isinstance(prefs,dict):
             for k,v in prefs.items():
@@ -1629,13 +1654,17 @@ class State(QObject):
                     data["__default__"]=val
                 else:
                     data[k]=val
-        self.ui_default_pref=data["__default__"]
+        setattr(self,attr,data["__default__"])
         return data
-    def _aggregate_preferences(self,prefs):
+    def _normalize_preferences(self,prefs):
+        return self._normalize_pref_bundle(prefs,cfg_defaults["ui_preferences"]["__default__"],"ui_default_pref")
+    def _normalize_data_preferences(self,prefs):
+        return self._normalize_pref_bundle(prefs,cfg_defaults["data_preferences"]["__default__"],"data_default_pref")
+    def _aggregate_preferences(self,prefs,default):
         if not isinstance(prefs,dict):
             return True
         vals=[v for k,v in prefs.items() if k!="__default__" and v in ["higher","lower"]]
-        base=prefs.get("__default__",self.ui_default_pref if hasattr(self,"ui_default_pref") else cfg_defaults["ui_preferences"]["__default__"])
+        base=prefs.get("__default__",default)
         if not vals and base in ["higher","lower"]:
             vals=[base]
         if not vals:
@@ -1654,7 +1683,7 @@ class State(QObject):
             self.ui_default_pref=val
         else:
             self.ui_preferences[key]=val
-        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences)
+        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences,self.ui_default_pref)
         self.hyper.set_preferences(self.ui_preferences)
         self.strategy.update_preferences(self.ui_preferences)
         self._save_preferences()
@@ -1663,6 +1692,23 @@ class State(QObject):
         self.signal_tip.emit(f"{target}目标:{txt}")
     def _save_preferences(self):
         self.save_cfg("ui_preferences",self.ui_preferences)
+    def preference_for_data(self,name):
+        if isinstance(name,str) and name in self.data_preferences:
+            return self.data_preferences[name]
+        return self.data_preferences.get("__default__",self.data_default_pref)
+    def update_data_preference(self,name,mode):
+        key="__default__" if not name else str(name)
+        val=self._norm_pref_value(mode,self.data_default_pref)
+        if key=="__default__":
+            self.data_preferences["__default__"]=val
+            self.data_default_pref=val
+        else:
+            self.data_preferences[key]=val
+        self.data_prefers_high=self._aggregate_preferences(self.data_preferences,self.data_default_pref)
+        self.save_cfg("data_preferences",self.data_preferences)
+        txt="越高越好" if val=="higher" else "越低越好" if val=="lower" else "无关"
+        target="全局数据" if key=="__default__" else key
+        self.signal_tip.emit(f"{target}目标:{txt}")
     def _align_dim(self,val,step):
         if step<=0:
             return int(val)
@@ -3245,6 +3291,7 @@ class UIInspector:
         self.prototype={}
         self.prototype_count={}
         self.memory=collections.deque(maxlen=500)
+        self.data_history=collections.defaultdict(lambda:collections.deque(maxlen=32))
         self._refresh_schema(True)
     def analyze(self,img,events):
         self._refresh_schema()
@@ -3279,12 +3326,18 @@ class UIInspector:
         limit=self._dynamic_limit(events)
         if len(results)>limit:
             results=sorted(results,key=lambda item:item.get("confidence",0),reverse=True)[:limit]
+        data_points=self._collect_data(base,events,results)
         self.st.ui_elements=results
+        self.st.data_points=data_points
         with open(ui_cache_path,"w",encoding="utf-8") as f:
             json.dump(results,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
-        return results
+        with open(data_cache_path,"w",encoding="utf-8") as f:
+            json.dump(data_points,f,ensure_ascii=False,indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        return {"ui":results,"data":data_points}
     def _refresh_schema(self,force=False):
         try:
             mtime=os.path.getmtime(schema_path)
@@ -3504,6 +3557,86 @@ class UIInspector:
             if not overlapped:
                 merged.append(el)
         return merged
+    def _collect_data(self,img,events,ui_results):
+        data=[]
+        events=events or []
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        brightness=float(np.mean(gray)/255.0)
+        self._append_data(data,"场景亮度",(0,0,img.shape[1],img.shape[0]),brightness,1.0)
+        motion=0.0
+        prev=self.st.prev_img if hasattr(self.st,"prev_img") else None
+        if isinstance(prev,np.ndarray) and prev.size>0:
+            try:
+                prev_small=cv2.resize(prev,(img.shape[1],img.shape[0]))
+                diff=cv2.absdiff(prev_small,img)
+                motion=float(np.mean(diff)/255.0)
+            except:
+                motion=0.0
+        self._append_data(data,"画面变化",(0,0,img.shape[1],img.shape[0]),motion,min(1.0,0.6+motion))
+        heat=self._event_heat(events,img.shape[1],img.shape[0])
+        if isinstance(heat,np.ndarray):
+            density=float(np.mean(heat))
+            peak=float(np.max(heat))
+        else:
+            density=float(min(1.0,len(events)/50.0))
+            peak=density
+        self._append_data(data,"交互密度",(0,0,img.shape[1],img.shape[0]),density,min(1.0,0.5+peak))
+        for idx,(x1,y1,x2,y2,score,val) in enumerate(self._data_regions(gray,ui_results)):
+            name=f"数据区域{idx+1}"
+            self._append_data(data,name,(x1,y1,x2,y2),val,score)
+            if len(data)>=32:
+                break
+        return data
+    def _append_data(self,data,name,bounds,value,confidence):
+        val=float(max(0.0,min(1.0,value)))
+        conf=float(max(0.0,min(1.0,confidence)))
+        trend=self._trend(name,val)
+        pref=self.st.preference_for_data(name)
+        data.append({"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":val,"trend":trend,"confidence":conf,"preference":pref})
+    def _trend(self,key,val):
+        hist=self.data_history[key]
+        prev=hist[-1] if len(hist)>0 else val
+        hist.append(val)
+        return float(val-prev)
+    def _data_regions(self,gray,ui_results):
+        try:
+            small=cv2.GaussianBlur(gray,(3,3),0)
+            thr=cv2.adaptiveThreshold(small,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,25,9)
+            num,labels,stats,centroids=cv2.connectedComponentsWithStats(thr,8,cv2.CV_32S)
+        except Exception as e:
+            log(f"data_region_error:{e}")
+            return []
+        res=[]
+        for idx in range(1,num):
+            x,y,w,h,area=stats[idx]
+            if area<60 or area>48000:
+                continue
+            if w<10 or h<10:
+                continue
+            ratio=area/(w*h+1e-6)
+            if ratio<0.12 or ratio>0.88:
+                continue
+            box=(int(x),int(y),int(x+w),int(y+h))
+            if self._overlaps_ui(box,ui_results):
+                continue
+            region=gray[y:y+h,x:x+w]
+            if region.size==0:
+                continue
+            patch=region.astype(np.float32)/255.0
+            var=float(np.var(patch))
+            contrast=float(patch.max()-patch.min())
+            score=max(0.0,min(1.0,var*1.6+contrast*0.9))
+            value=float(np.mean(patch))
+            res.append((box[0],box[1],box[2],box[3],score,value))
+        res=sorted(res,key=lambda r:r[4],reverse=True)[:8]
+        return res
+    def _overlaps_ui(self,box,ui_results):
+        bx1,by1,bx2,by2=box
+        for el in ui_results:
+            bounds=el.get("bounds",[0,0,0,0])
+            if self._iou((bx1,by1,bx2,by2),(int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])))>0.4:
+                return True
+        return False
 class Main(QMainWindow):
     finish_opt=Signal(bool)
     finish_ui=Signal(bool,str,object)
@@ -3552,6 +3685,17 @@ class Main(QMainWindow):
         self.ui_table.setMaximumHeight(180)
         self.ui_table.setFocusPolicy(Qt.NoFocus)
         self.pref_editors=[]
+        self.data_table=QTableWidget()
+        self.data_table.setColumnCount(5)
+        self.data_table.setHorizontalHeaderLabels(["名称","数值","趋势","置信度","目标"])
+        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.data_table.verticalHeader().setVisible(False)
+        self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.data_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.data_table.setMaximumHeight(180)
+        self.data_table.setFocusPolicy(Qt.NoFocus)
+        self.data_pref_editors=[]
         self.window_table=QTableWidget()
         self.window_table.setColumnCount(5)
         self.window_table.setHorizontalHeaderLabels(["窗口","总操作","AI占比","均时","最近活动"])
@@ -3570,6 +3714,7 @@ class Main(QMainWindow):
         lm=QVBoxLayout(mid)
         lm.addWidget(self.preview_label,1)
         lm.addWidget(self.ui_table)
+        lm.addWidget(self.data_table)
         lm.addWidget(self.window_table)
         lb=QHBoxLayout(bot)
         lb.addWidget(self.lbl_mode)
@@ -3604,7 +3749,9 @@ class Main(QMainWindow):
         self.state.signal_optprog.connect(self.on_optprog)
         self.state.signal_modelprog.connect(self.on_modelprog)
         self.state.signal_ui_ready.connect(self.on_ui_ready)
+        self.state.signal_data_ready.connect(self.on_data_ready)
         self.state.signal_window_stats.connect(self.on_window_stats)
+        self.on_data_ready([])
         self.on_window_stats([])
         self.finish_opt.connect(self._handle_opt_finished)
         self.finish_ui.connect(self._handle_ui_finished)
@@ -3641,6 +3788,8 @@ class Main(QMainWindow):
             self.preview_label.clear()
     def on_pref_changed_item(self,label,val):
         self.state.update_ui_preference(label,val)
+    def on_data_pref_changed(self,label,val):
+        self.state.update_data_preference(label,val)
     def on_preview(self,px):
         if not self.preview_enabled():
             return
@@ -3699,6 +3848,34 @@ class Main(QMainWindow):
             combo.currentTextChanged.connect(lambda val,lab=t:self.on_pref_changed_item(lab,val))
             self.ui_table.setCellWidget(idx,4,combo)
             self.pref_editors.append(combo)
+    def on_data_ready(self,items):
+        self.data_table.setRowCount(0)
+        limited=items[:60]
+        self.data_table.setRowCount(len(limited))
+        self.data_pref_editors=[]
+        mapping={"higher":0,"lower":1,"ignore":2}
+        for idx,it in enumerate(limited):
+            name=str(it.get("name",""))
+            val=f"{float(it.get('value',0)):.2f}"
+            trend=f"{float(it.get('trend',0)):+.2f}"
+            conf=f"{float(it.get('confidence',0)):.2f}"
+            self.data_table.setItem(idx,0,QTableWidgetItem(name))
+            self.data_table.setItem(idx,1,QTableWidgetItem(val))
+            tr=QTableWidgetItem(trend)
+            tr.setTextAlignment(Qt.AlignCenter)
+            self.data_table.setItem(idx,2,tr)
+            cf=QTableWidgetItem(conf)
+            cf.setTextAlignment(Qt.AlignCenter)
+            self.data_table.setItem(idx,3,cf)
+            combo=QComboBox()
+            combo.addItems(["越高越好","越低越好","无关"])
+            pref=it.get("preference") or self.state.preference_for_data(name)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(mapping.get(pref,0))
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(lambda val,lab=name:self.on_data_pref_changed(lab,val))
+            self.data_table.setCellWidget(idx,4,combo)
+            self.data_pref_editors.append(combo)
     def on_window_stats(self,rows):
         self.window_table.setRowCount(0)
         limited=rows[:60]
@@ -3907,11 +4084,14 @@ class Main(QMainWindow):
         self._ui_thread.start()
     def _handle_ui_finished(self,ok,err,res):
         if ok:
-            self.state.signal_ui_ready.emit(res)
+            items=res.get("ui",[]) if isinstance(res,dict) else (res or [])
+            data_items=res.get("data",[]) if isinstance(res,dict) else []
+            self.state.signal_ui_ready.emit(items)
+            self.state.signal_data_ready.emit(data_items)
             QMessageBox.information(self,"提示","UI识别完成，结果已列出")
             self.lbl_tip.setText("UI识别完成，已恢复学习")
             if hasattr(self.state,"validator"):
-                self.state.validator.enqueue_ui(res,self._ui_last_frame)
+                self.state.validator.enqueue_ui(items,self._ui_last_frame)
         else:
             QMessageBox.warning(self,"提示","UI识别失败"+(f":{err}" if err else ""))
             self.lbl_tip.setText("UI识别失败，保持学习")
