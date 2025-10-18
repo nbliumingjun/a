@@ -183,7 +183,7 @@ try:
     _nv.nvmlInit()
 except:
     _nv=None
-from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QTableWidget,QDialog,QDialogButtonBox,QTableWidgetItem,QHeaderView,QAbstractItemView
+from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QTableWidget,QDialog,QDialogButtonBox,QTableWidgetItem,QHeaderView,QAbstractItemView,QSizePolicy
 from PySide6.QtCore import QTimer,Qt,Signal,QObject,QSize
 from PySide6.QtGui import QImage,QPixmap
 def _gpu_util_mem():
@@ -3876,6 +3876,8 @@ class Main(QMainWindow):
         self.preview_label=QLabel()
         self.preview_label.setFixedSize(QSize(640,400))
         self.preview_label.setVisible(self.state.preview_on)
+        self.ui_table_title=QLabel("UI识别结果")
+        self.data_table_title=QLabel("窗口内数据")
         self.ui_table=QTableWidget()
         self.ui_table.setColumnCount(5)
         self.ui_table.setHorizontalHeaderLabels(["类型","区域","置信度","交互强度","目标"])
@@ -3884,8 +3886,8 @@ class Main(QMainWindow):
         self.ui_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.ui_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.ui_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.ui_table.setMaximumHeight(180)
         self.ui_table.setFocusPolicy(Qt.NoFocus)
+        self.ui_table.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
         self.pref_editors=[]
         self.data_table=QTableWidget()
         self.data_table.setColumnCount(5)
@@ -3895,29 +3897,24 @@ class Main(QMainWindow):
         self.data_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.data_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.data_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.data_table.setMaximumHeight(180)
         self.data_table.setFocusPolicy(Qt.NoFocus)
+        self.data_table.setSizePolicy(QSizePolicy.Expanding,QSizePolicy.Expanding)
         self.data_pref_editors=[]
-        self.window_table=QTableWidget()
-        self.window_table.setColumnCount(5)
-        self.window_table.setHorizontalHeaderLabels(["窗口","总操作","AI占比","均时","最近活动"])
-        self.window_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.window_table.verticalHeader().setVisible(False)
-        self.window_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.window_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.window_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.window_table.setMaximumHeight(180)
-        self.window_table.setFocusPolicy(Qt.NoFocus)
         lt=QHBoxLayout(top)
         lt.addWidget(self.cmb,1)
         lt.addWidget(self.btn_opt)
         lt.addWidget(self.btn_ui)
         lt.addWidget(self.chk_preview)
-        lm=QVBoxLayout(mid)
-        lm.addWidget(self.preview_label,1)
-        lm.addWidget(self.ui_table)
-        lm.addWidget(self.data_table)
-        lm.addWidget(self.window_table)
+        lm=QHBoxLayout(mid)
+        left_col=QVBoxLayout()
+        left_col.addWidget(self.preview_label,1)
+        lm.addLayout(left_col,1)
+        right_panel=QVBoxLayout()
+        right_panel.addWidget(self.ui_table_title)
+        right_panel.addWidget(self.ui_table,1)
+        right_panel.addWidget(self.data_table_title)
+        right_panel.addWidget(self.data_table,1)
+        lm.addLayout(right_panel,1)
         lb=QHBoxLayout(bot)
         lb.addWidget(self.lbl_mode)
         lb.addWidget(self.lbl_fps)
@@ -3952,9 +3949,9 @@ class Main(QMainWindow):
         self.state.signal_modelprog.connect(self.on_modelprog)
         self.state.signal_ui_ready.connect(self.on_ui_ready)
         self.state.signal_data_ready.connect(self.on_data_ready)
-        self.state.signal_window_stats.connect(self.on_window_stats)
         self.on_data_ready([])
-        self.on_window_stats([])
+        self.ui_table_title.setObjectName("uiTableTitle")
+        self.data_table_title.setObjectName("dataTableTitle")
         self.finish_opt.connect(self._handle_opt_finished)
         self.finish_ui.connect(self._handle_ui_finished)
         self.refresh_timer=QTimer(self)
@@ -4085,28 +4082,6 @@ class Main(QMainWindow):
             combo.currentTextChanged.connect(lambda val,lab=name:self.on_data_pref_changed(lab,val))
             self.data_table.setCellWidget(idx,4,combo)
             self.data_pref_editors.append(combo)
-    def on_window_stats(self,rows):
-        self.window_table.setRowCount(0)
-        limited=rows[:60]
-        self.window_table.setRowCount(len(limited))
-        for idx,item in enumerate(limited):
-            title=str(item.get("window",""))
-            total=str(int(item.get("count",0)))
-            ai=f"{float(item.get('ai_ratio',0))*100.0:.1f}%"
-            avg=f"{float(item.get('avg_duration',0))*1000.0:.0f}ms"
-            gap=float(item.get("recent_gap",9999.0))
-            recent="--" if gap>=9000 else f"{gap:.1f}s"
-            self.window_table.setItem(idx,0,QTableWidgetItem(title))
-            self.window_table.setItem(idx,1,QTableWidgetItem(total))
-            cell_ai=QTableWidgetItem(ai)
-            cell_ai.setTextAlignment(Qt.AlignCenter)
-            self.window_table.setItem(idx,2,cell_ai)
-            cell_avg=QTableWidgetItem(avg)
-            cell_avg.setTextAlignment(Qt.AlignCenter)
-            self.window_table.setItem(idx,3,cell_avg)
-            cell_recent=QTableWidgetItem(recent)
-            cell_recent.setTextAlignment(Qt.AlignCenter)
-            self.window_table.setItem(idx,4,cell_recent)
     def refresh_windows(self):
         mapping=self.selector.refresh()
         keys=sorted(list(mapping.keys()))
