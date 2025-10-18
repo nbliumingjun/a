@@ -1612,6 +1612,9 @@ class State(QObject):
         self.trend_window=collections.deque(maxlen=36)
         self.data_color_map={}
         self._color_index=0
+        self.visibility_state=None
+        self.visibility_reason=""
+        self._last_clarity_boost=0.0
         self._pending_window=None
         self._pending_waiter=None
         self._pending_lock=threading.Lock()
@@ -1919,6 +1922,10 @@ class State(QObject):
             target-=0.18
         elif resource>90:
             target-=0.1
+        elif resource<58 and motion>18:
+            target+=0.12
+        elif resource<52 and motion>10:
+            target+=0.08
         elif resource<68 and motion>16:
             target+=0.08
         elif resource<58 and motion>24:
@@ -1927,6 +1934,15 @@ class State(QObject):
         if abs(target-self.resolution_scale)>0.05:
             self.resolution_scale=target
             self._apply_resolution_scale()
+    def _boost_clarity(self,lap,resource):
+        try:
+            now=time.time()
+            if lap<14.0 and resource<88.0 and now-self._last_clarity_boost>1.8:
+                self.resolution_scale=min(1.9,self.resolution_scale+0.1)
+                self._apply_resolution_scale()
+                self._last_clarity_boost=now
+        except:
+            pass
     def _init_day_files(self):
         day=time.strftime("%Y%m%d")
         if self.day_tag==day and self.events_writer and self.frames_writer:
@@ -2015,6 +2031,29 @@ class State(QObject):
             return wr,(tl[0],tl[1],tl[0]+cr[2],tl[1]+cr[3])
         except:
             return (0,0,0,0),(0,0,0,0)
+    def update_visibility(self,visible,context):
+        reason=str(context) if context is not None else ""
+        if visible:
+            if self.visibility_state is True and reason==self.visibility_reason:
+                return
+            self.visibility_state=True
+            self.visibility_reason=reason
+            if reason=="learning":
+                msg="窗口可见，继续学习"
+            elif reason=="training":
+                msg="窗口可见，继续训练"
+            elif reason:
+                msg=reason
+            else:
+                msg="窗口可见"
+            self.signal_tip.emit(msg)
+        else:
+            if self.visibility_state is False and reason==self.visibility_reason:
+                return
+            self.visibility_state=False
+            self.visibility_reason=reason
+            msg=reason if reason else "窗口不可见，已暂停"
+            self.signal_tip.emit(msg)
     def _mss_for_thread(self):
         if not hasattr(self,"thread_mss"):
             self.thread_mss=threading.local()
@@ -2034,6 +2073,21 @@ class State(QObject):
             return img
         except:
             return None
+    def _enhance_frame(self,img):
+        try:
+            if img is None or not isinstance(img,np.ndarray) or img.size==0:
+                return img
+            blur=cv2.GaussianBlur(img,(0,0),1.0)
+            sharp=cv2.addWeighted(img,1.45,blur,-0.45,0)
+            lab=cv2.cvtColor(sharp,cv2.COLOR_BGR2LAB)
+            l,a,b=cv2.split(lab)
+            clahe=cv2.createCLAHE(clipLimit=2.2,tileGridSize=(8,8))
+            l=clahe.apply(l)
+            merged=cv2.merge((l,a,b))
+            enhanced=cv2.cvtColor(merged,cv2.COLOR_LAB2BGR)
+            return enhanced
+        except:
+            return img
     def adapt_fps(self,prev,curr):
         if prev is None or curr is None:
             if curr is not None:
@@ -2081,6 +2135,7 @@ class State(QObject):
             motion_score=motion_score*max(0.6,min(1.6,self._window_weight()))
             resource_pressure=max(avg_cpu,avg_mem,avg_gpu,avg_vram)
             self._auto_adjust_resolution(motion_score,resource_pressure)
+            self._boost_clarity(lap,resource_pressure)
             adaptive_target=self.fps
             if motion_score>28 or trend>6:
                 adaptive_target=min(self.max_fps,adaptive_target+8.0)
@@ -2176,7 +2231,8 @@ class State(QObject):
             while os.path.exists(path):
                 fid=str(int(fid)+1)
                 path=os.path.join(base,f"{fid}.png")
-            resized=cv2.resize(img,(2560,1600))
+            enhanced=self._enhance_frame(img)
+            resized=cv2.resize(enhanced,(2560,1600),interpolation=cv2.INTER_LANCZOS4)
             ok,buf=cv2.imencode(".png",resized,[int(cv2.IMWRITE_PNG_COMPRESSION),self.png_comp])
             if not ok:
                 return None
@@ -2616,13 +2672,14 @@ class LearningThread(threading.Thread):
             self.st.rect=wr
             self.st.client_rect=cr
             if cr==(0,0,0,0) or not self.st.selected_hwnd or not Foreground.ready(self.st.selected_hwnd,cr):
-                self.st.signal_tip.emit("目标窗口不可见或被遮挡，暂停采集")
+                self.st.update_visibility(False,"学习暂停：窗口不可见或被遮挡")
                 time.sleep(0.12)
                 continue
             img=self.st.capture_client()
             if img is None:
                 time.sleep(0.06)
                 continue
+            self.st.update_visibility(True,"learning")
             fid=self.st.record_frame(img,"learning",force=False)
             self.st.adapt_fps(prev,img)
             self.st.prev_img=img
@@ -2656,20 +2713,22 @@ class TrainerThread(threading.Thread):
             self.st.rect=wr
             self.st.client_rect=cr
             if cr==(0,0,0,0) or not self.st.selected_hwnd or not Foreground.ready(self.st.selected_hwnd,cr):
-                self.st.signal_tip.emit("自动暂停：窗口不可见或被遮挡")
+                self.st.update_visibility(False,"训练暂停：窗口不可见或被遮挡")
                 time.sleep(0.10)
                 continue
             if not Foreground.ensure_front(self.st.selected_hwnd):
+                self.st.update_visibility(False,"训练暂停：等待窗口激活")
                 time.sleep(0.06)
                 continue
             if Foreground.occluded(self.st.selected_hwnd,cr):
-                self.st.signal_tip.emit("自动暂停：窗口被遮挡")
+                self.st.update_visibility(False,"训练暂停：窗口被遮挡")
                 time.sleep(0.10)
                 continue
             img=self.st.capture_client()
             if img is None:
                 time.sleep(0.06)
                 continue
+            self.st.update_visibility(True,"training")
             fid=self.st.record_frame(img,"training",force=False)
             self.st.adapt_fps(prev,img)
             self.st.prev_img=img
@@ -3984,6 +4043,17 @@ class UIInspector:
         transitions=float(np.sum(np.abs(np.diff(band,axis=1))))/max(1,h)
         if transitions<1.5:
             return False
+        try:
+            comps,_=cv2.connectedComponents(binary)
+            if comps-1>max(12,len(text)*3):
+                return False
+        except:
+            pass
+        lap=float(cv2.Laplacian(norm,cv2.CV_64F).var())
+        if lap<9.0:
+            return False
+        if float(qual)<0.35 and lap<16.0:
+            return False
         if float(qual)<0.25 and coverage<0.15:
             return False
         return True
@@ -4088,7 +4158,28 @@ class UIInspector:
             return "",0.0
         chars.sort(key=lambda item:item[0])
         text="".join(ch for _,ch,_ in chars).strip()
+        digits=[prob for _,ch,prob in chars if ch.isdigit()]
+        strong=[prob for _,ch,prob in chars if ch.isdigit() and prob>=0.7]
+        if not digits:
+            return "",0.0
+        if len(strong)<max(1,int(len(digits)*0.6)):
+            return "",0.0
         conf=float(sum(scores)/len(scores)) if scores else 0.0
+        ink=float(np.count_nonzero(thr))/max(1,thr.size)
+        if conf<0.55 or ink<0.06 or ink>0.42:
+            return "",0.0
+        edge=cv2.Canny(norm,40,120)
+        detail=float(np.count_nonzero(edge))/max(1,edge.size)
+        if detail<0.03:
+            return "",0.0
+        try:
+            comps,_=cv2.connectedComponents(thr)
+            if comps-1>max(12,len(chars)*3):
+                return "",0.0
+        except:
+            pass
+        if len(digits)>8 and conf<0.75:
+            return "",0.0
         return text,conf
     def _data_regions(self,gray,ui_results):
         try:
