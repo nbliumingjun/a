@@ -185,7 +185,7 @@ except:
     _nv=None
 from PySide6.QtWidgets import QApplication,QMainWindow,QWidget,QVBoxLayout,QHBoxLayout,QPushButton,QComboBox,QLabel,QCheckBox,QMessageBox,QProgressBar,QTableWidget,QDialog,QDialogButtonBox,QTableWidgetItem,QHeaderView,QAbstractItemView,QSizePolicy
 from PySide6.QtCore import QTimer,Qt,Signal,QObject,QSize
-from PySide6.QtGui import QImage,QPixmap
+from PySide6.QtGui import QImage,QPixmap,QColor
 def _gpu_util_mem():
     try:
         if _nv is None:
@@ -1591,6 +1591,8 @@ class State(QObject):
         self.activity_events=collections.deque(maxlen=360)
         self.window_stats={}
         self.trend_window=collections.deque(maxlen=36)
+        self.data_color_map={}
+        self._color_index=0
         self._pending_window=None
         self._pending_waiter=None
         self._pending_lock=threading.Lock()
@@ -1716,6 +1718,87 @@ class State(QObject):
         txt="越高越好" if val=="higher" else "越低越好" if val=="lower" else "无关"
         target="全局数据" if key=="__default__" else key
         self.signal_tip.emit(f"{target}目标:{txt}")
+    def ensure_data_color(self,key):
+        ref=key if key else str(uuid.uuid4())
+        if ref in self.data_color_map:
+            return self.data_color_map[ref]
+        color=self._next_color()
+        self.data_color_map[ref]=color
+        return color
+    def _next_color(self):
+        golden=0.618033988749895
+        h=(self._color_index*golden)%1.0
+        self._color_index+=1
+        s=0.72
+        v=0.95
+        r,g,b=self._hsv_to_rgb(h,s,v)
+        return (int(b),int(g),int(r))
+    def _hsv_to_rgb(self,h,s,v):
+        i=int(h*6.0)
+        f=h*6.0-i
+        p=v*(1.0-s)
+        q=v*(1.0-f*s)
+        t=v*(1.0-(1.0-f)*s)
+        i=i%6
+        if i==0:
+            r,g,b=v,t,p
+        elif i==1:
+            r,g,b=q,v,p
+        elif i==2:
+            r,g,b=p,v,t
+        elif i==3:
+            r,g,b=p,q,v
+        elif i==4:
+            r,g,b=t,p,v
+        else:
+            r,g,b=v,p,q
+        return int(r*255),int(g*255),int(b*255)
+    def preview_visual(self,img):
+        if img is None or not isinstance(img,np.ndarray):
+            return img
+        base=np.ascontiguousarray(img.copy())
+        items=self.data_points if isinstance(self.data_points,list) else []
+        if not items:
+            return base
+        h,w=base.shape[:2]
+        overlay=np.zeros_like(base)
+        outlines=[]
+        for it in items:
+            nb=it.get("norm_bounds")
+            if not nb or len(nb)!=4:
+                bounds=it.get("bounds")
+                if not bounds or len(bounds)!=4:
+                    continue
+                nb=[float(bounds[0])/1280.0,float(bounds[1])/800.0,float(bounds[2])/1280.0,float(bounds[3])/800.0]
+            try:
+                nx1=float(nb[0])
+                ny1=float(nb[1])
+                nx2=float(nb[2])
+                ny2=float(nb[3])
+            except:
+                continue
+            if nx2<=nx1 or ny2<=ny1:
+                continue
+            x1=int(max(0,min(w-1,math.floor(nx1*w))))
+            y1=int(max(0,min(h-1,math.floor(ny1*h))))
+            x2=int(max(x1+1,min(w,math.ceil(nx2*w))))
+            y2=int(max(y1+1,min(h,math.ceil(ny2*h))))
+            color=it.get("color")
+            key=it.get("key")
+            if key and (not color or len(color)!=3):
+                color=self.ensure_data_color(key)
+                it["color"]=[int(color[0]),int(color[1]),int(color[2])]
+            if not color or len(color)!=3:
+                continue
+            col=(int(color[0]),int(color[1]),int(color[2]))
+            cv2.rectangle(overlay,(x1,y1),(x2-1,y2-1),col,-1)
+            outlines.append((x1,y1,x2,y2,col))
+        if not outlines:
+            return base
+        blended=cv2.addWeighted(base,0.65,overlay,0.35,0)
+        for x1,y1,x2,y2,col in outlines:
+            cv2.rectangle(blended,(x1,y1),(x2-1,y2-1),col,2)
+        return blended
     def _align_dim(self,val,step):
         if step<=0:
             return int(val)
@@ -2479,8 +2562,13 @@ class LearningThread(threading.Thread):
             self.st.prev_imgs.append(img)
             prev=img
             if self.ui.preview_enabled():
-                h,w=img.shape[:2]
-                qi=QImage(img.data,w,h,3*w,QImage.Format_BGR888)
+                disp=self.st.preview_visual(img)
+                if isinstance(disp,np.ndarray):
+                    buf=np.ascontiguousarray(disp)
+                else:
+                    buf=np.ascontiguousarray(img)
+                h,w=buf.shape[:2]
+                qi=QImage(buf.data,w,h,3*w,QImage.Format_BGR888)
                 self.st.signal_preview.emit(QPixmap.fromImage(qi))
             self.st.periodic()
             time.sleep(max(1.0/self.st.fps,0.01))
@@ -2527,8 +2615,13 @@ class TrainerThread(threading.Thread):
                 break
             prev=img
             if self.ui.preview_enabled():
-                h,w=img.shape[:2]
-                qi=QImage(img.data,w,h,3*w,QImage.Format_BGR888)
+                disp=self.st.preview_visual(img)
+                if isinstance(disp,np.ndarray):
+                    buf=np.ascontiguousarray(disp)
+                else:
+                    buf=np.ascontiguousarray(img)
+                h,w=buf.shape[:2]
+                qi=QImage(buf.data,w,h,3*w,QImage.Format_BGR888)
                 self.st.signal_preview.emit(QPixmap.fromImage(qi))
             kind=act.get("kind") if isinstance(act,dict) else "idle"
             heat=act.get("heat") if isinstance(act,dict) else None
@@ -3672,22 +3765,28 @@ class UIInspector:
             return data
         gray=cv2.cvtColor(base_img,cv2.COLOR_BGR2GRAY)
         regions=self._data_regions(gray,ui_results)
+        base_shape=base_img.shape
         for idx,(x1,y1,x2,y2,score,_) in enumerate(regions):
             extracted=self._extract_value(orig_img,(x1,y1,x2,y2),base_img.shape)
             if extracted is None:
                 continue
             text,value,qual=extracted
             conf=float(max(0.0,min(1.0,score)))*float(max(0.05,min(1.0,qual)))
-            key=f"{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}"
+            q=lambda v:int(round(v/4.0)*4)
+            key=f"{q(x1)}_{q(y1)}_{q(x2)}_{q(y2)}"
             name=f"数据{idx+1}"
-            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key)
+            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key,base_shape)
             if len(data)>=32:
                 break
         return data
-    def _append_data(self,data,name,bounds,value,text,confidence,key):
+    def _append_data(self,data,name,bounds,value,text,confidence,key,base_shape):
         pref=self.st.preference_for_data(name)
         trend=self._trend(key,value)
-        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text}
+        color=self.st.ensure_data_color(key)
+        bw=max(1,base_shape[1])
+        bh=max(1,base_shape[0])
+        norm=[max(0.0,min(1.0,float(bounds[0])/bw)),max(0.0,min(1.0,float(bounds[1])/bh)),max(0.0,min(1.0,float(bounds[2])/bw)),max(0.0,min(1.0,float(bounds[3])/bh))]
+        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
         data.append(entry)
     def _trend(self,key,val):
         hist=self.data_history[key]
@@ -4082,6 +4181,24 @@ class Main(QMainWindow):
             combo.currentTextChanged.connect(lambda val,lab=name:self.on_data_pref_changed(lab,val))
             self.data_table.setCellWidget(idx,4,combo)
             self.data_pref_editors.append(combo)
+            color=it.get("color")
+            key=it.get("key")
+            if key and (not color or len(color)!=3):
+                color=self.state.ensure_data_color(key)
+                it["color"]=list(color)
+            if color and len(color)==3:
+                col=tuple(int(c) for c in color)
+                r=int(col[2])
+                g=int(col[1])
+                b=int(col[0])
+                bg=QColor((r+255)//2,(g+255)//2,(b+255)//2)
+                for col_idx in range(4):
+                    item=self.data_table.item(idx,col_idx)
+                    if item:
+                        item.setBackground(bg)
+                combo.setStyleSheet(f"background-color: rgba({r},{g},{b},120);")
+            else:
+                combo.setStyleSheet("")
     def refresh_windows(self):
         mapping=self.selector.refresh()
         keys=sorted(list(mapping.keys()))
