@@ -3297,8 +3297,8 @@ class Main(QMainWindow):
         for idx,it in enumerate(limited):
             t=str(it.get("type",""))
             b=str(it.get("bounds",""))
-            c=f"{float(it.get("confidence",0)):.2f}"
-            inter=f"{float(it.get("interaction",0)):.2f}"
+            c=f"{float(it.get('confidence',0)):.2f}"
+            inter=f"{float(it.get('interaction',0)):.2f}"
             self.ui_table.setItem(idx,0,QTableWidgetItem(t))
             self.ui_table.setItem(idx,1,QTableWidgetItem(b))
             ci=QTableWidgetItem(c)
