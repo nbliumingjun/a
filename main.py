@@ -1664,7 +1664,7 @@ class State(QObject):
                     val_int=int(str(raw_val).strip())
                 except:
                     val_int=None
-            if val_int is None or val_int<0:1
+            if val_int is None or val_int<0:
                 txt_src=it.get("text")
                 if isinstance(txt_src,str):
                     digits=re.findall(r"\d+",txt_src)
@@ -1673,7 +1673,7 @@ class State(QObject):
                             cand=int("".join(digits))
                         except:
                             cand=None
-                       if cand is not None and cand>=0:
+                        if cand is not None and cand>=0:
                             val_int=cand
             if val_int is None or val_int<0:
                 continue
