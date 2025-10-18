@@ -1071,6 +1071,36 @@ class StrategyEngine:
         if goal.max()>0:
             goal/=goal.max()
         return goal
+    def local_maxima(self,hm,top=80,dist=14):
+        if hm is None:
+            return []
+        arr=np.array(hm,dtype=np.float32,copy=True)
+        if arr.ndim==3:
+            arr=arr.squeeze()
+        if arr.ndim!=2:
+            return []
+        arr=np.nan_to_num(arr,copy=False)
+        h,w=arr.shape
+        if h==0 or w==0 or top<=0:
+            return []
+        arr[arr<0]=0
+        result=[]
+        work=arr.copy()
+        dist=max(1,int(dist))
+        for _ in range(int(top)):
+            idx=np.argmax(work)
+            val=float(work.flat[idx])
+            if val<=0:
+                break
+            y=idx//w
+            x=idx%w
+            result.append((int(x),int(y),val))
+            x1=max(0,x-dist)
+            x2=min(w,x+dist+1)
+            y1=max(0,y-dist)
+            y2=min(h,y+dist+1)
+            work[y1:y2,x1:x2]=0
+        return result
     def predict(self,img,events=None,ui_elements=None,heat_prior=None,event_prior=None):
         self.ensure_integrity()
         h,w=img.shape[:2]
