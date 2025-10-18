@@ -3556,21 +3556,25 @@ class UIInspector:
                 if patch.size==0:
                     continue
                 visual=torch.from_numpy(cv2.resize(patch,(128,128))).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
-                layout=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
-                inter=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
-                logits,rep=self.model(visual,layout,inter)
+                layout_tensor=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
+                inter_tensor=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
+                logits,rep=self.model(visual,layout_tensor,inter_tensor)
                 prob=torch.softmax(logits,dim=-1)
                 idx=int(torch.argmax(prob,dim=-1))
                 label=self.labels[idx]
                 conf=float(prob[0,idx].item())
-                enhanced=self._refine(label,conf,inter.cpu().numpy().flatten())
+                layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
+                inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
+                enhanced=self._refine(label,conf,inter_vec,rep)
                 score=float(max(0.0,min(1.0,enhanced)))
                 pref=self.st.preference_for_label(label)
                 if pref=="ignore":
                     score=0.0
                 elif pref=="lower":
                     score=1.0-score
-                results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":float(inter[0,0].item()),"dynamics":inter[0].tolist(),"layout":layout[0].tolist(),"preference":pref})
+                inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
+                interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
+                results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref})
                 self._update_memory(label,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
@@ -3685,11 +3689,11 @@ class UIInspector:
             p=v/total
             ent-=p*math.log(p+1e-9)
         return ent
-    def _refine(self,label,conf,inter):
+    def _refine(self,label,conf,inter,rep):
         weight=conf
-        click_density=inter[0]
-        avg_dur=inter[2]
-        entropy=inter[6]
+        click_density=inter[0] if len(inter)>0 else 0.0
+        avg_dur=inter[2] if len(inter)>2 else 0.0
+        entropy=inter[6] if len(inter)>6 else 0.0
         value_hint=float(getattr(self.st.strategy,"last_value",0.0)) if hasattr(self.st,"strategy") else 0.0
         if label=="button":
             weight=conf*0.7+min(1.0,click_density/5.0)*0.3
@@ -3698,8 +3702,12 @@ class UIInspector:
         elif label=="menu":
             weight=conf*0.5+min(1.0,entropy/1.5)*0.5
         elif label=="panel":
-            weight=conf*0.6+min(1.0,max(inter[3],0.1))*0.4
+            density=inter[3] if len(inter)>3 else 0.0
+            weight=conf*0.6+min(1.0,max(density,0.1))*0.4
         weight=weight*(0.85+0.3*value_hint)
+        proto=self._prototype_score(label,rep)
+        memory=self._memory_vote(label)
+        weight=weight*0.6+proto*0.25+memory*0.15
         return max(0.0,min(1.0,weight))
     def _update_memory(self,label,rep):
         if label not in self.prototype:
@@ -3711,6 +3719,23 @@ class UIInspector:
         self.prototype[label]=proto
         self.prototype_count[label]=count+1.0
         self.memory.append((label,rep.detach().cpu().numpy().tolist()))
+    def _prototype_score(self,label,rep):
+        proto=self.prototype.get(label)
+        if proto is None:
+            return 0.5
+        vec=rep.squeeze(0)
+        if proto.norm().item()==0 or vec.norm().item()==0:
+            return 0.5
+        sim=float(F.cosine_similarity(proto.unsqueeze(0),vec.unsqueeze(0)).item())
+        return max(0.0,min(1.0,0.5+0.5*sim))
+    def _memory_vote(self,label):
+        if not self.memory:
+            return 0.5
+        recent=list(self.memory)[-60:]
+        if not recent:
+            return 0.5
+        match=sum(1 for lab,_ in recent if lab==label)/len(recent)
+        return max(0.0,min(1.0,0.35+0.55*match))
     def _candidates(self,img,events):
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
         edges=cv2.Canny(gray,40,120)
@@ -3808,12 +3833,13 @@ class UIInspector:
                 merged.append(el)
         return merged
     def _collect_data(self,base_img,orig_img,events,ui_results):
-        data=[]
         if base_img is None or orig_img is None:
-            return data
+            return []
         gray=cv2.cvtColor(base_img,cv2.COLOR_BGR2GRAY)
         regions=self._data_regions(gray,ui_results)
         base_shape=base_img.shape
+        buckets={}
+        order=[]
         for idx,(x1,y1,x2,y2,score,_) in enumerate(regions):
             extracted=self._extract_value(orig_img,(x1,y1,x2,y2),base_img.shape)
             if extracted is None:
@@ -3823,11 +3849,20 @@ class UIInspector:
             q=lambda v:int(round(v/4.0)*4)
             key=f"{q(x1)}_{q(y1)}_{q(x2)}_{q(y2)}"
             name=f"数据{idx+1}"
-            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key,base_shape,orig_img.shape)
-            if len(data)>=32:
-                break
-        return data
-    def _append_data(self,data,name,bounds,value,text,confidence,key,base_shape,orig_shape):
+            entry=self._build_data_entry(name,(x1,y1,x2,y2),value,text,conf,key,base_shape,orig_img.shape)
+            if entry is None:
+                continue
+            uniq=(entry["key"],entry.get("text",""))
+            prev=buckets.get(uniq)
+            if prev is None or entry.get("confidence",0.0)>prev.get("confidence",0.0):
+                buckets[uniq]=entry
+                if prev is None:
+                    order.append(uniq)
+        ordered=[buckets[k] for k in order if k in buckets]
+        ordered.sort(key=lambda item:item.get("confidence",0.0),reverse=True)
+        deduped=self._dedupe_data_entries(ordered)
+        return deduped[:32]
+    def _build_data_entry(self,name,bounds,value,text,confidence,key,base_shape,orig_shape):
         pref=self.st.preference_for_data(name)
         trend=self._trend(key,value)
         color=self.st.ensure_data_color(key)
@@ -3847,7 +3882,20 @@ class UIInspector:
         ay2=int(max(ay1+1,min(oh,round(bounds[3]*sy))))
         norm=[max(0.0,min(1.0,float(ax1)/float(ow))),max(0.0,min(1.0,float(ay1)/float(oh))),max(0.0,min(1.0,float(ax2)/float(ow))),max(0.0,min(1.0,float(ay2)/float(oh)))]
         entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
-        data.append(entry)
+        return entry
+    def _dedupe_data_entries(self,items):
+        result=[]
+        for entry in items:
+            merged=False
+            for exist in result:
+                if self._iou(tuple(entry.get("bounds",[0,0,0,0])),tuple(exist.get("bounds",[0,0,0,0])))>0.55 or entry.get("key")==exist.get("key"):
+                    if entry.get("confidence",0.0)>exist.get("confidence",0.0):
+                        exist.update(entry)
+                    merged=True
+                    break
+            if not merged:
+                result.append(entry)
+        return result
     def _trend(self,key,val):
         hist=self.data_history[key]
         if val is None:
@@ -3872,8 +3920,41 @@ class UIInspector:
             qual=max(qual,prob)
         if not text or not any(ch.isdigit() for ch in text):
             return None
+        if not self._validate_numeric_patch(crop,text,qual):
+            return None
         value=self._parse_numeric(text)
         return text,value,max(qual,0.05)
+    def _validate_numeric_patch(self,img,text,qual):
+        if img is None or img.size==0:
+            return False
+        digits=sum(ch.isdigit() for ch in text)
+        if digits==0:
+            return False
+        ratio=digits/max(1,len(text))
+        if ratio<0.6:
+            return False
+        h,w=img.shape[:2]
+        if h*w<100:
+            return False
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        _,binary=cv2.threshold(norm,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        fg=cv2.countNonZero(binary)
+        area=binary.size
+        coverage=fg/max(1,area)
+        if coverage<0.08 or coverage>0.6:
+            return False
+        edges=cv2.Canny(norm,60,160)
+        edge_ratio=float(np.count_nonzero(edges))/max(1,area)
+        if edge_ratio<0.05 or edge_ratio>0.5:
+            return False
+        band=(binary>0).astype(np.int32)
+        transitions=float(np.sum(np.abs(np.diff(band,axis=1))))/max(1,h)
+        if transitions<1.5:
+            return False
+        if float(qual)<0.25 and coverage<0.15:
+            return False
+        return True
     def _map_to_client(self,bounds,orig_shape,base_shape):
         bx1,by1,bx2,by2=bounds
         base_h,base_w=base_shape[:2]
