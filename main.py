@@ -61,6 +61,8 @@ def ensure_config():
             del merged["ui_value_orientation"]
         if "__default__" not in prefs:
             prefs["__default__"]=cfg_defaults["ui_preferences"]["__default__"]
+        if "control" not in prefs:
+            prefs["control"]=prefs["__default__"]
         merged["ui_preferences"]=prefs
         data_prefs=dict(merged.get("data_preferences")) if isinstance(merged.get("data_preferences"),dict) else {}
         if "__default__" not in data_prefs:
@@ -1250,10 +1252,12 @@ class StrategyEngine:
         vec[0,3]=min(1.0,avg_area)
         vec[0,4]=min(1.0,max(areas) if areas else 0.0)
         vec[0,5]=min(1.0,min(areas) if areas else 0.0)
-        vec[0,6]=float(sum(1 for el in ui_elements if el.get("type")=="button"))/max(1,total)
-        vec[0,7]=float(sum(1 for el in ui_elements if el.get("type")=="panel"))/max(1,total)
-        vec[0,8]=float(sum(1 for el in ui_elements if el.get("type")=="input"))/max(1,total)
-        vec[0,9]=float(sum(1 for el in ui_elements if el.get("interaction",0)>0.5))/max(1,total)
+        conf_vals=[float(el.get("confidence",0)) for el in ui_elements]
+        inter_vals=[float(el.get("interaction",0)) for el in ui_elements]
+        vec[0,6]=sum(conf_vals)/max(1,total)
+        vec[0,7]=float(sum(1 for c in conf_vals if c>0.7))/max(1,total)
+        vec[0,8]=float(np.std(conf_vals)) if conf_vals else 0.0
+        vec[0,9]=float(sum(1 for v in inter_vals if v>0.5))/max(1,total)
         return vec
     def _multi_target_plan(self,score,ui_elements,multi_factor,risk_factor):
         h,w=score.shape
@@ -1286,7 +1290,7 @@ class StrategyEngine:
                         score=float(el.get("confidence",0))*0.6+float(el.get("interaction",0))*0.4
                         if score>best_score:
                             best_score=score
-                            best=el.get("type","unknown")
+                            best=el.get("raw_label",el.get("display","unknown"))
                 item["ui_type"]=best or "unknown"
         return plan
     def train_incremental(self,batches,progress_cb=None,total=None):
@@ -3775,21 +3779,22 @@ class UIInspector:
                 logits,rep=self.model(visual,layout_tensor,inter_tensor)
                 prob=torch.softmax(logits,dim=-1)
                 idx=int(torch.argmax(prob,dim=-1))
-                label=self.labels[idx]
+                raw_label=self.labels[idx]
                 conf=float(prob[0,idx].item())
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
                 inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
-                enhanced=self._refine(label,conf,inter_vec,rep)
+                enhanced=self._refine(raw_label,conf,inter_vec,rep)
                 score=float(max(0.0,min(1.0,enhanced)))
-                pref=self.st.preference_for_label(label)
+                pref_key="control"
+                pref=self.st.preference_for_label(pref_key)
                 if pref=="ignore":
                     score=0.0
                 elif pref=="lower":
                     score=1.0-score
                 inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
                 interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
-                results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref})
-                self._update_memory(label,rep)
+                results.append({"type":pref_key,"raw_label":raw_label,"display":raw_label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key})
+                self._update_memory(raw_label,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
         if len(results)>limit:
@@ -4157,6 +4162,11 @@ class UIInspector:
                 strict=self._non_negative_integer(onumeric)
                 if strict:
                     candidates.append((strict[0],strict[1],max(prob,0.65)))
+        cluster=self._cluster_digits(crop)
+        if cluster:
+            txt,val,conf=cluster
+            if all(txt!=c[0] for c in candidates):
+                candidates.append((txt,val,conf))
         best_txt=None
         best_val=None
         best_conf=0.0
@@ -4215,15 +4225,15 @@ class UIInspector:
         fg=cv2.countNonZero(binary)
         area=binary.size
         coverage=fg/max(1,area)
-        if coverage<0.08 or coverage>0.6:
+        if coverage<0.05 or coverage>0.72:
             return False
         edges=cv2.Canny(norm,60,160)
         edge_ratio=float(np.count_nonzero(edges))/max(1,area)
-        if edge_ratio<0.05 or edge_ratio>0.5:
+        if edge_ratio<0.04 or edge_ratio>0.65:
             return False
         band=(binary>0).astype(np.int32)
         transitions=float(np.sum(np.abs(np.diff(band,axis=1))))/max(1,h)
-        if transitions<1.5:
+        if transitions<1.2:
             return False
         try:
             comps,_=cv2.connectedComponents(binary)
@@ -4232,11 +4242,11 @@ class UIInspector:
         except:
             pass
         lap=float(cv2.Laplacian(norm,cv2.CV_64F).var())
-        if lap<9.0:
+        if lap<7.5:
             return False
-        if float(qual)<0.35 and lap<16.0:
+        if float(qual)<0.3 and lap<14.0:
             return False
-        if float(qual)<0.25 and coverage<0.15:
+        if float(qual)<0.2 and coverage<0.12:
             return False
         return True
     def _map_to_client(self,bounds,orig_shape,base_shape):
@@ -4388,6 +4398,66 @@ class UIInspector:
         if len(digits)>8 and conf<0.75:
             return "",0.0
         return text,conf
+    def _cluster_digits(self,img):
+        if img is None or img.size==0:
+            return None
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        try:
+            clahe=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8))
+            norm=clahe.apply(norm)
+        except:
+            pass
+        blur=cv2.GaussianBlur(norm,(3,3),0)
+        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,21,6)
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(2,3))
+        proc=cv2.morphologyEx(thr,cv2.MORPH_CLOSE,kernel,iterations=1)
+        contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        boxes=[]
+        for c in contours:
+            x,y,w,h=cv2.boundingRect(c)
+            area=w*h
+            if area<25 or area>4000:
+                continue
+            if h<8 or w<3:
+                continue
+            ratio=h/max(1.0,w)
+            if ratio<0.6 or ratio>5.0:
+                continue
+            boxes.append((x,y,w,h))
+        if not boxes:
+            return None
+        boxes.sort(key=lambda b:b[0])
+        height=max(b[3] for b in boxes)
+        baseline=min(b[1] for b in boxes)
+        filtered=[b for b in boxes if abs(b[1]-baseline)<=max(6,int(height*0.5))]
+        if len(filtered)>=max(1,len(boxes)//2):
+            boxes=filtered
+        ink=float(np.count_nonzero(proc))/max(1,proc.size)
+        if ink<0.04 or ink>0.75:
+            return None
+        digits=[]
+        probs=[]
+        for x,y,w,h in boxes:
+            pad=max(1,int(min(w,h)*0.3))
+            y1=max(0,y-pad)
+            y2=min(proc.shape[0],y+h+pad)
+            x1=max(0,x-pad)
+            x2=min(proc.shape[1],x+w+pad)
+            digit_img=proc[y1:y2,x1:x2]
+            if digit_img.size==0:
+                continue
+            pred,prob=self.digit_clf.classify(digit_img)
+            digits.append(str(pred))
+            probs.append(float(max(0.0,min(1.0,prob))))
+        if not digits:
+            return None
+        text="".join(digits)
+        strict=self._non_negative_integer(text)
+        if not strict:
+            return None
+        conf=sum(probs)/len(probs) if probs else 0.0
+        return strict[0],strict[1],max(0.55,float(conf))
     def _data_regions(self,gray,ui_results):
         try:
             small=cv2.GaussianBlur(gray,(3,3),0)
@@ -4418,13 +4488,14 @@ class UIInspector:
             score=max(0.0,min(1.0,var*1.6+contrast*0.9))
             value=float(np.mean(patch))
             res.append((box[0],box[1],box[2],box[3],score,value))
-        res=sorted(res,key=lambda r:r[4],reverse=True)[:8]
+        limit=max(12,min(64,self.max_items*2))
+        res=sorted(res,key=lambda r:r[4],reverse=True)[:limit]
         return res
     def _overlaps_ui(self,box,ui_results):
         bx1,by1,bx2,by2=box
         for el in ui_results:
             bounds=el.get("bounds",[0,0,0,0])
-            if self._iou((bx1,by1,bx2,by2),(int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])))>0.4:
+            if self._iou((bx1,by1,bx2,by2),(int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])))>0.75:
                 return True
         return False
 class Main(QMainWindow):
@@ -4614,11 +4685,12 @@ class Main(QMainWindow):
         self.pref_editors=[]
         mapping={"higher":0,"lower":1,"ignore":2}
         for idx,it in enumerate(limited):
-            t=str(it.get("type",""))
+            display=str(it.get("display",it.get("raw_label",it.get("type",""))))
+            pref_key=str(it.get("pref_key",it.get("type","")))
             b=str(it.get("bounds",""))
             c=f"{float(it.get('confidence',0)):.2f}"
             inter=f"{float(it.get('interaction',0)):.2f}"
-            self.ui_table.setItem(idx,0,QTableWidgetItem(t))
+            self.ui_table.setItem(idx,0,QTableWidgetItem(display))
             self.ui_table.setItem(idx,1,QTableWidgetItem(b))
             ci=QTableWidgetItem(c)
             ci.setTextAlignment(Qt.AlignCenter)
@@ -4628,12 +4700,12 @@ class Main(QMainWindow):
             self.ui_table.setItem(idx,3,ii)
             combo=QComboBox()
             combo.addItems(["越高越好","越低越好","无关"])
-            pref=it.get("preference") or self.state.preference_for_label(t)
+            pref=it.get("preference") or self.state.preference_for_label(pref_key)
             idx_pref=mapping.get(pref,0)
             combo.blockSignals(True)
             combo.setCurrentIndex(idx_pref)
             combo.blockSignals(False)
-            combo.currentTextChanged.connect(lambda val,lab=t:self.on_pref_changed_item(lab,val))
+            combo.currentTextChanged.connect(lambda val,lab=pref_key:self.on_pref_changed_item(lab,val))
             self.ui_table.setCellWidget(idx,4,combo)
             self.pref_editors.append(combo)
     def on_data_ready(self,items):
