@@ -1571,13 +1571,20 @@ class State(QObject):
                 serial[k]=v
         self.save_cfg("hyperparam_state",serial)
     def _norm_pref_value(self,val,default):
-        txt=str(val).lower()
-        if txt.startswith("低") or txt.startswith("low"):
-            return "lower"
-        if txt.startswith("无关") or txt.startswith("ignore"):
-            return "ignore"
-        if txt.startswith("高") or txt.startswith("high"):
-            return "higher"
+        raw=str(val).strip()
+        txt=raw.lower()
+        lower_tokens=["low","lower","越低","更低","低","越低越好","更低越好"]
+        for token in lower_tokens:
+            if txt.startswith(token) or token in txt or raw.startswith(token) or token in raw:
+                return "lower"
+        ignore_tokens=["无关","忽略","ignore","irrelevant","无影响"]
+        for token in ignore_tokens:
+            if txt.startswith(token) or token in txt or raw.startswith(token) or token in raw:
+                return "ignore"
+        higher_tokens=["high","higher","越高","更高","高","越高越好","更高越好"]
+        for token in higher_tokens:
+            if txt.startswith(token) or token in txt or raw.startswith(token) or token in raw:
+                return "higher"
         return default
     def _normalize_preferences(self,prefs):
         default=cfg_defaults["ui_preferences"]["__default__"]
