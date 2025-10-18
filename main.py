@@ -35,7 +35,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_value_orientation":"higher","hyperparam_state":{}}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{}}
 default_ui_labels=["button","input","panel","label","widget","menu","icon","ability","joystick","skill","toggle","minimap"]
 schema_defaults={"labels":default_ui_labels,"max_items":48}
 def ensure_config():
@@ -52,6 +52,15 @@ def ensure_config():
             cur={}
         merged=dict(cfg_defaults)
         merged.update(cur)
+        prefs=dict(merged.get("ui_preferences")) if isinstance(merged.get("ui_preferences"),dict) else {}
+        if "ui_value_orientation" in merged:
+            ori=str(merged.get("ui_value_orientation") or "")
+            prefs=dict(prefs)
+            prefs["__default__"]="lower" if ori.lower().startswith("low") else "higher"
+            del merged["ui_value_orientation"]
+        if "__default__" not in prefs:
+            prefs["__default__"]=cfg_defaults["ui_preferences"]["__default__"]
+        merged["ui_preferences"]=prefs
         with open(cfg_path,"w",encoding="utf-8") as f:
             json.dump(merged,f,ensure_ascii=False,indent=2)
             f.flush()
@@ -183,6 +192,118 @@ def _gpu_util_mem():
         return util,mem
     except:
         return None,None
+class RewardComposer:
+    def __init__(self):
+        self.summary={"win_rate":0.5,"objective":0.0,"task":0.0}
+        self.lock=threading.Lock()
+        self.last_scan=0.0
+    def _scan(self):
+        if time.time()-self.last_scan<5.0:
+            return
+        if not self.lock.acquire(blocking=False):
+            return
+        try:
+            wins=0
+            total=0
+            objective_sum=0.0
+            objective_count=0
+            task_sum=0.0
+            task_count=0
+            for path in glob.glob(os.path.join(logs_dir,"*.json*")):
+                if os.path.isdir(path):
+                    continue
+                try:
+                    if path.endswith(".jsonl"):
+                        with open(path,"r",encoding="utf-8") as f:
+                            for line in f:
+                                obj=json.loads(line)
+                                if isinstance(obj,dict):
+                                    wins,total,objective_sum,objective_count,task_sum,task_count=self._accumulate(obj,wins,total,objective_sum,objective_count,task_sum,task_count)
+                    else:
+                        with open(path,"r",encoding="utf-8") as f:
+                            obj=json.load(f)
+                            if isinstance(obj,dict):
+                                wins,total,objective_sum,objective_count,task_sum,task_count=self._accumulate(obj,wins,total,objective_sum,objective_count,task_sum,task_count)
+                            elif isinstance(obj,list):
+                                for item in obj:
+                                    if isinstance(item,dict):
+                                        wins,total,objective_sum,objective_count,task_sum,task_count=self._accumulate(item,wins,total,objective_sum,objective_count,task_sum,task_count)
+                except:
+                    continue
+            rate=wins/max(1,total)
+            objective=objective_sum/max(1,objective_count)
+            task=task_sum/max(1,task_count)
+            self.summary={"win_rate":max(0.0,min(1.0,rate)),"objective":max(0.0,objective),"task":max(0.0,task)}
+            self.last_scan=time.time()
+        finally:
+            self.lock.release()
+    def _accumulate(self,obj,wins,total,objective_sum,objective_count,task_sum,task_count):
+        result=str(obj.get("result",""))
+        if result:
+            total+=1
+            low=result.lower()
+            if low in ["win","victory","获胜","success"]:
+                wins+=1
+        for key in ["objective_score","score","kills","damage","economy","tower_destroyed","stars"]:
+            if key in obj:
+                try:
+                    objective_sum+=float(obj.get(key,0.0))
+                    objective_count+=1
+                except:
+                    continue
+        for key in ["tasks","task_progress","missions","quest","quests"]:
+            if key in obj:
+                val=obj.get(key)
+                if isinstance(val,(int,float)):
+                    task_sum+=float(val)
+                    task_count+=1
+                elif isinstance(val,dict):
+                    try:
+                        total_val=sum(float(v) for v in val.values())
+                        task_sum+=total_val
+                        task_count+=len(val)
+                    except:
+                        continue
+        return wins,total,objective_sum,objective_count,task_sum,task_count
+    def metrics(self):
+        self._scan()
+        return dict(self.summary)
+    def evaluate(self,event):
+        metrics=self.metrics()
+        base=0.1
+        typ=str(event.get("type",""))
+        if typ=="left":
+            base+=0.18
+        elif typ=="right":
+            base+=0.12
+        elif typ=="middle":
+            base+=0.08
+        duration=max(0.0,float(event.get("duration",0.0) or 0.0))
+        inside=float(event.get("ins_press",0))+float(event.get("ins_release",0))
+        inside=max(0.0,min(2.0,inside))
+        moves=event.get("moves") or []
+        span=0.0
+        if moves:
+            xs=[m[1] for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
+            ys=[m[2] for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
+            if xs and ys:
+                span=(max(xs)-min(xs)+max(ys)-min(ys))/4096.0
+        combo=len(event.get("clip_ids") or [])
+        synergy=0.6*metrics.get("win_rate",0.5)+0.25*min(1.5,metrics.get("objective",0.0)/10.0)+0.15*min(1.5,metrics.get("task",0.0)/5.0)
+        reward=base*(0.7+synergy)
+        reward+=min(0.5,span)
+        reward+=min(0.45,combo*0.06*(1.0+metrics.get("win_rate",0.5)))
+        reward+=min(0.4,duration*0.5)
+        reward+=min(0.3,inside*0.1)
+        if event.get("source")=="ai":
+            reward*=0.95
+        penalty=0.0
+        if duration>1.5:
+            penalty+=0.1
+        if span>0.8:
+            penalty+=0.08
+        reward=max(0.0,reward-penalty)
+        return max(0.0,min(2.2,reward))
 class ModelManifest:
     def __init__(self,cfg):
         self.repo=cfg.get("model_repo",cfg_defaults["model_repo"])
@@ -659,7 +780,9 @@ class AdaptiveHyperParams:
                 except:
                     vals[k]=defaults[k]
         self.values=vals
-        self.prefers_high=(cfg.get("ui_value_orientation","higher")!="lower")
+        self.pref_map={}
+        self.prefers_high=True
+        self.set_preferences(cfg.get("ui_preferences"))
         self.metrics=collections.deque(maxlen=240)
         self.ai_history=collections.deque(maxlen=360)
         self.resource=collections.deque(maxlen=240)
@@ -669,12 +792,40 @@ class AdaptiveHyperParams:
     def snapshot(self):
         data=dict(self.values)
         data["prefers_high"]=self.prefers_high
+        data["ui_preferences"]=dict(self.pref_map)
         return data
     def set_save_callback(self,cb):
         self.save_cb=cb
     def set_orientation(self,prefer_high):
         self.prefers_high=bool(prefer_high)
         self._notify()
+    def set_preferences(self,prefs):
+        clean=self._normalize_prefs(prefs)
+        if clean!=getattr(self,"pref_map",{}):
+            self.pref_map=clean
+        vals=[v for v in clean.values() if v in ["higher","lower"]]
+        if vals:
+            hi=sum(1 for v in vals if v=="higher")
+            self.prefers_high=hi>=((len(vals)+1)//2)
+        else:
+            self.prefers_high=True
+        self._notify()
+    def _normalize_prefs(self,prefs):
+        data={}
+        if isinstance(prefs,dict):
+            for k,v in prefs.items():
+                if not isinstance(k,str):
+                    continue
+                nv=str(v).lower()
+                if nv.startswith("low"):
+                    data[k]="lower"
+                elif nv.startswith("high"):
+                    data[k]="higher"
+                elif nv.startswith("无关") or nv.startswith("ignore"):
+                    data[k]="ignore"
+        if "__default__" not in data:
+            data["__default__"]=cfg_defaults["ui_preferences"]["__default__"]
+        return data
     def observe_event(self,event):
         if not isinstance(event,dict):
             return
@@ -769,6 +920,10 @@ class StrategyEngine:
         self.last_value=0.0
         self.hparams=None
         self.prefers_high=True
+        self.pref_map={"__default__":"higher"}
+        self.pref_default="higher"
+        self.policy_size=(320,200)
+        self.scene_side=256
     def ensure_loaded(self,progress_cb=None):
         path=self.manifest.ensure(progress_cb)
         ModelIO.load(self.model,path)
@@ -786,8 +941,61 @@ class StrategyEngine:
                 raise RuntimeError("模型参数包含无效值")
     def attach_hparams(self,hparams):
         self.hparams=hparams
+    def set_resolution(self,policy_size,scene_size=None):
+        try:
+            w=int(policy_size[0])
+            h=int(policy_size[1])
+        except:
+            w,h=320,200
+        w=max(224,w)
+        h=max(160,h)
+        self.policy_size=(w,h)
+        if scene_size is not None:
+            try:
+                if isinstance(scene_size,(list,tuple)):
+                    side=max(int(scene_size[0]),int(scene_size[-1]))
+                else:
+                    side=int(scene_size)
+            except:
+                side=max(w,h)
+            self.scene_side=max(224,min(640,side))
+        else:
+            self.scene_side=max(224,min(640,int(max(self.policy_size)*0.9)))
     def set_orientation(self,prefer_high):
         self.prefers_high=bool(prefer_high)
+    def update_preferences(self,prefs):
+        if not isinstance(prefs,dict):
+            prefs={}
+        clean={}
+        for k,v in prefs.items():
+            if not isinstance(k,str):
+                continue
+            clean[k]=self._normalize_pref(v)
+        if "__default__" not in clean:
+            clean["__default__"]=self.pref_map.get("__default__",self.pref_default)
+        self.pref_map=clean
+        self.pref_default=clean.get("__default__","higher")
+        vals=[v for k,v in clean.items() if k!="__default__" and v in ["higher","lower"]]
+        if not vals and self.pref_default in ["higher","lower"]:
+            vals=[self.pref_default]
+        if vals:
+            hi=sum(1 for v in vals if v=="higher")
+            self.prefers_high=hi>=((len(vals)+1)//2)
+        else:
+            self.prefers_high=True
+    def _normalize_pref(self,val):
+        txt=str(val).lower()
+        if txt.startswith("low") or txt.startswith("下"):
+            return "lower"
+        if txt.startswith("无关") or txt.startswith("ignore"):
+            return "ignore"
+        if txt.startswith("high") or txt.startswith("上"):
+            return "higher"
+        return self.pref_default
+    def _pref_for_label(self,label):
+        if isinstance(label,str) and label in self.pref_map:
+            return self.pref_map[label]
+        return self.pref_map.get("__default__",self.pref_default)
     def set_context(self,events):
         ctx=[]
         for e in events[-8:]:
@@ -821,7 +1029,7 @@ class StrategyEngine:
         self.temporal_memory.append(embedding.detach())
     def embed_frame(self,img):
         with torch.no_grad():
-            ten=torch.from_numpy(cv2.resize(img,(224,224))).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
+            ten=torch.from_numpy(cv2.resize(img,(self.scene_side,self.scene_side))).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
             feat=self.semantic(ten)
             return feat
     def integrate_ui(self,score,ui_map):
@@ -848,9 +1056,16 @@ class StrategyEngine:
             y1=int(max(0,min(h-1,round(oy1*sy))))
             x2=int(max(x1+1,min(w,round(ox2*sx))))
             y2=int(max(y1+1,min(h,round(oy2*sy))))
-            conf=float(el.get("confidence",0.5))
-            interaction=float(el.get("interaction",0))
-            score=min(1.0,conf*0.6+interaction*0.6)
+            label=el.get("type","")
+            pref=self._pref_for_label(label)
+            conf=max(0.0,min(1.0,float(el.get("confidence",0.5))))
+            interaction=max(0.0,min(1.0,float(el.get("interaction",0))))
+            if pref=="ignore":
+                continue
+            if pref=="lower":
+                conf=1.0-conf
+                interaction=1.0-interaction
+            score=min(1.0,max(0.0,conf*0.6+interaction*0.6))
             goal[y1:y2,x1:x2]+=score
         if goal.max()>0:
             goal/=goal.max()
@@ -858,7 +1073,7 @@ class StrategyEngine:
     def predict(self,img,events=None,ui_elements=None,heat_prior=None,event_prior=None):
         self.ensure_integrity()
         h,w=img.shape[:2]
-        inp=cv2.resize(img,(320,200))
+        inp=cv2.resize(img,self.policy_size)
         ten=torch.from_numpy(inp).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
         hp_vals=self.hparams.values if self.hparams else {"confidence_floor":0.18,"primary_threshold":0.55,"long_press_threshold":0.78,"drag_threshold":0.58,"multi_gate":0.5,"confidence_margin":0.1,"drag_steps":28,"parallel_streams":1}
         ctx=self.set_context(events or [])
@@ -873,7 +1088,8 @@ class StrategyEngine:
         frame_embed=self.embed_frame(img)
         self.update_temporal(frame_embed)
         plan_in=torch.stack(list(self.temporal_memory),dim=1) if len(self.temporal_memory)>0 else torch.zeros((1,0,self.context_dim),dtype=torch.float32,device=self.device)
-        scene_tensor=torch.from_numpy(inp).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
+        scene_img=cv2.resize(img,(self.scene_side,self.scene_side))
+        scene_tensor=torch.from_numpy(scene_img).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
         with torch.no_grad():
             scene_vec,self.scene_state=self.scene(scene_tensor,self.scene_state)
         if plan_in.shape[1]>0:
@@ -1235,6 +1451,7 @@ class State(QObject):
     signal_optprog=Signal(int,str)
     signal_modelprog=Signal(int,str)
     signal_ui_ready=Signal(list)
+    signal_window_stats=Signal(list)
     MARK=0x22ACE777
     def __init__(self):
         super().__init__()
@@ -1283,10 +1500,14 @@ class State(QObject):
         self.block_margin_px=int(self.cfg.get("block_margin_px",6))
         self.idle_timeout=int(self.cfg.get("idle_timeout",10))
         self.preview_on=bool(self.cfg.get("preview_on",True))
-        self.ui_value_orientation=str(self.cfg.get("ui_value_orientation","higher"))
-        self.ui_prefers_high=self.ui_value_orientation!="lower"
-        self.hyper.set_orientation(self.ui_prefers_high)
-        self.strategy.set_orientation(self.ui_prefers_high)
+        self.ui_preferences=self._normalize_preferences(self.cfg.get("ui_preferences"))
+        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences)
+        self.hyper.set_preferences(self.ui_preferences)
+        self.strategy.update_preferences(self.ui_preferences)
+        self.policy_base=(320,200)
+        self.policy_resolution,self.scene_resolution,self.resolution_scale=self._compute_policy_resolution()
+        self.strategy.set_resolution(self.policy_resolution,self.scene_resolution)
+        self.reward_engine=RewardComposer()
         self.stop_event=threading.Event()
         self.events_path=None
         self.frames_path=None
@@ -1311,6 +1532,7 @@ class State(QObject):
         self._pending_lock=threading.Lock()
         self._init_day_files()
         threading.Thread(target=self._ensure_model_bg,daemon=True).start()
+        self.signal_window_stats.emit([])
     def _ensure_model_bg(self):
         try:
             self.signal_modelprog.emit(1,"准备模型")
@@ -1348,19 +1570,122 @@ class State(QObject):
             except:
                 serial[k]=v
         self.save_cfg("hyperparam_state",serial)
-    def set_ui_orientation(self,mode):
-        txt=str(mode).lower()
-        val="lower" if txt.startswith("低") or txt.startswith("low") or txt=="lower" else "higher"
-        prefer=val!="lower"
-        if self.ui_value_orientation==val and self.ui_prefers_high==prefer:
-            return
-        self.ui_value_orientation=val
-        self.ui_prefers_high=prefer
-        self.hyper.set_orientation(prefer)
-        self.strategy.set_orientation(prefer)
-        self.save_cfg("ui_value_orientation",val)
-        hint="已更新为高优先" if prefer else "已更新为低优先"
-        self.signal_tip.emit(f"UI数据偏好{hint}")
+    def _norm_pref_value(self,val,default):
+        txt=str(val).lower()
+        if txt.startswith("低") or txt.startswith("low"):
+            return "lower"
+        if txt.startswith("无关") or txt.startswith("ignore"):
+            return "ignore"
+        if txt.startswith("高") or txt.startswith("high"):
+            return "higher"
+        return default
+    def _normalize_preferences(self,prefs):
+        default=cfg_defaults["ui_preferences"]["__default__"]
+        data={"__default__":default}
+        if isinstance(prefs,dict):
+            for k,v in prefs.items():
+                if not isinstance(k,str):
+                    continue
+                val=self._norm_pref_value(v,default)
+                if k=="__default__":
+                    data["__default__"]=val
+                else:
+                    data[k]=val
+        self.ui_default_pref=data["__default__"]
+        return data
+    def _aggregate_preferences(self,prefs):
+        if not isinstance(prefs,dict):
+            return True
+        vals=[v for k,v in prefs.items() if k!="__default__" and v in ["higher","lower"]]
+        base=prefs.get("__default__",self.ui_default_pref if hasattr(self,"ui_default_pref") else cfg_defaults["ui_preferences"]["__default__"])
+        if not vals and base in ["higher","lower"]:
+            vals=[base]
+        if not vals:
+            return True
+        hi=sum(1 for v in vals if v=="higher")
+        return hi>=((len(vals)+1)//2)
+    def preference_for_label(self,label):
+        if isinstance(label,str) and label in self.ui_preferences:
+            return self.ui_preferences[label]
+        return self.ui_preferences.get("__default__",self.ui_default_pref)
+    def update_ui_preference(self,label,mode):
+        key="__default__" if not label else str(label)
+        val=self._norm_pref_value(mode,self.ui_default_pref)
+        if key=="__default__":
+            self.ui_preferences["__default__"]=val
+            self.ui_default_pref=val
+        else:
+            self.ui_preferences[key]=val
+        self.ui_prefers_high=self._aggregate_preferences(self.ui_preferences)
+        self.hyper.set_preferences(self.ui_preferences)
+        self.strategy.update_preferences(self.ui_preferences)
+        self._save_preferences()
+        txt="越高越好" if val=="higher" else "越低越好" if val=="lower" else "无关"
+        target="全局" if key=="__default__" else key
+        self.signal_tip.emit(f"{target}目标:{txt}")
+    def _save_preferences(self):
+        self.save_cfg("ui_preferences",self.ui_preferences)
+    def _align_dim(self,val,step):
+        if step<=0:
+            return int(val)
+        return int(max(step,(val//step)*step))
+    def _compute_policy_resolution(self):
+        base=self.policy_base
+        scale=1.0
+        try:
+            cores=psutil.cpu_count(logical=False) or psutil.cpu_count()
+        except:
+            cores=None
+        if cores and cores>=12:
+            scale+=0.25
+        elif cores and cores>=8:
+            scale+=0.15
+        try:
+            ram=psutil.virtual_memory().total/(1<<30)
+        except:
+            ram=16.0
+        if ram>48:
+            scale+=0.25
+        elif ram>24:
+            scale+=0.15
+        gu,gm=_gpu_util_mem()
+        if gm and gm>70:
+            scale+=0.35
+        elif gm and gm>40:
+            scale+=0.2
+        if gu and gu>85:
+            scale-=0.1
+        scale=max(0.8,min(1.8,scale))
+        w=self._align_dim(int(base[0]*scale),16)
+        h=self._align_dim(int(base[1]*scale),8)
+        w=max(224,w)
+        h=max(160,h)
+        scene=max(224,min(640,int(max(w,h)*0.9)))
+        return (w,h),(scene,scene),scale
+    def _apply_resolution_scale(self):
+        base=self.policy_base
+        w=self._align_dim(int(base[0]*self.resolution_scale),16)
+        h=self._align_dim(int(base[1]*self.resolution_scale),8)
+        w=max(224,w)
+        h=max(160,h)
+        self.policy_resolution=(w,h)
+        side=max(224,min(640,int(max(w,h)*0.9)))
+        self.scene_resolution=(side,side)
+        self.strategy.set_resolution(self.policy_resolution,self.scene_resolution)
+    def _auto_adjust_resolution(self,motion,resource):
+        target=self.resolution_scale
+        if resource>95:
+            target-=0.18
+        elif resource>90:
+            target-=0.1
+        elif resource<68 and motion>16:
+            target+=0.08
+        elif resource<58 and motion>24:
+            target+=0.12
+        target=max(0.7,min(1.9,target))
+        if abs(target-self.resolution_scale)>0.05:
+            self.resolution_scale=target
+            self._apply_resolution_scale()
     def _init_day_files(self):
         day=time.strftime("%Y%m%d")
         if self.day_tag==day and self.events_writer and self.frames_writer:
@@ -1502,6 +1827,7 @@ class State(QObject):
             motion_score=v*0.35+mag*48.0+lap*0.02
             motion_score=motion_score*max(0.6,min(1.6,self._window_weight()))
             resource_pressure=max(avg_cpu,avg_mem,avg_gpu,avg_vram)
+            self._auto_adjust_resolution(motion_score,resource_pressure)
             adaptive_target=self.fps
             if motion_score>28 or trend>6:
                 adaptive_target=min(self.max_fps,adaptive_target+8.0)
@@ -1668,6 +1994,28 @@ class State(QObject):
                 stats["recent"].popleft()
             while self.activity_events and now-self.activity_events[0]["time"]>90:
                 self.activity_events.popleft()
+            self._emit_window_stats()
+        except:
+            pass
+    def _emit_window_stats(self):
+        try:
+            now=time.time()
+            rows=[]
+            for title,data in self.window_stats.items():
+                recent=list(data.get("recent",[]))
+                total=int(data.get("count",0))
+                duration=float(data.get("duration",0.0))
+                if recent:
+                    last_gap=max(0.0,now-recent[-1][0])
+                    avg=sum(r[1] for r in recent)/max(1,len(recent))
+                    ai=sum(1 for r in recent if len(r)>=3 and r[2]=="ai")/max(1,len(recent))
+                else:
+                    last_gap=9999.0
+                    avg=0.0
+                    ai=0.0
+                rows.append({"window":title,"count":total,"avg_duration":avg,"ai_ratio":ai,"recent_gap":last_gap,"total_duration":duration})
+            rows=sorted(rows,key=lambda x:x.get("recent_gap",9999.0))[:60]
+            self.signal_window_stats.emit(rows)
         except:
             pass
     def activity_density(self):
@@ -2268,6 +2616,7 @@ class OptimizerThread(threading.Thread):
         self.batch_size=hp.values.get("batch_size",6) if hp else 6
         self.trace=0.0
         self.baseline=0.0
+        self.reward_engine=getattr(self.st,"reward_engine",RewardComposer())
     def run(self):
         self.st.optimizing=True
         try:
@@ -2480,7 +2829,8 @@ class OptimizerThread(threading.Thread):
                         continue
                     ctx=self._context_tensor(list(hist),len(hist)-1)
                     hist_t=self._history_tensor(list(hist),len(hist)-1)
-                    tensor_img=torch.from_numpy(cv2.resize(img,(320,200))).permute(2,0,1).float()/255.0
+                    size=self.st.policy_resolution
+                    tensor_img=torch.from_numpy(cv2.resize(img,size)).permute(2,0,1).float()/255.0
                     reward=self._reward_of_event(e)
                     value,adv,weight=self._rl_signal(reward)
                     pending.append((tensor_img,ctx,label,hist_t,value,adv,weight))
@@ -2523,33 +2873,19 @@ class OptimizerThread(threading.Thread):
     def _reward_of_event(self,e):
         if not isinstance(e,dict):
             return 0.0
-        base=0.08
-        if e.get("source")=="user":
-            base+=0.24
-        elif e.get("source")=="ai":
-            base+=0.18
-        dur=float(e.get("duration",0.0) or 0.0)
-        base+=min(0.4,dur*0.65)
-        moves=e.get("moves") or []
-        base+=min(0.22,len(moves)/28.0)
-        if e.get("mode")=="training":
-            base+=0.12
-        if e.get("type")=="left":
-            base+=0.08
-        if e.get("type")=="right":
-            base+=0.05
-        drag_span=0.0
-        if moves:
-            xs=[m[1] if isinstance(m,(list,tuple)) and len(m)>=3 else 0 for m in moves]
-            ys=[m[2] if isinstance(m,(list,tuple)) and len(m)>=3 else 0 for m in moves]
-            if xs and ys:
-                span_x=max(xs)-min(xs)
-                span_y=max(ys)-min(ys)
-                drag_span=(abs(span_x)+abs(span_y))/5120.0
-        base+=min(0.18,drag_span)
-        combo=len(e.get("clip_ids") or [])
-        base+=min(0.16,combo*0.04)
-        return max(0.0,min(1.6,base))
+        try:
+            reward=float(self.reward_engine.evaluate(e))
+        except:
+            reward=0.0
+        if reward<=0.0:
+            dur=max(0.0,float(e.get("duration",0.0) or 0.0))
+            base=0.08+min(0.36,dur*0.4)
+            if e.get("type")=="left":
+                base+=0.12
+            elif e.get("type")=="right":
+                base+=0.08
+            reward=base
+        return max(0.0,min(2.2,reward))
     def _rl_signal(self,reward):
         r=float(reward)
         self.trace=self.trace*self.gamma*self.lam+r
@@ -2599,7 +2935,8 @@ class OptimizerThread(threading.Thread):
             img=self._get_frame_image(fr.get("path"))
             if img is None:
                 continue
-            img=cv2.resize(img,(320,200))
+            size=self.st.policy_resolution
+            img=cv2.resize(img,size)
             label=self._make_label(e,img.shape[1],img.shape[0])
             if label is None:
                 continue
@@ -2893,9 +3230,12 @@ class UIInspector:
                 conf=float(prob[0,idx].item())
                 enhanced=self._refine(label,conf,inter.cpu().numpy().flatten())
                 score=float(max(0.0,min(1.0,enhanced)))
-                if not getattr(self.st,"ui_prefers_high",True):
+                pref=self.st.preference_for_label(label)
+                if pref=="ignore":
+                    score=0.0
+                elif pref=="lower":
                     score=1.0-score
-                results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":float(inter[0,0].item()),"dynamics":inter[0].tolist(),"layout":layout[0].tolist()})
+                results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":float(inter[0,0].item()),"dynamics":inter[0].tolist(),"layout":layout[0].tolist(),"preference":pref})
                 self._update_memory(label,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
@@ -3145,9 +3485,6 @@ class Main(QMainWindow):
         self.btn_ui=QPushButton("UI识别")
         self.chk_preview=QCheckBox("预览")
         self.chk_preview.setChecked(self.state.preview_on)
-        self.cmb_pref=QComboBox()
-        self.cmb_pref.addItems(["数据偏好:高","数据偏好:低"])
-        self.cmb_pref.setCurrentIndex(0 if self.state.ui_prefers_high else 1)
         self.lbl_mode=QLabel("模式:学习")
         self.lbl_fps=QLabel("帧率:0")
         self.lbl_rec=QLabel("0B")
@@ -3167,8 +3504,8 @@ class Main(QMainWindow):
         self.preview_label.setFixedSize(QSize(640,400))
         self.preview_label.setVisible(self.state.preview_on)
         self.ui_table=QTableWidget()
-        self.ui_table.setColumnCount(4)
-        self.ui_table.setHorizontalHeaderLabels(["类型","区域","置信度","交互强度"])
+        self.ui_table.setColumnCount(5)
+        self.ui_table.setHorizontalHeaderLabels(["类型","区域","置信度","交互强度","目标"])
         self.ui_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ui_table.verticalHeader().setVisible(False)
         self.ui_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -3176,15 +3513,26 @@ class Main(QMainWindow):
         self.ui_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.ui_table.setMaximumHeight(180)
         self.ui_table.setFocusPolicy(Qt.NoFocus)
+        self.pref_editors=[]
+        self.window_table=QTableWidget()
+        self.window_table.setColumnCount(5)
+        self.window_table.setHorizontalHeaderLabels(["窗口","总操作","AI占比","均时","最近活动"])
+        self.window_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.window_table.verticalHeader().setVisible(False)
+        self.window_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.window_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.window_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.window_table.setMaximumHeight(180)
+        self.window_table.setFocusPolicy(Qt.NoFocus)
         lt=QHBoxLayout(top)
         lt.addWidget(self.cmb,1)
         lt.addWidget(self.btn_opt)
         lt.addWidget(self.btn_ui)
         lt.addWidget(self.chk_preview)
-        lt.addWidget(self.cmb_pref)
         lm=QVBoxLayout(mid)
         lm.addWidget(self.preview_label,1)
         lm.addWidget(self.ui_table)
+        lm.addWidget(self.window_table)
         lh=QHBoxLayout()
         lh.addWidget(self.lbl_mode)
         lh.addStretch(1)
@@ -3210,7 +3558,6 @@ class Main(QMainWindow):
         self.btn_opt.clicked.connect(self.on_opt)
         self.btn_ui.clicked.connect(self.on_ui)
         self.chk_preview.stateChanged.connect(self.on_preview_changed)
-        self.cmb_pref.currentIndexChanged.connect(self.on_pref_changed)
         self.cmb.currentIndexChanged.connect(self.on_sel_changed)
         self.state.signal_preview.connect(self.on_preview)
         self.state.signal_mode.connect(self.on_mode)
@@ -3221,6 +3568,8 @@ class Main(QMainWindow):
         self.state.signal_optprog.connect(self.on_optprog)
         self.state.signal_modelprog.connect(self.on_modelprog)
         self.state.signal_ui_ready.connect(self.on_ui_ready)
+        self.state.signal_window_stats.connect(self.on_window_stats)
+        self.on_window_stats([])
         self.finish_opt.connect(self._handle_opt_finished)
         self.finish_ui.connect(self._handle_ui_finished)
         self.refresh_timer=QTimer(self)
@@ -3254,13 +3603,8 @@ class Main(QMainWindow):
         self.preview_label.setVisible(enabled)
         if not enabled:
             self.preview_label.clear()
-    def on_pref_changed(self,_):
-        idx=self.cmb_pref.currentIndex()
-        val="higher" if idx==0 else "lower"
-        self.state.set_ui_orientation(val)
-        self.cmb_pref.blockSignals(True)
-        self.cmb_pref.setCurrentIndex(0 if self.state.ui_prefers_high else 1)
-        self.cmb_pref.blockSignals(False)
+    def on_pref_changed_item(self,label,val):
+        self.state.update_ui_preference(label,val)
     def on_preview(self,px):
         if not self.preview_enabled():
             return
@@ -3294,6 +3638,8 @@ class Main(QMainWindow):
         self.ui_table.setRowCount(0)
         limited=items[:60]
         self.ui_table.setRowCount(len(limited))
+        self.pref_editors=[]
+        mapping={"higher":0,"lower":1,"ignore":2}
         for idx,it in enumerate(limited):
             t=str(it.get("type",""))
             b=str(it.get("bounds",""))
@@ -3307,6 +3653,38 @@ class Main(QMainWindow):
             ii=QTableWidgetItem(inter)
             ii.setTextAlignment(Qt.AlignCenter)
             self.ui_table.setItem(idx,3,ii)
+            combo=QComboBox()
+            combo.addItems(["越高越好","越低越好","无关"])
+            pref=it.get("preference") or self.state.preference_for_label(t)
+            idx_pref=mapping.get(pref,0)
+            combo.blockSignals(True)
+            combo.setCurrentIndex(idx_pref)
+            combo.blockSignals(False)
+            combo.currentTextChanged.connect(lambda val,lab=t:self.on_pref_changed_item(lab,val))
+            self.ui_table.setCellWidget(idx,4,combo)
+            self.pref_editors.append(combo)
+    def on_window_stats(self,rows):
+        self.window_table.setRowCount(0)
+        limited=rows[:60]
+        self.window_table.setRowCount(len(limited))
+        for idx,item in enumerate(limited):
+            title=str(item.get("window",""))
+            total=str(int(item.get("count",0)))
+            ai=f"{float(item.get('ai_ratio',0))*100.0:.1f}%"
+            avg=f"{float(item.get('avg_duration',0))*1000.0:.0f}ms"
+            gap=float(item.get("recent_gap",9999.0))
+            recent="--" if gap>=9000 else f"{gap:.1f}s"
+            self.window_table.setItem(idx,0,QTableWidgetItem(title))
+            self.window_table.setItem(idx,1,QTableWidgetItem(total))
+            cell_ai=QTableWidgetItem(ai)
+            cell_ai.setTextAlignment(Qt.AlignCenter)
+            self.window_table.setItem(idx,2,cell_ai)
+            cell_avg=QTableWidgetItem(avg)
+            cell_avg.setTextAlignment(Qt.AlignCenter)
+            self.window_table.setItem(idx,3,cell_avg)
+            cell_recent=QTableWidgetItem(recent)
+            cell_recent.setTextAlignment(Qt.AlignCenter)
+            self.window_table.setItem(idx,4,cell_recent)
     def refresh_windows(self):
         m=self.selector.refresh()
         keys=sorted(list(m.keys()))
