@@ -25,6 +25,7 @@ cfg_path=os.path.join(base_dir,"config.json")
 deps_path=os.path.join(base_dir,"deps.json")
 meta_path=os.path.join(models_dir,"model_meta.json")
 ui_cache_path=os.path.join(base_dir,"ui_elements.json")
+schema_path=os.path.join(base_dir,"ui_schema.json")
 for d in [base_dir,exp_dir,models_dir,logs_dir]:
     os.makedirs(d,exist_ok=True)
 log_path=os.path.join(logs_dir,"app.log")
@@ -35,6 +36,8 @@ def log(s):
     except:
         pass
 cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":""}
+default_ui_labels=["button","input","panel","label","widget","menu","icon","ability","joystick","skill","toggle","minimap"]
+schema_defaults={"labels":default_ui_labels,"max_items":48}
 def ensure_config():
     if not os.path.exists(cfg_path):
         with open(cfg_path,"w",encoding="utf-8") as f:
@@ -54,6 +57,29 @@ def ensure_config():
             f.flush()
             os.fsync(f.fileno())
 ensure_config()
+def ensure_schema():
+    data=None
+    if os.path.exists(schema_path):
+        try:
+            with open(schema_path,"r",encoding="utf-8") as f:
+                data=json.load(f)
+        except:
+            data=None
+    if not isinstance(data,dict):
+        data=dict(schema_defaults)
+    else:
+        merged=dict(schema_defaults)
+        labs=[lab for lab in data.get("labels",[]) if isinstance(lab,str) and lab]
+        if labs:
+            merged["labels"]=labs
+        max_items=int(data.get("max_items",merged.get("max_items",48)))
+        merged["max_items"]=max(4,min(128,max_items))
+        data=merged
+    with open(schema_path,"w",encoding="utf-8") as f:
+        json.dump(data,f,ensure_ascii=False,indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+ensure_schema()
 def _msgbox(t,m):
     try:
         ctypes.windll.user32.MessageBoxW(0,str(m),str(t),0)
@@ -525,6 +551,7 @@ class PolicyModel(nn.Module):
         self.temporal=nn.GRU(192,192,batch_first=True)
         self.transformer=PolicyTransformer()
         self.head=PolicyHead(192)
+        self.value=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,192),nn.GELU(),nn.Linear(192,1))
     def forward(self,img,context,history=None):
         feat=self.backbone(img)
         feat=self.reducer(feat)
@@ -537,9 +564,10 @@ class PolicyModel(nn.Module):
             tokens=torch.cat([context,tokens],dim=1)
         enc=self.transformer(tokens)
         out=self.head(enc)
+        value=self.value(enc.mean(dim=1))
         logits=out[:, -H*W:, :]
         logits=logits.view(B,H,W,2).permute(0,3,1,2)
-        return logits
+        return logits,value
 class ModelInitializer:
     @staticmethod
     def default_bytes():
@@ -568,9 +596,12 @@ class ModelIO:
             os.fsync(f.fileno())
     @staticmethod
     def load(model,path):
+        current=model.state_dict()
         with np.load(path,allow_pickle=False) as d:
-            state={k:torch.from_numpy(d[k]) for k in d.files}
-        model.load_state_dict(state,strict=True)
+            for k in current.keys():
+                if k in d.files:
+                    current[k]=torch.from_numpy(d[k])
+        model.load_state_dict(current,strict=False)
 class TemporalPlanner(nn.Module):
     def __init__(self,dim=192):
         super().__init__()
@@ -632,6 +663,7 @@ class StrategyEngine:
         self.decision=MultiTargetDecision(self.context_dim).to(self.device)
         self.scene_state=None
         self.loaded_path=None
+        self.last_value=0.0
     def ensure_loaded(self,progress_cb=None):
         path=self.manifest.ensure(progress_cb)
         ModelIO.load(self.model,path)
@@ -722,8 +754,10 @@ class StrategyEngine:
         ctx=self.set_context(events or [])
         hist=self._history_tensor()
         with torch.no_grad():
-            logits=self.model(ten,ctx,hist)
+            logits,value=self.model(ten,ctx,hist)
             prob=torch.sigmoid(logits)
+            value_score=float(torch.sigmoid(value).mean().item())
+        self.last_value=value_score
         left=prob[0,0].cpu().numpy()
         self.frame_memory.append(left)
         frame_embed=self.embed_frame(img)
@@ -745,7 +779,7 @@ class StrategyEngine:
             decision=self.decision(scene_vec,plan_vec,ui_summary)
         multi_factor=float(decision[0,1].item())
         risk_factor=float(decision[0,2].item())
-        gate=float(min(1.0,max(0.0,0.4*gate_plan+0.4*multi_factor+0.2*risk_factor)))
+        gate=float(min(1.0,max(0.0,0.32*gate_plan+0.36*multi_factor+0.2*risk_factor+0.12*value_score)))
         score=cv2.resize(left,(w,h),interpolation=cv2.INTER_CUBIC)
         goal=self.synthesize_goal_map(ui_elements,w,h)
         if goal is not None:
@@ -759,7 +793,7 @@ class StrategyEngine:
         y,x=np.unravel_index(np.argmax(score),score.shape)
         conf=float(score[y,x])
         grid=(score.shape[1],score.shape[0])
-        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical}
+        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical,"value":value_score}
         if conf<0.18:
             return base
         btn="left" if conf>0.55 or risk_factor>0.45 else "right"
@@ -851,7 +885,7 @@ class StrategyEngine:
             coords.append((int(x),int(y),float(score[y,x])))
         coords.sort(key=lambda t:t[2],reverse=True)
         plan=[]
-        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)
+        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(value_score>0.62)
         used=set()
         for x,y,val in coords:
             if len(plan)>=budget:
@@ -881,17 +915,37 @@ class StrategyEngine:
         if counted is None:
             counted=len(batches) if hasattr(batches,"__len__") else 0
         processed=0
-        for (img,ctx,label,hist) in batches:
+        for batch in batches:
+            if batch is None:
+                continue
+            if len(batch)==4:
+                img,ctx,label,hist=batch
+                bs=img.shape[0]
+                val=torch.zeros((bs,1),dtype=torch.float32)
+                adv=torch.zeros((bs,1),dtype=torch.float32)
+                weight=torch.ones((bs,1),dtype=torch.float32)
+            else:
+                img,ctx,label,hist,val,adv,weight=batch
             processed+=1
             img=img.to(self.device)
             ctx=ctx.to(self.device).float()
             hist=hist.to(self.device).float()
             label=label.to(self.device).float()
             opt.zero_grad()
-            logits=self.model(img,ctx,hist)
+            val_t=val.to(self.device).float()
+            adv_t=adv.to(self.device).float()
+            weight_t=weight.to(self.device).float()
+            logits,value=self.model(img,ctx,hist)
             if logits.shape[-2:]!=label.shape[-2:]:
                 label=F.interpolate(label,size=logits.shape[-2:],mode="bilinear",align_corners=False)
-            loss=F.binary_cross_entropy_with_logits(logits,label)
+            base_loss=F.binary_cross_entropy_with_logits(logits,label)
+            weighted=F.binary_cross_entropy_with_logits(logits,label,reduction="none")
+            rl_loss=(weighted*(weight_t.view(weight_t.shape[0],1,1,1))).mean()
+            value_loss=F.smooth_l1_loss(value,val_t)
+            prob=torch.sigmoid(logits)
+            entropy=-(prob*torch.log(prob+1e-6)+(1-prob)*torch.log(1-prob+1e-6)).mean()
+            neg_factor=torch.relu(-adv_t).mean()
+            loss=0.55*base_loss+0.35*rl_loss+0.5*value_loss-0.02*entropy+0.05*neg_factor
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(),1.0)
             nn.utils.clip_grad_norm_(self.semantic.parameters(),1.0)
@@ -1118,6 +1172,8 @@ class State(QObject):
         self.model_error=None
         self.metric_history=collections.deque(maxlen=180)
         self.resource_history=collections.deque(maxlen=120)
+        self.activity_events=collections.deque(maxlen=360)
+        self.window_stats={}
         self.trend_window=collections.deque(maxlen=36)
         self._pending_window=None
         self._pending_waiter=None
@@ -1319,16 +1375,27 @@ class State(QObject):
         except:
             pass
     def _window_weight(self):
-        if not self.selected_title:
-            return 1.0
-        title=self.selected_title.lower()
-        if any(k in title for k in ["game","游戏","3d","渲染"]):
-            return 1.45
-        if any(k in title for k in ["浏览器","browser","chrome","edge","视频","player"]):
-            return 1.25
-        if any(k in title for k in ["excel","表格","editor","文档"]):
-            return 0.9
-        return 1.0
+        title=self.selected_title or ""
+        weight=1.0
+        stats=self.window_stats.get(title)
+        if stats:
+            now=time.time()
+            recent=[item for item in list(stats.get("recent",[])) if now-item[0]<=90]
+            if recent:
+                freq=len(recent)/90.0
+                dur=sum(r[1] for r in recent)/max(1.0,len(recent))
+                ai_ratio=sum(1 for r in recent if len(r)>=3 and r[2]=="ai")/max(1,len(recent))
+                weight+=min(0.6,freq*5.0)+min(0.4,dur*1.4)+min(0.3,ai_ratio*0.8)
+                if freq<0.01 and dur<0.2:
+                    weight=max(0.7,weight*0.75)
+        title_lower=title.lower()
+        if any(k in title_lower for k in ["game","游戏","3d","渲染"]):
+            weight=max(weight,1.25)
+        elif any(k in title_lower for k in ["浏览器","browser","chrome","edge","视频","player"]):
+            weight=max(weight,1.1)
+        elif any(k in title_lower for k in ["excel","表格","editor","文档"]):
+            weight=min(weight,0.95)
+        return max(0.6,min(1.8,weight))
     def clamp_abs(self,x,y):
         x1,y1,x2,y2=self.client_rect
         x=int(max(x1+self.block_margin_px,min(x2-1-self.block_margin_px,x)))
@@ -1421,8 +1488,40 @@ class State(QObject):
             self.events_writer.append(obj)
             self.event_count+=1
             self.signal_counts.emit(self.event_count)
+            self._update_activity(obj)
         except:
             pass
+    def _update_activity(self,event):
+        try:
+            now=time.time()
+            duration=max(0.0,float(event.get("duration",0.0) or 0.0))
+            window=event.get("window_title") or self.selected_title or ""
+            record={"time":now,"duration":duration,"window":window,"source":event.get("source","unknown")}
+            self.activity_events.append(record)
+            stats=self.window_stats.get(window)
+            if stats is None:
+                stats={"recent":collections.deque(maxlen=180),"count":0,"duration":0.0}
+                self.window_stats[window]=stats
+            stats["count"]+=1
+            stats["duration"]+=duration
+            stats["recent"].append((now,duration,record["source"]))
+            while stats["recent"] and now-stats["recent"][0][0]>120:
+                stats["recent"].popleft()
+            while self.activity_events and now-self.activity_events[0]["time"]>90:
+                self.activity_events.popleft()
+        except:
+            pass
+    def activity_density(self):
+        now=time.time()
+        while self.activity_events and now-self.activity_events[0]["time"]>60:
+            self.activity_events.popleft()
+        if not self.activity_events:
+            return 0.0
+        total=len(self.activity_events)
+        duration=sum(item["duration"] for item in self.activity_events)
+        freq=total/60.0
+        dur=duration/max(1.0,total)
+        return max(0.0,min(2.0,freq*2.5+dur))
     def record_kbd(self,ts):
         try:
             sec=ts/1_000_000_000.0 if isinstance(ts,(int,float)) and ts>1e6 else float(ts)
@@ -1986,9 +2085,15 @@ class OptimizerThread(threading.Thread):
         self.cancel_flag=cancel_flag
         self.frame_cache=collections.OrderedDict()
         self.cache_limit=256
+        self.gamma=0.92
+        self.lam=0.85
+        self.trace=0.0
+        self.baseline=0.0
     def run(self):
         self.st.optimizing=True
         try:
+            self.trace=0.0
+            self.baseline=0.0
             self.st.signal_optprog.emit(10,"收集数据")
             all_days=sorted([p for p in glob.glob(os.path.join(exp_dir,"*")) if os.path.isdir(p)])
             sample_count,tsmin,tsmax=self._count_samples(all_days)
@@ -2197,7 +2302,9 @@ class OptimizerThread(threading.Thread):
                     ctx=self._context_tensor(list(hist),len(hist)-1)
                     hist_t=self._history_tensor(list(hist),len(hist)-1)
                     tensor_img=torch.from_numpy(cv2.resize(img,(320,200))).permute(2,0,1).float()/255.0
-                    pending.append((tensor_img,ctx,label,hist_t))
+                    reward=self._reward_of_event(e)
+                    value,adv,weight=self._rl_signal(reward)
+                    pending.append((tensor_img,ctx,label,hist_t,value,adv,weight))
                     if len(pending)>=bs:
                         produced+=1
                         yield self._stack_batch(pending[:bs])
@@ -2213,7 +2320,10 @@ class OptimizerThread(threading.Thread):
         ctxs=[]
         labels=[]
         hists=[]
-        for (img,ctx,label,hist) in samples:
+        vals=[]
+        advs=[]
+        weights=[]
+        for (img,ctx,label,hist,val,adv,weight) in samples:
             imgs.append(img.float())
             if isinstance(ctx,torch.Tensor):
                 ctxs.append(ctx.to(torch.float32))
@@ -2227,7 +2337,51 @@ class OptimizerThread(threading.Thread):
                 hists.append(hist.to(torch.float32))
             else:
                 hists.append(torch.tensor(hist,dtype=torch.float32))
-        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(labels,dim=0),torch.stack(hists,dim=0))
+            vals.append(float(val))
+            advs.append(float(adv))
+            weights.append(float(weight))
+        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(labels,dim=0),torch.stack(hists,dim=0),torch.tensor(vals,dtype=torch.float32).unsqueeze(1),torch.tensor(advs,dtype=torch.float32).unsqueeze(1),torch.tensor(weights,dtype=torch.float32).unsqueeze(1))
+    def _reward_of_event(self,e):
+        if not isinstance(e,dict):
+            return 0.0
+        base=0.08
+        if e.get("source")=="user":
+            base+=0.24
+        elif e.get("source")=="ai":
+            base+=0.18
+        dur=float(e.get("duration",0.0) or 0.0)
+        base+=min(0.4,dur*0.65)
+        moves=e.get("moves") or []
+        base+=min(0.22,len(moves)/28.0)
+        if e.get("mode")=="training":
+            base+=0.12
+        if e.get("type")=="left":
+            base+=0.08
+        if e.get("type")=="right":
+            base+=0.05
+        drag_span=0.0
+        if moves:
+            xs=[m[1] if isinstance(m,(list,tuple)) and len(m)>=3 else 0 for m in moves]
+            ys=[m[2] if isinstance(m,(list,tuple)) and len(m)>=3 else 0 for m in moves]
+            if xs and ys:
+                span_x=max(xs)-min(xs)
+                span_y=max(ys)-min(ys)
+                drag_span=(abs(span_x)+abs(span_y))/5120.0
+        base+=min(0.18,drag_span)
+        combo=len(e.get("clip_ids") or [])
+        base+=min(0.16,combo*0.04)
+        return max(0.0,min(1.6,base))
+    def _rl_signal(self,reward):
+        r=float(reward)
+        self.trace=self.trace*self.gamma*self.lam+r
+        self.baseline=self.baseline*0.97+r*0.03
+        adv=self.trace-self.baseline
+        adv=max(-2.5,min(2.5,adv))
+        value=max(-3.0,min(3.0,self.trace))
+        weight=max(0.1,min(2.5,0.5+abs(adv)*0.7))
+        if adv<0:
+            weight*=0.6
+        return value,adv,weight
     def _sort_events(self,events):
         return sorted(events,key=lambda e:self._event_time(e) or 0)
     def _event_time(self,e):
@@ -2272,15 +2426,17 @@ class OptimizerThread(threading.Thread):
                 continue
             ctx=self._context_tensor(events,idx)
             hist=self._history_tensor(events,idx)
-            seqs.append((img,ctx,label,hist))
+            reward=self._reward_of_event(e)
+            seqs.append((img,ctx,label,hist,reward))
         random.shuffle(seqs)
         batches=[]
         bs=6
         for i in range(0,len(seqs),bs):
             chunk=seqs[i:i+bs]
             samples=[]
-            for (img,ctx,label,hist) in chunk:
-                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,hist))
+            for (img,ctx,label,hist,reward) in chunk:
+                value,adv,weight=self._rl_signal(reward)
+                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,hist,value,adv,weight))
             if not samples:
                 continue
             batches.append(self._stack_batch(samples))
@@ -2441,7 +2597,10 @@ class OptimizerThread(threading.Thread):
         cx=random.randint(2,17)
         cy=random.randint(1,11)
         label[:,0,cy,cx]=1.0
-        return [(img,ctx,label,hist)]
+        val=torch.zeros((4,1),dtype=torch.float32)
+        adv=torch.zeros((4,1),dtype=torch.float32)
+        weight=torch.ones((4,1),dtype=torch.float32)
+        return [(img,ctx,label,hist,val,adv,weight)]
 class UIReasoner(nn.Module):
     def __init__(self,num_classes):
         super().__init__()
@@ -2461,15 +2620,17 @@ class UIReasoner(nn.Module):
 class UIInspector:
     def __init__(self,st):
         self.st=st
-        self.labels=["button","input","panel","label","widget","menu","icon"]
-        self.model=UIReasoner(len(self.labels))
-        self.model.eval()
         self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        self.prototype={k:torch.zeros(128,device=self.device) for k in self.labels}
-        self.prototype_count={k:1.0 for k in self.labels}
+        self.schema_mtime=0.0
+        self.labels=[]
+        self.max_items=schema_defaults.get("max_items",48)
+        self.model=None
+        self.prototype={}
+        self.prototype_count={}
         self.memory=collections.deque(maxlen=500)
+        self._refresh_schema(True)
     def analyze(self,img,events):
+        self._refresh_schema()
         base=cv2.resize(img,(1280,800))
         cands=self._candidates(base,events)
         results=[]
@@ -2493,12 +2654,52 @@ class UIInspector:
                 results.append({"type":label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":float(inter[0,0].item()),"dynamics":inter[0].tolist(),"layout":layout[0].tolist()})
                 self._update_memory(label,rep)
         results=self._merge(results)
+        limit=self._dynamic_limit(events)
+        if len(results)>limit:
+            results=sorted(results,key=lambda item:item.get("confidence",0),reverse=True)[:limit]
         self.st.ui_elements=results
         with open(ui_cache_path,"w",encoding="utf-8") as f:
             json.dump(results,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
         return results
+    def _refresh_schema(self,force=False):
+        try:
+            mtime=os.path.getmtime(schema_path)
+        except:
+            mtime=0.0
+        if not force and mtime<=self.schema_mtime:
+            return
+        self.schema_mtime=mtime
+        data=dict(schema_defaults)
+        try:
+            with open(schema_path,"r",encoding="utf-8") as f:
+                disk=json.load(f)
+                if isinstance(disk,dict):
+                    data.update({k:disk.get(k,data.get(k)) for k in ["labels","max_items"]})
+        except:
+            pass
+        labels=[lab for lab in data.get("labels",[]) if isinstance(lab,str) and lab]
+        if not labels:
+            labels=list(default_ui_labels)
+        limit=max(4,min(128,int(data.get("max_items",48))))
+        changed=len(labels)!=len(self.labels) or any(a!=b for a,b in zip(labels,self.labels))
+        self.labels=labels
+        self.max_items=limit
+        if self.model is None or changed:
+            self.model=UIReasoner(len(self.labels))
+            self.model.eval()
+            self.model.to(self.device)
+            self.prototype={k:torch.zeros(128,device=self.device) for k in self.labels}
+            self.prototype_count={k:1.0 for k in self.labels}
+            self.memory.clear()
+    def _dynamic_limit(self,events):
+        density=self.st.activity_density()
+        event_count=len(events) if events else 0
+        base=self.max_items
+        scale=0.6+min(1.4,density+event_count/60.0)
+        limit=int(max(6,min(160,base*scale)))
+        return limit
     def _layout_vec(self,shape,x1,y1,x2,y2):
         h,w=shape[:2]
         area=(x2-x1)*(y2-y1)
@@ -2564,6 +2765,7 @@ class UIInspector:
         click_density=inter[0]
         avg_dur=inter[2]
         entropy=inter[6]
+        value_hint=float(getattr(self.st.strategy,"last_value",0.0)) if hasattr(self.st,"strategy") else 0.0
         if label=="button":
             weight=conf*0.7+min(1.0,click_density/5.0)*0.3
         elif label=="input":
@@ -2572,8 +2774,12 @@ class UIInspector:
             weight=conf*0.5+min(1.0,entropy/1.5)*0.5
         elif label=="panel":
             weight=conf*0.6+min(1.0,max(inter[3],0.1))*0.4
-        return weight
+        weight=weight*(0.85+0.3*value_hint)
+        return max(0.0,min(1.0,weight))
     def _update_memory(self,label,rep):
+        if label not in self.prototype:
+            self.prototype[label]=torch.zeros(128,device=self.device)
+            self.prototype_count[label]=1.0
         proto=self.prototype[label]
         count=self.prototype_count[label]
         proto=(proto*count+rep.squeeze(0))/(count+1.0)
