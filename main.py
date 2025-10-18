@@ -721,10 +721,61 @@ class StrategyEngine:
         score=np.clip(score,0,1)
         y,x=np.unravel_index(np.argmax(score),score.shape)
         conf=float(score[y,x])
+        grid=(score.shape[1],score.shape[0])
+        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid}
         if conf<0.18:
-            return ("idle",None,None,score)
+            return base
         btn="left" if conf>0.55 else "right"
-        return ("click",(x,y),btn,score)
+        gy,gx=np.gradient(score)
+        vx=float(gx[y,x])
+        vy=float(gy[y,x])
+        norm=math.sqrt(vx*vx+vy*vy)+1e-6
+        vx/=norm
+        vy/=norm
+        def make_tap(ix,iy,button,conf_level):
+            return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":0.06+0.04*gate,"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy))}
+        if conf>0.78:
+            act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":0.35+0.45*gate,"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y))}
+        elif conf>0.58:
+            extent=max(score.shape[1],score.shape[0])*0.18*(0.6+conf)
+            dx=vx*extent
+            dy=vy*extent
+            ex=int(max(0,min(score.shape[1]-1,round(x+dx))))
+            ey=int(max(0,min(score.shape[0]-1,round(y+dy))))
+            if ex==x and ey==y:
+                ex=int(max(0,min(score.shape[1]-1,round(x+(random.random()-0.5)*extent))))
+                ey=int(max(0,min(score.shape[0]-1,round(y+(random.random()-0.5)*extent))))
+            steps=max(8,int(20+gate*20))
+            drag_path=[]
+            for i in range(steps):
+                u=i/max(steps-1,1)
+                ix=int(round(x+(ex-x)*u))
+                iy=int(round(y+(ey-y)*u))
+                drag_path.append((ix,iy))
+            act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":0.18+0.22*gate,"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey))}
+        else:
+            act=make_tap(x,y,btn,conf)
+        peaks=self.local_maxima(score,top=6,dist=40)
+        extra=[]
+        for (px,py,pv) in peaks:
+            if len(extra)>=2:
+                break
+            if px==x and py==y:
+                continue
+            if pv<0.62:
+                continue
+            extra.append(make_tap(px,py,"left" if pv>0.7 else "right",pv))
+        if extra:
+            seq=[dict(act)]
+            for item in extra:
+                seq.append(item)
+            for item in seq:
+                item["heat_shape"]=grid
+            combo={"kind":"combo","sequence":seq,"grid":grid,"confidence":conf,"heat":score,"button":btn}
+            return combo
+        act["heat"]=score
+        act["heat_shape"]=grid
+        return act
     def train_incremental(self,batches,progress_cb=None,total=None):
         self.model.train()
         opt=optim.AdamW(list(self.model.parameters())+list(self.semantic.parameters())+list(self.planner.parameters()),lr=1e-4,weight_decay=1e-4)
@@ -1672,60 +1723,138 @@ class TrainerThread(threading.Thread):
                 h,w=img.shape[:2]
                 qi=QImage(img.data,w,h,3*w,QImage.Format_BGR888)
                 self.st.signal_preview.emit(QPixmap.fromImage(qi))
-            if act[0]=="idle":
+            kind=act.get("kind") if isinstance(act,dict) else "idle"
+            heat=act.get("heat") if isinstance(act,dict) else None
+            if kind=="idle":
                 time.sleep(max(1.0/self.st.fps,0.01))
                 continue
             if time.time()<cool_t:
                 time.sleep(max(1.0/self.st.fps,0.01))
                 continue
-            if act[0]=="click":
-                x,y=act[1]
-                heat=act[3]
-                cw=max(1,self.st.client_rect[2]-self.st.client_rect[0])
-                ch=max(1,self.st.client_rect[3]-self.st.client_rect[1])
-                sw=heat.shape[1] if isinstance(heat,np.ndarray) else cw
-                sh=heat.shape[0] if isinstance(heat,np.ndarray) else ch
-                nx=float(x)/max(1,sw-1)
-                ny=float(y)/max(1,sh-1)
-                bx=self.st.client_rect[0]+int(round(nx*(cw-1)))
-                by=self.st.client_rect[1]+int(round(ny*(ch-1)))
-                bx,by=self.st.clamp_abs(bx,by)
-                btn=act[2]
+            if self.st.interrupt_ai:
+                break
+            cooldown=self._execute_action(act,heat,fid)
+            if cooldown is not None:
+                cool_t=time.time()+max(0.12,cooldown)
+            time.sleep(max(1.0/self.st.fps,0.01))
+    def _grid(self,act,heat):
+        if isinstance(act,dict):
+            if act.get("grid"):
+                g=act.get("grid")
+                return (int(g[0]),int(g[1]))
+            if act.get("heat_shape"):
+                g=act.get("heat_shape")
+                return (int(g[0]),int(g[1]))
+        if isinstance(heat,np.ndarray):
+            return (heat.shape[1],heat.shape[0])
+        cw=max(1,self.st.client_rect[2]-self.st.client_rect[0])
+        ch=max(1,self.st.client_rect[3]-self.st.client_rect[1])
+        return (cw,ch)
+    def _coord_abs(self,pt,grid):
+        cw=max(1,self.st.client_rect[2]-self.st.client_rect[0])
+        ch=max(1,self.st.client_rect[3]-self.st.client_rect[1])
+        sw=max(1,grid[0])
+        sh=max(1,grid[1])
+        nx=float(pt[0])/max(1,sw-1)
+        ny=float(pt[1])/max(1,sh-1)
+        bx=self.st.client_rect[0]+int(round(nx*(cw-1)))
+        by=self.st.client_rect[1]+int(round(ny*(ch-1)))
+        return self.st.clamp_abs(bx,by)
+    def _cursor_path(self,start,end,steps):
+        cx,cy=start
+        bx,by=end
+        c1x=cx+(bx-cx)*0.3+random.uniform(-12,12)
+        c1y=cy+(by-cy)*0.3+random.uniform(-12,12)
+        c2x=cx+(bx-cx)*0.7+random.uniform(-12,12)
+        c2y=cy+(by-cy)*0.7+random.uniform(-12,12)
+        pts=[]
+        steps=max(steps,3)
+        for i in range(1,steps+1):
+            u=i/float(steps)
+            ux=(1-u)**3*cx+3*(1-u)**2*u*c1x+3*(1-u)*u**2*c2x+u**3*bx
+            uy=(1-u)**3*cy+3*(1-u)**2*u*c1y+3*(1-u)*u**2*c2y+u**3*by
+            pts.append((int(ux),int(uy)))
+        return pts
+    def _segment_path(self,start,end,steps):
+        pts=[]
+        steps=max(steps,1)
+        for i in range(1,steps+1):
+            u=i/float(steps)
+            x=int(round(start[0]+(end[0]-start[0])*u))
+            y=int(round(start[1]+(end[1]-start[1])*u))
+            pts.append((x,y))
+        return pts
+    def _within(self,x,y):
+        r=self.st.client_rect
+        return x>=r[0] and x<=r[2] and y>=r[1] and y<=r[3]
+    def _execute_action(self,act,heat,fid):
+        if not isinstance(act,dict):
+            return None
+        if act.get("kind")=="combo":
+            total=0.0
+            seq=act.get("sequence") or []
+            for idx,item in enumerate(seq):
+                if self.st.interrupt_ai:
+                    break
+                cool=self._execute_single(item,heat,fid)
+                if cool is not None:
+                    total+=cool
+                if idx<len(seq)-1:
+                    time.sleep(max(0.02,min(0.12,float(item.get("duration",0.05)))))
+            return total if total>0 else 0.25
+        return self._execute_single(act,heat,fid)
+    def _execute_single(self,act,heat,fid):
+        if not isinstance(act,dict):
+            return None
+        grid=self._grid(act,heat)
+        coord=act.get("coord") or act.get("start")
+        if coord is None:
+            return None
+        btn=act.get("button","left")
+        duration=float(act.get("duration",0.05))
+        path=act.get("path") or [tuple(coord)]
+        seq=[(int(p[0]),int(p[1])) for p in path]
+        abs_seq=[self._coord_abs(p,grid) for p in seq]
+        if not abs_seq:
+            return None
+        try:
+            cur=win32api.GetCursorPos()
+        except:
+            cur=abs_seq[0]
+        pre=self._cursor_path(cur,abs_seq[0],max(10,int(self.st.fps*0.6)))
+        mv=[]
+        if pre:
+            if not self.inj.move_path(pre,step_delay=max(0.004,0.2/self.st.fps)):
+                return None
+            for (px,py) in pre:
+                mv.append((time.time_ns(),px,py,1))
+        if self.st.interrupt_ai:
+            return None
+        press_ns=time.time_ns()
+        self.inj.down(btn)
+        mv.append((press_ns,abs_seq[0][0],abs_seq[0][1],1))
+        for i in range(1,len(abs_seq)):
+            seg=self._segment_path(abs_seq[i-1],abs_seq[i],max(6,int(self.st.fps*0.4)))
+            if not seg:
+                continue
+            if not self.inj.move_path(seg,step_delay=max(0.004,0.18/self.st.fps)):
                 try:
-                    if self.st.interrupt_ai:
-                        break
-                    try:
-                        cx,cy=win32api.GetCursorPos()
-                    except:
-                        cx,cy=bx,by
-                    n=max(10,int(self.st.fps*0.6))
-                    t0=time.time_ns()
-                    mv=[]
-                    c1x=cx+(bx-cx)*0.3+random.uniform(-12,12)
-                    c1y=cy+(by-cy)*0.3+random.uniform(-12,12)
-                    c2x=cx+(bx-cx)*0.7+random.uniform(-12,12)
-                    c2y=cy+(by-cy)*0.7+random.uniform(-12,12)
-                    pts=[]
-                    for i in range(1,n+1):
-                        u=i/float(n)
-                        ux=(1-u)**3*cx+3*(1-u)**2*u*c1x+3*(1-u)*u**2*c2x+u**3*bx
-                        uy=(1-u)**3*cy+3*(1-u)**2*u*c1y+3*(1-u)*u**2*c2y+u**3*by
-                        pts.append((int(ux),int(uy)))
-                    ok=self.inj.move_path(pts,step_delay=max(0.004,0.2/self.st.fps))
-                    for (px,py) in pts:
-                        mv.append((time.time_ns(),px,py,1))
-                    if not ok or self.st.interrupt_ai:
-                        break
-                    self.inj.down(btn)
-                    mv.append((time.time_ns(),bx,by,1))
-                    time.sleep(0.02)
                     self.inj.up(btn)
-                    t1=time.time_ns()
-                    self.st.record_op("ai",btn,t0,bx,by,t1,bx,by,mv,fid,1,1,[],"training")
                 except:
                     pass
-                cool_t=time.time()+max(0.15,0.8/self.st.fps)
-            time.sleep(max(1.0/self.st.fps,0.01))
+                return None
+            for (px,py) in seg:
+                mv.append((time.time_ns(),px,py,1))
+        hold=max(0.01,duration)
+        time.sleep(hold)
+        self.inj.up(btn)
+        release_ns=time.time_ns()
+        rel=abs_seq[-1]
+        ins_press=1 if self._within(abs_seq[0][0],abs_seq[0][1]) else 0
+        ins_release=1 if self._within(rel[0],rel[1]) else 0
+        mv.append((release_ns,rel[0],rel[1],1))
+        self.st.record_op("ai",btn,press_ns,abs_seq[0][0],abs_seq[0][1],release_ns,rel[0],rel[1],mv,fid,ins_press,ins_release,[],"training")
+        return hold+0.25
 class WindowSelector:
     def __init__(self):
         self.map={}
@@ -2179,18 +2308,32 @@ class OptimizerThread(threading.Thread):
             except Exception as ex:
                 log(f"synth predict fail:{ex}")
                 continue
-            if act[0]!="click" or act[1] is None:
+            step=None
+            if isinstance(act,dict):
+                kind=act.get("kind")
+                if kind in ["tap","long_press","drag"]:
+                    step=act
+                elif kind=="combo":
+                    seq=act.get("sequence") or []
+                    if seq:
+                        step=seq[0]
+            if not isinstance(step,dict):
                 continue
-            x,y=act[1]
-            btn=act[2]
-            press_lx=int(max(0,min(2560,round(x))))
-            press_ly=int(max(0,min(1600,round(y))))
+            coord=step.get("coord") or step.get("start")
+            if coord is None:
+                continue
+            btn=step.get("button","left")
+            press_lx=int(max(0,min(2560,round(coord[0]))))
+            press_ly=int(max(0,min(1600,round(coord[1]))))
             now_ns=time.time_ns()
             now_sec=now_ns/1_000_000_000.0
-            dur=0.03
+            dur=max(0.02,float(step.get("duration",0.05)))
+            release=step.get("release") or coord
+            relx=int(max(0,min(2560,round(release[0]))))
+            rely=int(max(0,min(1600,round(release[1]))))
             release_ns=int(now_ns+dur*1_000_000_000)
             release_sec=release_ns/1_000_000_000.0
-            synth.append({"id":str(uuid.uuid4()),"source":"ai","mode":"training","type":btn,"press_t":now_sec,"press_t_ns":now_ns,"press_x":0.0,"press_y":0.0,"press_lx":press_lx,"press_ly":press_ly,"release_t":release_sec,"release_t_ns":release_ns,"release_x":0.0,"release_y":0.0,"release_lx":press_lx,"release_ly":press_ly,"moves":[],"moves_ns":[],"window_title":rec.get("window_title",self.st.selected_title),"rect":[0,0,2560,1600],"frame_id":rec.get("id"),"ins_press":1,"ins_release":1,"clip_ids":[],"session_id":self.st.session_id,"duration":dur})
+            synth.append({"id":str(uuid.uuid4()),"source":"ai","mode":"training","type":btn,"press_t":now_sec,"press_t_ns":now_ns,"press_x":0.0,"press_y":0.0,"press_lx":press_lx,"press_ly":press_ly,"release_t":release_sec,"release_t_ns":release_ns,"release_x":0.0,"release_y":0.0,"release_lx":relx,"release_ly":rely,"moves":[],"moves_ns":[],"window_title":rec.get("window_title",self.st.selected_title),"rect":[0,0,2560,1600],"frame_id":rec.get("id"),"ins_press":1,"ins_release":1,"clip_ids":[],"session_id":self.st.session_id,"duration":dur})
         return synth
     def _create_default_batches(self):
         img=torch.zeros((4,3,200,320),dtype=torch.float32)
@@ -2544,6 +2687,7 @@ class Main(QMainWindow):
         self._optim_flag=threading.Event()
         self._ui_thread=None
         self._ui_busy=False
+        self._ui_paused=False
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
         self.start_wait_timer.start(200)
@@ -2709,6 +2853,9 @@ class Main(QMainWindow):
             return
         if self._ui_busy:
             return
+        if not self.state.model_ready_event.is_set():
+            QMessageBox.information(self,"提示","模型尚未准备完成，请稍候")
+            return
         try:
             self.state.wait_model()
         except ModelIntegrityError as e:
@@ -2745,12 +2892,27 @@ class Main(QMainWindow):
         if not self.state.selected_hwnd:
             QMessageBox.information(self,"提示","未选择窗口")
             return
-        img=self.state.capture_client()
+        paused=False
+        if self.state.mode=="learning" and self.learning_thread and self.learning_thread.is_alive():
+            paused=True
+            self.state.stop_event.set()
+            try:
+                self.learning_thread.join(timeout=1.0)
+            except:
+                pass
+            self.state.stop_event.clear()
+        img=self.state.prev_img.copy() if isinstance(self.state.prev_img,np.ndarray) else None
+        if img is None:
+            img=self.state.capture_client()
         if img is None:
             QMessageBox.information(self,"提示","无法获取窗口画面")
+            if paused:
+                self._ui_paused=False
+                self.set_mode("learning",force=True)
             return
         events=self.state._recent_events(source="user",mode="learning")
         self._ui_busy=True
+        self._ui_paused=paused
         self.btn_opt.setEnabled(False)
         self.btn_ui.setEnabled(False)
         self.lbl_tip.setText("正在执行UI识别")
@@ -2778,6 +2940,9 @@ class Main(QMainWindow):
         self.btn_opt.setEnabled(True)
         self.btn_ui.setEnabled(True)
         self._ui_busy=False
+        if self._ui_paused:
+            self.state.stop_event.clear()
+        self._ui_paused=False
         self._ui_thread=None
         self.set_mode("learning",force=True)
     def on_model_ready_check(self):
