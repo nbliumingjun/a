@@ -1,4 +1,4 @@
-import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,ssl,io,base64,subprocess
+import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,re,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,ssl,io,base64,subprocess
 from pathlib import Path
 os.environ["QT_ENABLE_HIGHDPI_SCALING"]="1"
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"]="1"
@@ -110,7 +110,7 @@ def _ver(name,modname=None):
         except:
             return ""
 def deps_check():
-    core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml")]
+    core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml"),("comtypes","comtypes")]
     attempt=0
     max_attempts=3
     while True:
@@ -155,7 +155,7 @@ def deps_check():
         msg="依赖未满足:"+",".join(miss_final)
         _msgbox("依赖检查",msg)
         raise RuntimeError(msg)
-    d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml")}
+    d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml"),"comtypes":_ver("comtypes")}
     with open(deps_path,"w",encoding="utf-8") as f:
         json.dump(d,f,ensure_ascii=False,indent=2)
         f.flush()
@@ -171,6 +171,13 @@ import queue
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+if os.name=="nt":
+    try:
+        import comtypes.client as _ct_client
+    except:
+        _ct_client=None
+else:
+    _ct_client=None
 try:
     import pynvml as _nv
     _nv.nvmlInit()
@@ -1804,7 +1811,19 @@ class State(QObject):
         except:
             return 0
     def set_window(self,hwnd,title):
+        if not hwnd:
+            return
+        if self.selected_hwnd==hwnd:
+            if self.selected_title!=title:
+                self.selected_title=title
+                if self.model_ready_event.is_set() and not self.model_error:
+                    self.signal_window.emit(title)
+            return
         with self._pending_lock:
+            if self._pending_window and self._pending_window[0]==hwnd and self.selected_hwnd is None:
+                self._pending_window=(hwnd,title)
+                self.selected_title=title
+                return
             self._pending_window=(hwnd,title)
         self.selected_hwnd=None
         self.selected_title=title
@@ -3203,6 +3222,92 @@ class OptimizerThread(threading.Thread):
         adv=torch.zeros((bs,1),dtype=torch.float32)
         weight=torch.ones((bs,1),dtype=torch.float32)
         return [(img,ctx,label,hist,val,adv,weight)]
+class UIATextExtractor:
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.automation=None
+        self.defs=None
+        if os.name=="nt" and _ct_client is not None:
+            try:
+                _ct_client.GetModule("UIAutomationCore.dll")
+                from comtypes.gen import UIAutomationClient as defs
+                self.defs=defs
+                self.automation=_ct_client.CreateObject(defs.CUIAutomation,interface=defs.IUIAutomation)
+            except:
+                self.automation=None
+                self.defs=None
+    def text(self,bounds,hwnd):
+        if self.automation is None or self.defs is None:
+            return ""
+        with self.lock:
+            try:
+                pt=self.defs.tagPOINT()
+                pt.x=int((bounds[0]+bounds[2])//2)
+                pt.y=int((bounds[1]+bounds[3])//2)
+                element=self.automation.ElementFromPoint(pt)
+            except:
+                return ""
+        if not element:
+            return ""
+        try:
+            handle=int(getattr(element,"CurrentNativeWindowHandle",0))
+        except:
+            handle=0
+        if hwnd and handle and handle!=hwnd:
+            return ""
+        try:
+            rect=element.CurrentBoundingRectangle
+            if rect and (rect.left>bounds[2] or rect.right<bounds[0] or rect.top>bounds[3] or rect.bottom<bounds[1]):
+                return ""
+        except:
+            pass
+        txt=""
+        if _ct_client is not None and self.defs is not None:
+            try:
+                pattern=element.GetCurrentPattern(self.defs.UIA_ValuePatternId)
+                if pattern:
+                    pattern=_ct_client.Cast(pattern,self.defs.IUIAutomationValuePattern)
+                    value=pattern.CurrentValue
+                    if value:
+                        txt=str(value)
+            except:
+                txt=""
+        if not txt:
+            try:
+                value=element.CurrentName
+                if value:
+                    txt=str(value)
+            except:
+                txt=""
+        if not txt:
+            try:
+                value=element.CurrentHelpText
+                if value:
+                    txt=str(value)
+            except:
+                txt=""
+        return txt.strip()
+class DigitClassifier:
+    def __init__(self):
+        from sklearn.datasets import load_digits
+        from sklearn.neighbors import KNeighborsClassifier
+        digits=load_digits()
+        self.model=KNeighborsClassifier(n_neighbors=3,weights="distance")
+        self.model.fit(digits.data,digits.target)
+    def classify(self,img):
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        resized=cv2.resize(gray,(8,8),interpolation=cv2.INTER_AREA)
+        arr=(255-resized).astype(np.float32)/255.0*16.0
+        vec=arr.reshape(1,-1)
+        pred=int(self.model.predict(vec)[0])
+        if hasattr(self.model,"predict_proba"):
+            prob=float(self.model.predict_proba(vec)[0][pred])
+        else:
+            prob=0.75
+        return pred,prob
 class AutoValidator(threading.Thread):
     def __init__(self,st):
         super().__init__(daemon=True)
@@ -3292,9 +3397,13 @@ class UIInspector:
         self.prototype_count={}
         self.memory=collections.deque(maxlen=500)
         self.data_history=collections.defaultdict(lambda:collections.deque(maxlen=32))
+        self.uia=UIATextExtractor()
+        self.digit_clf=DigitClassifier()
+        self.window_hwnd=0
         self._refresh_schema(True)
     def analyze(self,img,events):
         self._refresh_schema()
+        self.window_hwnd=int(self.st.selected_hwnd or 0)
         base=cv2.resize(img,(1280,800))
         cands=self._candidates(base,events)
         results=[]
@@ -3326,7 +3435,7 @@ class UIInspector:
         limit=self._dynamic_limit(events)
         if len(results)>limit:
             results=sorted(results,key=lambda item:item.get("confidence",0),reverse=True)[:limit]
-        data_points=self._collect_data(base,events,results)
+        data_points=self._collect_data(base,img,events,results)
         self.st.ui_elements=results
         self.st.data_points=data_points
         with open(ui_cache_path,"w",encoding="utf-8") as f:
@@ -3557,47 +3666,139 @@ class UIInspector:
             if not overlapped:
                 merged.append(el)
         return merged
-    def _collect_data(self,img,events,ui_results):
+    def _collect_data(self,base_img,orig_img,events,ui_results):
         data=[]
-        events=events or []
-        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-        brightness=float(np.mean(gray)/255.0)
-        self._append_data(data,"场景亮度",(0,0,img.shape[1],img.shape[0]),brightness,1.0)
-        motion=0.0
-        prev=self.st.prev_img if hasattr(self.st,"prev_img") else None
-        if isinstance(prev,np.ndarray) and prev.size>0:
-            try:
-                prev_small=cv2.resize(prev,(img.shape[1],img.shape[0]))
-                diff=cv2.absdiff(prev_small,img)
-                motion=float(np.mean(diff)/255.0)
-            except:
-                motion=0.0
-        self._append_data(data,"画面变化",(0,0,img.shape[1],img.shape[0]),motion,min(1.0,0.6+motion))
-        heat=self._event_heat(events,img.shape[1],img.shape[0])
-        if isinstance(heat,np.ndarray):
-            density=float(np.mean(heat))
-            peak=float(np.max(heat))
-        else:
-            density=float(min(1.0,len(events)/50.0))
-            peak=density
-        self._append_data(data,"交互密度",(0,0,img.shape[1],img.shape[0]),density,min(1.0,0.5+peak))
-        for idx,(x1,y1,x2,y2,score,val) in enumerate(self._data_regions(gray,ui_results)):
-            name=f"数据区域{idx+1}"
-            self._append_data(data,name,(x1,y1,x2,y2),val,score)
+        if base_img is None or orig_img is None:
+            return data
+        gray=cv2.cvtColor(base_img,cv2.COLOR_BGR2GRAY)
+        regions=self._data_regions(gray,ui_results)
+        for idx,(x1,y1,x2,y2,score,_) in enumerate(regions):
+            extracted=self._extract_value(orig_img,(x1,y1,x2,y2),base_img.shape)
+            if extracted is None:
+                continue
+            text,value,qual=extracted
+            conf=float(max(0.0,min(1.0,score)))*float(max(0.05,min(1.0,qual)))
+            key=f"{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}"
+            name=f"数据{idx+1}"
+            self._append_data(data,name,(x1,y1,x2,y2),value,text,conf,key)
             if len(data)>=32:
                 break
         return data
-    def _append_data(self,data,name,bounds,value,confidence):
-        val=float(max(0.0,min(1.0,value)))
-        conf=float(max(0.0,min(1.0,confidence)))
-        trend=self._trend(name,val)
+    def _append_data(self,data,name,bounds,value,text,confidence,key):
         pref=self.st.preference_for_data(name)
-        data.append({"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":val,"trend":trend,"confidence":conf,"preference":pref})
+        trend=self._trend(key,value)
+        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"value":None if value is None else float(value),"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":text}
+        data.append(entry)
     def _trend(self,key,val):
         hist=self.data_history[key]
+        if val is None:
+            hist.clear()
+            return None
         prev=hist[-1] if len(hist)>0 else val
-        hist.append(val)
+        hist.append(float(val))
         return float(val-prev)
+    def _extract_value(self,orig_img,bounds,base_shape):
+        if orig_img is None or orig_img.size==0:
+            return None
+        ax1,ay1,ax2,ay2=self._map_to_client(bounds,orig_img.shape,base_shape)
+        if ax2-ax1<4 or ay2-ay1<4:
+            return None
+        crop=orig_img[ay1:ay2,ax1:ax2]
+        screen=self._to_screen_bounds((ax1,ay1,ax2,ay2))
+        text=self._normalize_text(self.uia.text(screen,self.window_hwnd)) if hasattr(self,"uia") and self.uia else ""
+        qual=0.6 if text else 0.0
+        if not text or not any(ch.isdigit() for ch in text):
+            ocr_text,prob=self._ocr_digits(crop)
+            text=self._normalize_text(ocr_text)
+            qual=max(qual,prob)
+        if not text or not any(ch.isdigit() for ch in text):
+            return None
+        value=self._parse_numeric(text)
+        return text,value,max(qual,0.05)
+    def _map_to_client(self,bounds,orig_shape,base_shape):
+        bx1,by1,bx2,by2=bounds
+        base_h,base_w=base_shape[:2]
+        sx=orig_shape[1]/max(1,base_w)
+        sy=orig_shape[0]/max(1,base_h)
+        ax1=int(max(0,min(orig_shape[1]-1,round(bx1*sx))))
+        ay1=int(max(0,min(orig_shape[0]-1,round(by1*sy))))
+        ax2=int(max(ax1+1,min(orig_shape[1],round(bx2*sx))))
+        ay2=int(max(ay1+1,min(orig_shape[0],round(by2*sy))))
+        pad=3
+        ax1=max(0,ax1-pad)
+        ay1=max(0,ay1-pad)
+        ax2=min(orig_shape[1],ax2+pad)
+        ay2=min(orig_shape[0],ay2+pad)
+        return ax1,ay1,ax2,ay2
+    def _to_screen_bounds(self,bounds):
+        left,top,_,_=self.st.client_rect if hasattr(self.st,"client_rect") else (0,0,0,0)
+        return (left+bounds[0],top+bounds[1],left+bounds[2],top+bounds[3])
+    def _normalize_text(self,text):
+        if not text:
+            return ""
+        return re.sub(r"[^0-9\.\-]+","",str(text))
+    def _parse_numeric(self,text):
+        if not text:
+            return None
+        m=re.search(r"-?\d+(?:\.\d+)?",text)
+        if not m:
+            return None
+        try:
+            return float(m.group(0))
+        except:
+            return None
+    def _ocr_digits(self,img):
+        if img is None or img.size==0:
+            return "",0.0
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        blur=cv2.GaussianBlur(norm,(3,3),0)
+        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,15,8)
+        contours,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return "",0.0
+        boxes=[]
+        for c in contours:
+            x,y,w,h=cv2.boundingRect(c)
+            if w<3 or h<6:
+                continue
+            boxes.append((x,y,w,h))
+        if not boxes:
+            return "",0.0
+        boxes.sort(key=lambda b:b[0])
+        max_h=max(h for _,_,_,h in boxes)
+        chars=[]
+        scores=[]
+        for x,y,w,h in boxes:
+            if h<max_h*0.35:
+                if w>h*1.6:
+                    chars.append((x,"-",0.55))
+                    scores.append(0.55)
+                elif h>1:
+                    chars.append((x,".",0.6))
+                    scores.append(0.6)
+                continue
+            pad=2
+            y1=max(0,y-pad)
+            y2=min(thr.shape[0],y+h+pad)
+            x1=max(0,x-pad)
+            x2=min(thr.shape[1],x+w+pad)
+            digit_img=thr[y1:y2,x1:x2]
+            if digit_img.size==0:
+                continue
+            pred,prob=self.digit_clf.classify(digit_img)
+            prob=float(max(0.0,min(1.0,prob)))
+            chars.append((x,str(pred),prob))
+            scores.append(prob)
+        if not chars:
+            return "",0.0
+        chars.sort(key=lambda item:item[0])
+        text="".join(ch for _,ch,_ in chars).strip()
+        conf=float(sum(scores)/len(scores)) if scores else 0.0
+        return text,conf
     def _data_regions(self,gray,ui_results):
         try:
             small=cv2.GaussianBlur(gray,(3,3),0)
@@ -3648,6 +3849,7 @@ class Main(QMainWindow):
         self.inspector=UIInspector(self.state)
         self.hook=LowLevelHook(self.state)
         self.hook.start()
+        self._selected_hwnd_ui=None
         top=QWidget()
         mid=QWidget()
         bot=QWidget()
@@ -3856,9 +4058,16 @@ class Main(QMainWindow):
         mapping={"higher":0,"lower":1,"ignore":2}
         for idx,it in enumerate(limited):
             name=str(it.get("name",""))
-            val=f"{float(it.get('value',0)):.2f}"
-            trend=f"{float(it.get('trend',0)):+.2f}"
-            conf=f"{float(it.get('confidence',0)):.2f}"
+            raw_text=str(it.get("text",""))
+            if raw_text:
+                val=raw_text
+            else:
+                num=it.get("value",None)
+                val="--" if num is None else f"{float(num):.3f}".rstrip("0").rstrip(".")
+            trend_val=it.get("trend",None)
+            trend="--" if trend_val is None else f"{float(trend_val):+.2f}"
+            conf_val=it.get("confidence",None)
+            conf="--" if conf_val is None else f"{float(conf_val)*100.0:.0f}%"
             self.data_table.setItem(idx,0,QTableWidgetItem(name))
             self.data_table.setItem(idx,1,QTableWidgetItem(val))
             tr=QTableWidgetItem(trend)
@@ -3899,23 +4108,55 @@ class Main(QMainWindow):
             cell_recent.setTextAlignment(Qt.AlignCenter)
             self.window_table.setItem(idx,4,cell_recent)
     def refresh_windows(self):
-        m=self.selector.refresh()
-        keys=sorted(list(m.keys()))
-        curr=self.cmb.currentText()
+        mapping=self.selector.refresh()
+        keys=sorted(list(mapping.keys()))
         self.cmb.blockSignals(True)
         self.cmb.clear()
         self.cmb.addItems(keys)
         self.cmb.blockSignals(False)
-        if curr in keys:
-            self.cmb.setCurrentText(curr)
-        if self.state.selected_hwnd is None and keys:
+        target_hwnd=self.state.selected_hwnd
+        pending=getattr(self.state,"_pending_window",None)
+        if target_hwnd is None and pending:
+            target_hwnd=pending[0]
+        if target_hwnd is None and self._selected_hwnd_ui:
+            target_hwnd=self._selected_hwnd_ui
+        selected_key=None
+        if target_hwnd:
+            for k in keys:
+                if mapping[k]==target_hwnd:
+                    selected_key=k
+                    break
+        if selected_key is not None:
+            idx=keys.index(selected_key)
+            self.cmb.blockSignals(True)
+            self.cmb.setCurrentIndex(idx)
+            self.cmb.blockSignals(False)
+            self._selected_hwnd_ui=mapping[selected_key]
+            if self.state.selected_title!=selected_key or self.state.selected_hwnd!=self._selected_hwnd_ui:
+                self.state.set_window(self._selected_hwnd_ui,selected_key)
+            return
+        if keys:
+            self.cmb.blockSignals(True)
             self.cmb.setCurrentIndex(0)
-            self.on_sel_changed(0)
+            self.cmb.blockSignals(False)
+            new_key=keys[0]
+            new_hwnd=mapping[new_key]
+            if self._selected_hwnd_ui!=new_hwnd or self.state.selected_hwnd!=new_hwnd:
+                self._selected_hwnd_ui=new_hwnd
+                self.state.set_window(new_hwnd,new_key)
+            else:
+                self._selected_hwnd_ui=new_hwnd
+        else:
+            self._selected_hwnd_ui=None
     def on_sel_changed(self,_):
         key=self.cmb.currentText()
         hwnd=self.selector.map.get(key)
-        if hwnd:
-            self.state.set_window(hwnd,key)
+        if not hwnd:
+            return
+        if hwnd==self._selected_hwnd_ui and self.state.selected_hwnd==hwnd and self.state.selected_title==key:
+            return
+        self._selected_hwnd_ui=hwnd
+        self.state.set_window(hwnd,key)
     def set_mode(self,mode,force=False):
         if not self.state.model_ready_event.is_set():
             return
