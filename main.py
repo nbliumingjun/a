@@ -39,8 +39,8 @@ def log(s):
     except:
         pass
 cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
-default_ui_labels=["generic"]
-schema_defaults={"labels":default_ui_labels,"max_items":48}
+default_ui_identifiers=["generic"]
+schema_defaults={"identifiers":default_ui_identifiers,"max_items":48}
 def ensure_config():
     if not os.path.exists(cfg_path):
         with open(cfg_path,"w",encoding="utf-8") as f:
@@ -87,9 +87,9 @@ def ensure_schema():
         data=dict(schema_defaults)
     else:
         merged=dict(schema_defaults)
-        labs=[lab for lab in data.get("labels",[]) if isinstance(lab,str) and lab]
+        labs=[lab for lab in data.get("identifiers",[]) if isinstance(lab,str) and lab]
         if labs:
-            merged["labels"]=labs
+            merged["identifiers"]=labs
         max_items=int(data.get("max_items",merged.get("max_items",48)))
         merged["max_items"]=max(4,min(128,max_items))
         data=merged
@@ -2150,11 +2150,11 @@ class State(QObject):
             return True
         hi=sum(1 for v in vals if v=="higher")
         return hi>=((len(vals)+1)//2)
-    def preference_for_label(self,label):
+    def preference_for_identifier(self,label):
         if isinstance(label,str) and label in self.ui_preferences:
             return self.ui_preferences[label]
         return self.ui_preferences.get("__default__",self.ui_default_pref)
-    def update_ui_preference(self,label,mode):
+    def update_identifier_preference(self,label,mode):
         key="__default__" if not label else str(label)
         val=self._norm_pref_value(mode,self.ui_default_pref)
         if key=="__default__":
@@ -4800,7 +4800,7 @@ class UIInspector:
         self.st=st
         self.device=torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.schema_mtime=0.0
-        self.labels=[]
+        self.identifiers=[]
         self.max_items=schema_defaults.get("max_items",48)
         reg=getattr(self.st,"ui_registry",None)
         if reg is None:
@@ -4826,7 +4826,7 @@ class UIInspector:
         base=cv2.resize(img,(1280,800))
         cands=self._candidates(base,events)
         results=[]
-        out_features=max(1,len(self.labels))
+        out_features=max(1,len(self.identifiers))
         train_samples=[]
         with torch.no_grad():
             for (x1,y1,x2,y2) in cands:
@@ -4856,7 +4856,7 @@ class UIInspector:
                 enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
                 score=float(max(0.0,min(1.0,enhanced)))
                 pref_key=result_id
-                pref=self.st.preference_for_label(pref_key)
+                pref=self.st.preference_for_identifier(pref_key)
                 if pref=="ignore":
                     score=0.0
                 elif pref=="lower":
@@ -4897,15 +4897,17 @@ class UIInspector:
             with open(schema_path,"r",encoding="utf-8") as f:
                 disk=json.load(f)
                 if isinstance(disk,dict):
-                    data.update({k:disk.get(k,data.get(k)) for k in ["labels","max_items"]})
+                    data.update({k:disk.get(k,data.get(k)) for k in ["identifiers","max_items"]})
         except:
             pass
-        labels=["generic"]
+        identifiers=[i for i in data.get("identifiers",["generic"]) if isinstance(i,str) and i]
+        if not identifiers:
+            identifiers=["generic"]
         limit=max(4,min(128,int(data.get("max_items",48))))
-        changed=len(labels)!=len(self.labels) or any(a!=b for a,b in zip(labels,self.labels))
-        self.labels=labels
+        changed=len(identifiers)!=len(self.identifiers) or any(a!=b for a,b in zip(identifiers,self.identifiers))
+        self.identifiers=identifiers
         self.max_items=limit
-        out_features=max(1,len(self.labels))
+        out_features=max(1,len(self.identifiers))
         schema_changed=force or changed or self.out_features!=out_features
         self.out_features=out_features
         if hasattr(self,"registry") and self.registry:
@@ -5969,7 +5971,7 @@ class Main(QMainWindow):
         self.data_table_title=QLabel("窗口内数据列表")
         self.ui_table=QTableWidget()
         self.ui_table.setColumnCount(5)
-        self.ui_table.setHorizontalHeaderLabels(["类型","区域","置信度","交互强度","目标"])
+        self.ui_table.setHorizontalHeaderLabels(["标识","范围","置信度","交互强度","目标"])
         self.ui_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.ui_table.verticalHeader().setVisible(False)
         self.ui_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -6087,7 +6089,7 @@ class Main(QMainWindow):
         if not enabled:
             self.preview_label.clear()
     def on_pref_changed_item(self,label,val):
-        self.state.update_ui_preference(label,val)
+        self.state.update_identifier_preference(label,val)
     def on_data_pref_changed(self,combo,val):
         if not isinstance(combo,QComboBox):
             return
@@ -6180,8 +6182,8 @@ class Main(QMainWindow):
             pref_key=str(it.get("pref_key",it.get("id","")))
             if not pref_key:
                 pref_key="__default__"
-            label_tail=pref_key[-6:] if len(pref_key)>=6 else pref_key
-            display=f"区域{idx+1}-{label_tail}" if label_tail else f"区域{idx+1}"
+            identifier_tail=pref_key[-6:] if len(pref_key)>=6 else pref_key
+            display=f"标识{idx+1}-{identifier_tail}" if identifier_tail else f"标识{idx+1}"
             b=str(bounds)
             c=f"{float(it.get('confidence',0)):.2f}"
             inter=f"{float(it.get('interaction',0)):.2f}"
@@ -6195,7 +6197,7 @@ class Main(QMainWindow):
             self.ui_table.setItem(idx,3,ii)
             combo=QComboBox()
             combo.addItems(["越高越好","越低越好","无关"])
-            pref=it.get("preference") or self.state.preference_for_label(pref_key)
+            pref=it.get("preference") or self.state.preference_for_identifier(pref_key)
             idx_pref=mapping.get(pref,0)
             combo.blockSignals(True)
             combo.setCurrentIndex(idx_pref)
