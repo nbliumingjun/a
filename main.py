@@ -1809,6 +1809,25 @@ class State(QObject):
         with self.rect_lock:
             self.data_points=[dict(p) for p in sanitized]
         return [dict(p) for p in sanitized]
+    def remove_data_point(self,key):
+        if not key:
+            return (self.current_data_snapshot(),False)
+        with self.rect_lock:
+            if not isinstance(self.data_points,list):
+                return ([],False)
+            current=[dict(p) for p in self.data_points]
+            remain=[p for p in current if p.get("key")!=key]
+            if len(remain)==len(current):
+                return (current,False)
+            self.data_points=[dict(p) for p in remain]
+        try:
+            with open(data_cache_path,"w",encoding="utf-8") as f:
+                json.dump(remain,f,ensure_ascii=False,indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            log(f"data remove save fail:{e}")
+        return ([dict(p) for p in remain],True)
     def current_data_snapshot(self):
         with self.rect_lock:
             return [dict(p) for p in self.data_points] if isinstance(self.data_points,list) else []
@@ -5397,6 +5416,9 @@ class Main(QMainWindow):
         self._ui_busy=False
         self._ui_paused=False
         self._ui_last_frame=None
+        self._ui_restore_state=Qt.WindowNoState
+        self._ui_restore_required=False
+        self._data_items=[]
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
         self.start_wait_timer.start(200)
@@ -5411,8 +5433,24 @@ class Main(QMainWindow):
             self.preview_label.clear()
     def on_pref_changed_item(self,label,val):
         self.state.update_ui_preference(label,val)
-    def on_data_pref_changed(self,label,val):
-        self.state.update_data_preference(label,val)
+    def on_data_pref_changed(self,combo,val):
+        if not isinstance(combo,QComboBox):
+            return
+        name=str(combo.property("data_name") or "")
+        key=combo.property("data_key")
+        prev=combo.property("current_pref") or "higher"
+        if val=="删除":
+            self._handle_data_delete(combo,name,key)
+            return
+        mapping={"越高越好":"higher","越低越好":"lower","无关":"ignore"}
+        pref=mapping.get(val,prev if prev in ["higher","lower","ignore"] else "higher")
+        combo.setProperty("current_pref",pref)
+        self.state.update_data_preference(name,val)
+        if isinstance(key,str) and key:
+            for it in self._data_items:
+                if it.get("key")==key:
+                    it["preference"]=pref
+                    break
     def on_preview(self,px):
         if not self.preview_enabled():
             return
@@ -5475,10 +5513,10 @@ class Main(QMainWindow):
     def on_data_ready(self,items):
         self.data_table.setRowCount(0)
         limited=items[:60]
-        self.data_table.setRowCount(len(limited))
+        self._data_items=[dict(it) for it in limited]
+        self.data_table.setRowCount(len(self._data_items))
         self.data_pref_editors=[]
-        mapping={"higher":0,"lower":1,"ignore":2}
-        for idx,it in enumerate(limited):
+        for idx,it in enumerate(self._data_items):
             name=str(it.get("name",""))
             num=it.get("value",None)
             val="--"
@@ -5509,15 +5547,22 @@ class Main(QMainWindow):
             cf.setTextAlignment(Qt.AlignCenter)
             self.data_table.setItem(idx,3,cf)
             combo=QComboBox()
-            combo.addItems(["越高越好","越低越好","无关"])
+            combo.addItems(["越高越好","越低越好","无关","删除"])
             pref=it.get("preference") or self.state.preference_for_data(name)
+            if pref not in ["higher","lower","ignore"]:
+                pref=self.state.preference_for_data(name)
+            it["preference"]=pref
             combo.blockSignals(True)
-            combo.setCurrentIndex(mapping.get(pref,0))
+            combo.setCurrentIndex(self._data_pref_index(pref))
             combo.blockSignals(False)
-            combo.currentTextChanged.connect(lambda val,lab=name:self.on_data_pref_changed(lab,val))
+            key_ref=it.get("key") or name
+            combo.setProperty("data_name",name)
+            combo.setProperty("data_key",key_ref)
+            combo.setProperty("current_pref",pref)
+            combo.currentTextChanged.connect(lambda val,widget=combo:self.on_data_pref_changed(widget,val))
             self.data_table.setCellWidget(idx,4,combo)
             self.data_pref_editors.append(combo)
-            stable_key=it.get("key") or name
+            stable_key=key_ref
             color=it.get("color")
             if not isinstance(color,(list,tuple)) or len(color)!=3:
                 color=self.state.ensure_data_color(stable_key)
@@ -5536,6 +5581,58 @@ class Main(QMainWindow):
                 combo.setStyleSheet(f"background-color: rgba({r},{g},{b},120); color: rgb({fg.red()},{fg.green()},{fg.blue()});")
             else:
                 combo.setStyleSheet("")
+    def _data_pref_index(self,pref):
+        if pref=="lower":
+            return 1
+        if pref=="ignore":
+            return 2
+        return 0
+    def _reset_data_combo(self,combo,pref):
+        combo.blockSignals(True)
+        combo.setCurrentIndex(self._data_pref_index(pref))
+        combo.blockSignals(False)
+        combo.setProperty("current_pref",pref)
+    def _handle_data_delete(self,combo,name,key):
+        prev=combo.property("current_pref") or "higher"
+        box=QMessageBox(self)
+        box.setWindowTitle("删除确认")
+        box.setText(f"确定删除“{name}”数据吗？")
+        box.setStandardButtons(QMessageBox.Yes|QMessageBox.No)
+        yes=box.button(QMessageBox.Yes)
+        no=box.button(QMessageBox.No)
+        if yes:
+            yes.setText("确定")
+        if no:
+            no.setText("取消")
+        result=box.exec()
+        if result!=QMessageBox.Yes:
+            self._reset_data_combo(combo,prev)
+            return
+        remain,removed=self.state.remove_data_point(key or name)
+        if not removed:
+            self._reset_data_combo(combo,prev)
+            return
+        self.state.signal_tip.emit(f"已删除数据:{name}")
+        self.state.signal_data_ready.emit(remain)
+        self._refresh_preview_overlay()
+    def _refresh_preview_overlay(self):
+        if not self.preview_enabled():
+            return
+        frame=None
+        if isinstance(self.state.prev_img,np.ndarray):
+            frame=self.state.prev_img
+        elif isinstance(self._ui_last_frame,np.ndarray):
+            frame=self._ui_last_frame
+        if frame is None:
+            return
+        disp=self.state.preview_visual(frame)
+        if isinstance(disp,np.ndarray):
+            buf=np.ascontiguousarray(disp)
+        else:
+            buf=np.ascontiguousarray(frame)
+        h,w=buf.shape[:2]
+        qi=QImage(buf.data,w,h,3*w,QImage.Format_BGR888)
+        self.state.signal_preview.emit(QPixmap.fromImage(qi))
     def refresh_windows(self):
         mapping=self.selector.refresh()
         keys=sorted(list(mapping.keys()))
@@ -5714,6 +5811,38 @@ class Main(QMainWindow):
                 ver=self.lbl_ver.text()
             self.state.signal_modelver.emit(ver)
         self.set_mode("learning",force=True)
+    def _prepare_ui_minimize(self):
+        self._ui_restore_state=self.windowState()
+        self._ui_restore_required=False
+        if not (self._ui_restore_state&Qt.WindowMinimized):
+            self._ui_restore_required=True
+            self.showMinimized()
+            QApplication.processEvents()
+            time.sleep(0.15)
+        else:
+            QApplication.processEvents()
+            time.sleep(0.05)
+    def _restore_ui_window(self):
+        if not self._ui_restore_required:
+            return
+        state=self._ui_restore_state
+        try:
+            if state&Qt.WindowFullScreen:
+                self.showFullScreen()
+            elif state&Qt.WindowMaximized:
+                self.showMaximized()
+            else:
+                self.showNormal()
+        except:
+            self.showNormal()
+        QApplication.processEvents()
+        try:
+            self.activateWindow()
+            self.raise_()
+        except:
+            pass
+        self._ui_restore_required=False
+        self._ui_restore_state=Qt.WindowNoState
     def on_ui(self):
         if self.state.optimizing or self._ui_busy:
             return
@@ -5729,10 +5858,16 @@ class Main(QMainWindow):
             except:
                 pass
             self.state.stop_event.clear()
-        img=self.state.prev_img.copy() if isinstance(self.state.prev_img,np.ndarray) else None
+        self._prepare_ui_minimize()
+        img=None
+        for _ in range(6):
+            frame=self.state.capture_client()
+            if isinstance(frame,np.ndarray):
+                img=frame
+                break
+            time.sleep(0.05)
         if img is None:
-            img=self.state.capture_client()
-        if img is None:
+            self._restore_ui_window()
             QMessageBox.information(self,"提示","无法获取窗口画面")
             if paused:
                 self._ui_paused=False
@@ -5759,6 +5894,7 @@ class Main(QMainWindow):
         self._ui_thread=threading.Thread(target=task,daemon=True)
         self._ui_thread.start()
     def _handle_ui_finished(self,ok,err,res):
+        self._restore_ui_window()
         if ok:
             items=res.get("ui",[]) if isinstance(res,dict) else (res or [])
             data_items=res.get("data",[]) if isinstance(res,dict) else []
