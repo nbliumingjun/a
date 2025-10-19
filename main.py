@@ -37,7 +37,7 @@ def log(s):
     except:
         pass
 cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
-default_ui_labels=["button","input","panel","label","widget","menu","icon","ability","joystick","skill","toggle","minimap"]
+default_ui_labels=["generic"]
 schema_defaults={"labels":default_ui_labels,"max_items":48}
 def ensure_config():
     if not os.path.exists(cfg_path):
@@ -1090,7 +1090,7 @@ class StrategyEngine:
             y1=int(max(0,min(h-1,round(oy1*sy))))
             x2=int(max(x1+1,min(w,round(ox2*sx))))
             y2=int(max(y1+1,min(h,round(oy2*sy))))
-            label=el.get("type","")
+            label=str(el.get("pref_key",el.get("id","")))
             pref=self._pref_for_label(label)
             conf=max(0.0,min(1.0,float(el.get("confidence",0.5))))
             interaction=max(0.0,min(1.0,float(el.get("interaction",0))))
@@ -1320,8 +1320,8 @@ class StrategyEngine:
                         score=float(el.get("confidence",0))*0.6+float(el.get("interaction",0))*0.4
                         if score>best_score:
                             best_score=score
-                            best=el.get("raw_label",el.get("display","unknown"))
-                item["ui_type"]=best or "unknown"
+                            best=el.get("pref_key",el.get("id",""))
+                item["ui_reference"]=best or ""
         return plan
     def train_incremental(self,batches,progress_cb=None,total=None):
         self.model.train()
@@ -4255,24 +4255,22 @@ class UIInspector:
                 layout_tensor=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
                 inter_tensor=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
                 logits,rep=self.model(visual,layout_tensor,inter_tensor)
-                prob=torch.softmax(logits,dim=-1)
-                idx=int(torch.argmax(prob,dim=-1))
-                raw_label=self.labels[idx]
-                conf=float(prob[0,idx].item())
+                conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item()) if logits.shape[-1]>0 else 0.5
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
                 inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
                 inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
                 signature=self._interaction_signature(layout_vals,inter_list)
                 enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
                 score=float(max(0.0,min(1.0,enhanced)))
-                pref_key="control"
+                result_id=self._stable_key(signature,(x1,y1,x2,y2))
+                pref_key=result_id
                 pref=self.st.preference_for_label(pref_key)
                 if pref=="ignore":
                     score=0.0
                 elif pref=="lower":
                     score=1.0-score
                 interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
-                results.append({"type":pref_key,"raw_label":raw_label,"display":raw_label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature})
+                results.append({"id":result_id,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature})
                 self._update_memory(signature,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
@@ -4306,15 +4304,17 @@ class UIInspector:
                     data.update({k:disk.get(k,data.get(k)) for k in ["labels","max_items"]})
         except:
             pass
-        labels=[lab for lab in data.get("labels",[]) if isinstance(lab,str) and lab]
-        if not labels:
-            labels=list(default_ui_labels)
+        labels=["generic"]
         limit=max(4,min(128,int(data.get("max_items",48))))
         changed=len(labels)!=len(self.labels) or any(a!=b for a,b in zip(labels,self.labels))
         self.labels=labels
         self.max_items=limit
-        if self.model is None or changed:
-            self.model=UIReasoner(len(self.labels))
+        out_features=max(1,len(self.labels))
+        need_new=self.model is None or changed
+        if not need_new and getattr(self.model.head,"out_features",None)!=out_features:
+            need_new=True
+        if need_new:
+            self.model=UIReasoner(out_features)
             self.model.eval()
             self.model.to(self.device)
             self.prototype={}
@@ -4399,6 +4399,13 @@ class UIInspector:
         dur=float(inter_list[2]) if len(inter_list)>2 else 0.0
         bins=(int(min(9,area*10.0)),int(min(9,clicks)),int(min(9,entropy*4.0)),int(min(9,ai)),int(min(9,dur*10.0)))
         return f"sig_{bins[0]}_{bins[1]}_{bins[2]}_{bins[3]}_{bins[4]}"
+    def _stable_key(self,signature,bounds):
+        try:
+            x1,y1,x2,y2=bounds
+        except:
+            x1=y1=x2=y2=0
+        payload=f"{signature}_{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}"
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
     def _refine(self,conf,inter,rep,layout_vals,signature):
         clicks=float(inter[0]) if len(inter)>0 else 0.0
         ai_ratio=float(inter[1]) if len(inter)>1 else 0.0
@@ -5487,9 +5494,13 @@ class Main(QMainWindow):
         self.pref_editors=[]
         mapping={"higher":0,"lower":1,"ignore":2}
         for idx,it in enumerate(limited):
-            display=str(it.get("display",it.get("raw_label",it.get("type",""))))
-            pref_key=str(it.get("pref_key",it.get("type","")))
-            b=str(it.get("bounds",""))
+            bounds=it.get("bounds",[0,0,0,0])
+            pref_key=str(it.get("pref_key",it.get("id","")))
+            if not pref_key:
+                pref_key="__default__"
+            label_tail=pref_key[-6:] if len(pref_key)>=6 else pref_key
+            display=f"区域{idx+1}-{label_tail}" if label_tail else f"区域{idx+1}"
+            b=str(bounds)
             c=f"{float(it.get('confidence',0)):.2f}"
             inter=f"{float(it.get('interaction',0)):.2f}"
             self.ui_table.setItem(idx,0,QTableWidgetItem(display))
