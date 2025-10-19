@@ -4080,7 +4080,51 @@ class UIInspector:
         ordered=[buckets[k] for k in order if k in buckets]
         ordered.sort(key=lambda item:item.get("confidence",0.0),reverse=True)
         deduped=self._dedupe_data_entries(ordered)
-        return deduped[:32]
+        existing_abs=[]
+        for entry in deduped:
+            ab=entry.get("abs_bounds")
+            if isinstance(ab,list) and len(ab)==4:
+                existing_abs.append(tuple(int(v) for v in ab))
+            else:
+                mapped=self._map_to_client(tuple(entry.get("bounds",[0,0,0,0])),orig_img.shape,base_img.shape)
+                existing_abs.append(mapped)
+        extras=[]
+        counter=len(deduped)
+        for box in self._global_digit_scan(orig_img,existing_abs):
+            if any(self._iou(box,ex)>0.6 for ex in existing_abs):
+                continue
+            base_box=self._map_to_base(box,orig_img.shape,base_img.shape)
+            if base_box is None:
+                continue
+            extracted=self._extract_value(orig_img,base_box,base_img.shape)
+            if extracted is None:
+                continue
+            text,value,conf=extracted
+            counter+=1
+            name=f"数据{counter}"
+            q=lambda v:int(round(v/4.0)*4)
+            key=f"{q(base_box[0])}_{q(base_box[1])}_{q(base_box[2])}_{q(base_box[3])}"
+            entry=self._build_data_entry(name,base_box,value,text,conf,key,base_img.shape,orig_img.shape)
+            if entry is None or entry.get("value") is None:
+                continue
+            merged=False
+            for exist in deduped+extras:
+                if self._iou(tuple(entry.get("bounds",[0,0,0,0])),tuple(exist.get("bounds",[0,0,0,0])))>0.55 or entry.get("key")==exist.get("key"):
+                    if entry.get("confidence",0.0)>exist.get("confidence",0.0):
+                        exist.update(entry)
+                    merged=True
+                    break
+            if merged:
+                continue
+            extras.append(entry)
+            eb=entry.get("abs_bounds")
+            if isinstance(eb,list) and len(eb)==4:
+                existing_abs.append(tuple(int(v) for v in eb))
+            else:
+                existing_abs.append(tuple(entry.get("bounds",[0,0,0,0])))
+        combined=deduped+extras
+        combined.sort(key=lambda item:item.get("confidence",0.0),reverse=True)
+        return combined[:64]
     def _build_data_entry(self,name,bounds,value,text,confidence,key,base_shape,orig_shape):
         pref=self.st.preference_for_data(name)
         trend=self._trend(key,value)
@@ -4264,6 +4308,22 @@ class UIInspector:
         ax2=min(orig_shape[1],ax2+pad)
         ay2=min(orig_shape[0],ay2+pad)
         return ax1,ay1,ax2,ay2
+    def _map_to_base(self,bounds,orig_shape,base_shape):
+        if base_shape is None or orig_shape is None:
+            return None
+        if len(base_shape)<2 or len(orig_shape)<2:
+            return None
+        ax1,ay1,ax2,ay2=bounds
+        base_h,base_w=base_shape[:2]
+        if base_h<=0 or base_w<=0:
+            return None
+        sx=base_w/max(1,orig_shape[1])
+        sy=base_h/max(1,orig_shape[0])
+        bx1=int(max(0,min(base_w-1,round(ax1*sx))))
+        by1=int(max(0,min(base_h-1,round(ay1*sy))))
+        bx2=int(max(bx1+1,min(base_w,round(ax2*sx))))
+        by2=int(max(by1+1,min(base_h,round(ay2*sy))))
+        return bx1,by1,bx2,by2
     def _to_screen_bounds(self,bounds):
         left,top,_,_=self.st.client_rect if hasattr(self.st,"client_rect") else (0,0,0,0)
         return (left+bounds[0],top+bounds[1],left+bounds[2],top+bounds[3])
@@ -4491,6 +4551,52 @@ class UIInspector:
         limit=max(12,min(64,self.max_items*2))
         res=sorted(res,key=lambda r:r[4],reverse=True)[:limit]
         return res
+    def _global_digit_scan(self,img,existing):
+        if img is None or img.size==0:
+            return []
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        blur=cv2.GaussianBlur(norm,(5,5),0)
+        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,31,9)
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(3,5))
+        proc=cv2.morphologyEx(thr,cv2.MORPH_CLOSE,kernel,iterations=2)
+        contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []
+        h,w=proc.shape[:2]
+        res=[]
+        exist=list(existing) if existing else []
+        for c in contours:
+            x,y,bw,bh=cv2.boundingRect(c)
+            area=bw*bh
+            if area<40 or area>90000:
+                continue
+            if bw<4 or bh<8:
+                continue
+            aspect=bh/max(1.0,bw)
+            if aspect<0.35 or aspect>6.5:
+                continue
+            ink_region=proc[y:y+bh,x:x+bw]
+            if ink_region.size==0:
+                continue
+            ink=float(np.count_nonzero(ink_region))/max(1,ink_region.size)
+            if ink<0.08 or ink>0.9:
+                continue
+            bx1=max(0,x-2)
+            by1=max(0,y-2)
+            bx2=min(w,x+bw+2)
+            by2=min(h,y+bh+2)
+            box=(bx1,by1,bx2,by2)
+            skip=False
+            for ex in exist:
+                if self._iou(box,ex)>0.65:
+                    skip=True
+                    break
+            if skip:
+                continue
+            res.append(box)
+        res.sort(key=lambda b:(b[1],b[0]))
+        return res[:48]
     def _overlaps_ui(self,box,ui_results):
         bx1,by1,bx2,by2=box
         for el in ui_results:
