@@ -1608,7 +1608,7 @@ class State(QObject):
         self.io_thread.start()
         self.prev_lock=threading.Lock()
         self.rect_lock=threading.Lock()
-        self.mode="learning"
+        self.mode="initializing"
         self.last_user_activity=time.time()
         self.selected_hwnd=None
         self.selected_title=""
@@ -1665,6 +1665,9 @@ class State(QObject):
         self.window_stats={}
         self.trend_window=collections.deque(maxlen=36)
         self.data_color_map={}
+        self._data_id_lock=threading.Lock()
+        self._data_id_map={}
+        self._data_alias_map={}
         self._color_index=0
         self.visibility_state=None
         self.visibility_reason=""
@@ -1766,12 +1769,8 @@ class State(QObject):
             ax2=int(max(ax1+1,min(dw,round(nx2*dw))))
             ay2=int(max(ay1+1,min(dh,round(ny2*dh))))
             name=str(it.get("name") or f"数据{idx+1}")
-            key=str(it.get("key") or f"dp_{idx}")
+            raw_key=it.get("key")
             color=it.get("color")
-            if not isinstance(color,(list,tuple)) or len(color)!=3:
-                color=self.ensure_data_color(key)
-            else:
-                color=tuple(int(c) for c in color)
             conf=float(max(0.0,min(1.0,it.get("confidence",0.0))))
             trend=it.get("trend")
             try:
@@ -1790,7 +1789,12 @@ class State(QObject):
             else:
                 bounds_val=[ax1,ay1,ax2,ay2]
             display_txt=str(txt_src) if isinstance(txt_src,str) and txt_src.strip() else str(val_int)
-            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":display_txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":[nx1,ny1,nx2,ny2]}
+            stable_key=self.resolve_data_key(raw_key if raw_key is not None else f"dp_{idx}",[nx1,ny1,nx2,ny2],display_txt or name)
+            if not isinstance(color,(list,tuple)) or len(color)!=3:
+                color=self.ensure_data_color(stable_key)
+            else:
+                color=tuple(int(c) for c in color)
+            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":display_txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":stable_key,"norm_bounds":[nx1,ny1,nx2,ny2]}
             sanitized.append(entry)
             idx+=1
         return sanitized
@@ -1924,13 +1928,91 @@ class State(QObject):
         txt="越高越好" if val=="higher" else "越低越好" if val=="lower" else "无关"
         target="全局数据" if key=="__default__" else key
         self.signal_tip.emit(f"{target}目标:{txt}")
+    def resolve_data_key(self,raw_key,norm,text):
+        key=''
+        if isinstance(raw_key,str) and raw_key:
+            key=raw_key
+        elif raw_key is not None:
+            key=str(raw_key)
+        label=str(text).strip() if isinstance(text,str) else ''
+        bounds=[float(norm[0]),float(norm[1]),float(norm[2]),float(norm[3])] if isinstance(norm,(list,tuple)) and len(norm)==4 else None
+        with self._data_id_lock:
+            if key and key in self._data_id_map:
+                info=self._data_id_map[key]
+                if bounds:
+                    info['norm']=bounds
+                if label:
+                    info['text']=label
+                info['last']=time.time()
+                return key
+            if key and key in self._data_alias_map:
+                stable=self._data_alias_map[key]
+                info=self._data_id_map.get(stable)
+                if info is None:
+                    self._data_id_map[stable]={'norm':bounds,'text':label,'last':time.time()}
+                else:
+                    if bounds:
+                        info['norm']=bounds
+                    if label:
+                        info['text']=label
+                    info['last']=time.time()
+                if key!=stable:
+                    self._data_alias_map[key]=stable
+                return stable
+            best_id=None
+            best_score=None
+            if bounds:
+                for sid,info in self._data_id_map.items():
+                    dist=self._data_distance(info.get('norm'),bounds)
+                    if label and info.get('text'):
+                        if label==info.get('text'):
+                            dist*=0.5
+                        else:
+                            dist*=1.1
+                    if best_score is None or dist<best_score:
+                        best_id=sid
+                        best_score=dist
+                if best_score is not None and best_score<0.18:
+                    info=self._data_id_map[best_id]
+                    if bounds:
+                        info['norm']=bounds
+                    if label:
+                        info['text']=label
+                    info['last']=time.time()
+                    if key:
+                        self._data_alias_map[key]=best_id
+                    return best_id
+            stable=key if key and key.startswith('data-') and key not in self._data_id_map else f"data-{uuid.uuid4().hex[:8]}"
+            self._data_id_map[stable]={'norm':bounds,'text':label,'last':time.time()}
+            if key and key!=stable:
+                self._data_alias_map[key]=stable
+            return stable
     def ensure_data_color(self,key):
-        ref=key if key else str(uuid.uuid4())
+        ref=str(key) if key else str(uuid.uuid4())
         if ref in self.data_color_map:
             return self.data_color_map[ref]
         color=self._next_color()
         self.data_color_map[ref]=color
         return color
+    def _data_distance(self,a,b):
+        if not a or not b:
+            return 1.0
+        try:
+            ax1,ay1,ax2,ay2=float(a[0]),float(a[1]),float(a[2]),float(a[3])
+            bx1,by1,bx2,by2=float(b[0]),float(b[1]),float(b[2]),float(b[3])
+        except Exception:
+            return 1.0
+        aw=max(1e-6,ax2-ax1)
+        ah=max(1e-6,ay2-ay1)
+        bw=max(1e-6,bx2-bx1)
+        bh=max(1e-6,by2-by1)
+        acx=(ax1+ax2)/2.0
+        acy=(ay1+ay2)/2.0
+        bcx=(bx1+bx2)/2.0
+        bcy=(by1+by2)/2.0
+        dc=abs(acx-bcx)+abs(acy-bcy)
+        ds=abs(aw-bw)+abs(ah-bh)
+        return dc*1.1+ds
     def _next_color(self):
         golden=0.618033988749895
         h=(self._color_index*golden)%1.0
@@ -3262,6 +3344,9 @@ class OptimizerThread(threading.Thread):
             ModelMeta.update(files,{"start":tsmin,"end":tsmax},{"samples":trained_sample_count,"batches":trained_batches_count})
             self.st.strategy.ensure_loaded(lambda p,t:None)
             self.st.model_loaded=True
+            ver=f"v{ModelMeta.read().get('version',0)}"
+            self.st.model_ver_str=ver
+            self.st.signal_modelver.emit(ver)
             self._done(True)
         except Exception as e:
             log(f"opt error:{e}")
@@ -4523,8 +4608,6 @@ class UIInspector:
         return combined[:64]
     def _build_data_entry(self,name,bounds,value,text,confidence,key,base_shape,orig_shape):
         pref=self.st.preference_for_data(name)
-        trend=self._trend(key,value)
-        color=self.st.ensure_data_color(key)
         bw=max(1,base_shape[1])
         bh=max(1,base_shape[0])
         if orig_shape is None or len(orig_shape)<2:
@@ -4547,7 +4630,11 @@ class UIInspector:
             except:
                 val_entry=None
         txt=str(val_entry) if val_entry is not None else (text or "")
-        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":val_entry,"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":key,"norm_bounds":norm}
+        ident=txt if txt else name
+        stable_key=self.st.resolve_data_key(key,norm,ident)
+        trend=self._trend(stable_key,value)
+        color=self.st.ensure_data_color(stable_key)
+        entry={"name":name,"bounds":[int(bounds[0]),int(bounds[1]),int(bounds[2]),int(bounds[3])],"abs_bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"window_size":[int(ow),int(oh)],"value":val_entry,"trend":trend,"confidence":float(max(0.0,min(1.0,confidence))),"preference":pref,"text":txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":stable_key,"norm_bounds":norm}
         return entry
     def _dedupe_data_entries(self,items):
         result=[]
@@ -5077,7 +5164,7 @@ class Main(QMainWindow):
         self.btn_ui=QPushButton("识别")
         self.chk_preview=QCheckBox("预览开关")
         self.chk_preview.setChecked(self.state.preview_on)
-        self.lbl_mode=QLabel("模式:学习")
+        self.lbl_mode=QLabel("模式:初始化")
         self.lbl_fps=QLabel("帧率:0")
         self.lbl_rec=QLabel("0B")
         self.lbl_ver=QLabel("v0")
@@ -5501,6 +5588,12 @@ class Main(QMainWindow):
         self.state.stop_event.clear()
         self.state.running=True
         self.lbl_tip.setText("优化完成，已恢复学习" if ok else "优化失败，继续使用现有模型")
+        if ok:
+            try:
+                ver=f"v{ModelMeta.read().get('version',0)}"
+            except Exception:
+                ver=self.lbl_ver.text()
+            self.state.signal_modelver.emit(ver)
         self.set_mode("learning",force=True)
     def on_ui(self):
         if self.state.optimizing or self._ui_busy:
