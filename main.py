@@ -112,7 +112,7 @@ def _ver(name,modname=None):
         except:
             return ""
 def deps_check():
-    core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml"),("comtypes","comtypes")]
+    core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml"),("comtypes","comtypes"),("pytesseract","pytesseract")]
     attempt=0
     max_attempts=3
     while True:
@@ -157,7 +157,7 @@ def deps_check():
         msg="依赖未满足:"+",".join(miss_final)
         _msgbox("依赖检查",msg)
         raise RuntimeError(msg)
-    d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml"),"comtypes":_ver("comtypes")}
+    d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml"),"comtypes":_ver("comtypes"),"pytesseract":_ver("pytesseract")}
     with open(deps_path,"w",encoding="utf-8") as f:
         json.dump(d,f,ensure_ascii=False,indent=2)
         f.flush()
@@ -173,6 +173,15 @@ import queue
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+try:
+    import pytesseract
+except:
+    pytesseract=None
+try:
+    from pytesseract import Output as _PTOutput
+except:
+    _PTOutput=None
+_warned_pytesseract=False
 if os.name=="nt":
     try:
         import comtypes.client as _ct_client
@@ -4690,68 +4699,33 @@ class UIInspector:
         if ax2-ax1<4 or ay2-ay1<4:
             return None
         crop=orig_img[ay1:ay2,ax1:ax2]
-        screen=self._to_screen_bounds((ax1,ay1,ax2,ay2))
-        raw=self.uia.text(screen,self.window_hwnd) if hasattr(self,"uia") and self.uia else ""
-        display=self._sanitize_text(raw)
         ow=max(1,orig_img.shape[1])
         oh=max(1,orig_img.shape[0])
         norm_bounds=[max(0.0,min(1.0,float(ax1)/ow)),max(0.0,min(1.0,float(ay1)/oh)),max(0.0,min(1.0,float(ax2)/ow)),max(0.0,min(1.0,float(ay2)/oh))]
-        candidates=[]
-        if display:
-            digits=sum(1 for ch in display if ch.isdigit())
-            non_space=sum(1 for ch in display if not ch.isspace())
-            if non_space>0 and digits/non_space>=0.6:
-                filtered="".join(ch for ch in display if ch.isdigit() or ch.isspace())
-                strict=self._non_negative_integer(filtered)
-                if strict:
-                    candidates.append((strict[0],strict[1],0.62))
-            numeric=self._numeric_text(display)
-            if numeric and "." not in numeric and "-" not in numeric:
-                strict=self._non_negative_integer(numeric)
-                if strict and all(strict[0]!=c[0] for c in candidates):
-                    candidates.append((strict[0],strict[1],0.58))
         ocr_text,prob=self._ocr_digits(crop)
-        if ocr_text:
-            oclean=self._sanitize_text(ocr_text)
-            onumeric=self._numeric_text(oclean)
-            if onumeric and "." not in onumeric and "-" not in onumeric:
-                strict=self._non_negative_integer(onumeric)
-                if strict:
-                    candidates.append((strict[0],strict[1],max(prob,0.65)))
-        cluster=self._cluster_digits(crop)
-        if cluster:
-            txt,val,conf=cluster
-            if all(txt!=c[0] for c in candidates):
-                candidates.append((txt,val,conf))
-        ensemble=self.digit_ensemble.detect(crop)
-        if ensemble:
-            txt,val,conf=ensemble
-            if all(txt!=c[0] for c in candidates):
-                candidates.append((txt,val,conf))
-        best_txt=None
-        best_val=None
-        best_conf=0.0
-        for cand_txt,cand_val,cand_conf in candidates:
-            if not self._validate_numeric_patch(crop,cand_txt,max(cand_conf,0.4)):
-                continue
-            if cand_conf>best_conf:
-                best_conf=cand_conf
-                best_txt=cand_txt
-                best_val=cand_val
-        if best_txt is None:
-            fallback=self._fallback_numeric(crop)
-            if fallback is None:
-                self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,0.0)
-                return None
-            best_txt,best_val,best_conf=fallback
-        shape_conf=self._digit_shape_confidence(crop,best_txt)
-        if shape_conf<0.45:
-            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,shape_conf)
+        if not ocr_text:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,float(prob))
             return None
-        final_conf=max(best_conf,shape_conf)
-        if final_conf<0.6:
+        segments=re.findall(r"\d+",ocr_text)
+        if not segments:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,float(prob))
+            return None
+        best=None
+        for seg in segments:
+            strict=self._non_negative_integer(seg)
+            if strict:
+                best=strict
+                break
+        if best is None:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,float(prob))
+            return None
+        best_txt,best_val=best
+        shape_conf=self._digit_shape_confidence(crop,best_txt)
+        final_conf=float(max(0.0,min(1.0,(float(prob)+shape_conf)/2.0)))
+        if final_conf<0.55:
             self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,final_conf)
-        return best_txt,best_val,max(final_conf,0.5)
+            return None
+        return best_txt,best_val,final_conf
     def _register_miss(self,img,abs_bounds,norm_bounds,confidence):
         try:
             if img is None or img.size==0:
@@ -5033,77 +5007,104 @@ class UIInspector:
     def _ocr_digits(self,img):
         if img is None or img.size==0:
             return "",0.0
-        if img.ndim==3:
-            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-        else:
-            gray=img
+        global _warned_pytesseract
+        if pytesseract is None:
+            if not _warned_pytesseract:
+                log("pytesseract_missing")
+                _warned_pytesseract=True
+            return "",0.0
+        if not hasattr(self,"_tesseract_ready"):
+            try:
+                pytesseract.get_tesseract_version()
+                self._tesseract_ready=True
+            except Exception as e:
+                self._tesseract_ready=False
+                if not hasattr(self,"_tesseract_log"):
+                    self._tesseract_log=True
+                    log(f"tesseract_unavailable:{e}")
+        if not getattr(self,"_tesseract_ready",False):
+            return "",0.0
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
         norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
-        blur=cv2.GaussianBlur(norm,(3,3),0)
-        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,15,8)
-        contours,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        h,w=norm.shape[:2]
+        short=max(1,min(h,w))
+        scale=1
+        if short<64:
+            scale=min(6,max(2,int(128/short)))
+        if scale>1:
+            norm=cv2.resize(norm,(w*scale,h*scale),interpolation=cv2.INTER_CUBIC)
+        blur=cv2.medianBlur(norm,3)
+        eq=cv2.equalizeHist(blur)
+        _,thr=cv2.threshold(eq,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        inv=cv2.bitwise_not(thr)
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(2,2))
+        proc=cv2.morphologyEx(inv,cv2.MORPH_CLOSE,kernel,iterations=1)
+        ink=float(np.count_nonzero(proc))/max(1,proc.size)
+        if ink<0.02 or ink>0.6:
             return "",0.0
-        boxes=[]
-        for c in contours:
-            x,y,w,h=cv2.boundingRect(c)
-            if w<3 or h<6:
-                continue
-            boxes.append((x,y,w,h))
-        if not boxes:
-            return "",0.0
-        boxes.sort(key=lambda b:b[0])
-        max_h=max(h for _,_,_,h in boxes)
-        chars=[]
-        scores=[]
-        for x,y,w,h in boxes:
-            if h<max_h*0.35:
-                if w>h*1.6:
-                    chars.append((x,"-",0.55))
-                    scores.append(0.55)
-                elif h>1:
-                    chars.append((x,".",0.6))
-                    scores.append(0.6)
-                continue
-            pad=2
-            y1=max(0,y-pad)
-            y2=min(thr.shape[0],y+h+pad)
-            x1=max(0,x-pad)
-            x2=min(thr.shape[1],x+w+pad)
-            digit_img=thr[y1:y2,x1:x2]
-            if digit_img.size==0:
-                continue
-            pred,prob=self.digit_clf.classify(digit_img)
-            prob=float(max(0.0,min(1.0,prob)))
-            chars.append((x,str(pred),prob))
-            scores.append(prob)
-        if not chars:
-            return "",0.0
-        chars.sort(key=lambda item:item[0])
-        text="".join(ch for _,ch,_ in chars).strip()
-        digits=[prob for _,ch,prob in chars if ch.isdigit()]
-        strong=[prob for _,ch,prob in chars if ch.isdigit() and prob>=0.7]
-        if not digits:
-            return "",0.0
-        if len(strong)<max(1,int(len(digits)*0.6)):
-            return "",0.0
-        conf=float(sum(scores)/len(scores)) if scores else 0.0
-        ink=float(np.count_nonzero(thr))/max(1,thr.size)
-        ink_min=0.045 if np.var(norm)<900 else 0.06
-        ink_max=0.48 if np.var(norm)>3200 else 0.42
-        if conf<0.5 or ink<ink_min or ink>ink_max:
-            return "",0.0
-        edge=cv2.Canny(norm,40,120)
-        detail=float(np.count_nonzero(edge))/max(1,edge.size)
-        if detail<0.03:
+        detail_src=cv2.Canny(eq,40,120)
+        detail=float(np.count_nonzero(detail_src))/max(1,detail_src.size)
+        if detail<0.015:
             return "",0.0
         try:
-            comps,_=cv2.connectedComponents(thr)
-            if comps-1>max(12,len(chars)*3):
-                return "",0.0
+            output_type=pytesseract.Output.DICT if hasattr(pytesseract,"Output") else (_PTOutput.DICT if _PTOutput else None)
         except:
-            pass
-        if len(digits)>8 and conf<0.75:
+            output_type=_PTOutput.DICT if _PTOutput else None
+        if output_type is None:
             return "",0.0
+        try:
+            data=pytesseract.image_to_data(proc,config="--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789",output_type=output_type)
+        except Exception as e:
+            if not getattr(self,"_ocr_error_logged",False):
+                self._ocr_error_logged=True
+                log(f"ocr_engine_error:{e}")
+            return "",0.0
+        texts=data.get("text",[])
+        confs_raw=data.get("conf",[])
+        lefts=data.get("left",[])
+        widths=data.get("width",[])
+        heights=data.get("height",[])
+        n=min(len(texts),len(confs_raw),len(lefts),len(widths),len(heights))
+        entries=[]
+        for i in range(n):
+            txt=texts[i]
+            if not txt:
+                continue
+            clean=re.sub(r"[^0-9]","",txt)
+            if not clean:
+                continue
+            try:
+                conf_val=float(confs_raw[i])
+            except:
+                conf_val=-1.0
+            if conf_val<0:
+                continue
+            try:
+                width=int(widths[i])
+            except:
+                width=0
+            try:
+                height=int(heights[i])
+            except:
+                height=0
+            if width<=1 or height<=5:
+                continue
+            if width*height<36 or width*height>40000:
+                continue
+            try:
+                left=int(lefts[i])
+            except:
+                left=i
+            conf_norm=float(max(0.0,min(1.0,conf_val/100.0)))
+            entries.append((left,clean,conf_norm))
+        if not entries:
+            return "",0.0
+        entries.sort(key=lambda item:item[0])
+        strong=sum(1 for _,_,c in entries if c>=0.6)
+        if strong==0:
+            return "",0.0
+        text=" ".join(seg for _,seg,_ in entries)
+        conf=float(sum(c for _,_,c in entries)/len(entries))
         return text,conf
     def _cluster_digits(self,img):
         if img is None or img.size==0:
