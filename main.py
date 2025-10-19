@@ -4556,47 +4556,72 @@ class UIInspector:
             return []
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
         norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
-        blur=cv2.GaussianBlur(norm,(5,5),0)
-        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,31,9)
-        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(3,5))
-        proc=cv2.morphologyEx(thr,cv2.MORPH_CLOSE,kernel,iterations=2)
-        contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            return []
-        h,w=proc.shape[:2]
-        res=[]
+        try:
+            clahe=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8))
+            norm=clahe.apply(norm)
+        except:
+            pass
+        blurs=[cv2.GaussianBlur(norm,(3,3),0),cv2.GaussianBlur(norm,(5,5),0)]
+        masks=[]
+        for blur in blurs:
+            masks.append(cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,21,7))
+            masks.append(cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,31,9))
+            _,otsu=cv2.threshold(blur,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+            masks.append(otsu)
+        grad=cv2.morphologyEx(norm,cv2.MORPH_GRADIENT,cv2.getStructuringElement(cv2.MORPH_RECT,(3,3)))
+        _,grad_thr=cv2.threshold(grad,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        masks.append(grad_thr)
+        h,w=norm.shape[:2]
         exist=list(existing) if existing else []
-        for c in contours:
-            x,y,bw,bh=cv2.boundingRect(c)
-            area=bw*bh
-            if area<40 or area>90000:
+        res=[]
+        seen=[]
+        for mask in masks:
+            if mask is None or mask.size==0:
                 continue
-            if bw<4 or bh<8:
+            kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(3,5))
+            proc=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel,iterations=2)
+            contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
                 continue
-            aspect=bh/max(1.0,bw)
-            if aspect<0.35 or aspect>6.5:
-                continue
-            ink_region=proc[y:y+bh,x:x+bw]
-            if ink_region.size==0:
-                continue
-            ink=float(np.count_nonzero(ink_region))/max(1,ink_region.size)
-            if ink<0.08 or ink>0.9:
-                continue
-            bx1=max(0,x-2)
-            by1=max(0,y-2)
-            bx2=min(w,x+bw+2)
-            by2=min(h,y+bh+2)
-            box=(bx1,by1,bx2,by2)
-            skip=False
-            for ex in exist:
-                if self._iou(box,ex)>0.65:
-                    skip=True
-                    break
-            if skip:
-                continue
-            res.append(box)
+            for c in contours:
+                x,y,bw,bh=cv2.boundingRect(c)
+                area=bw*bh
+                if area<36 or area>120000:
+                    continue
+                if bw<4 or bh<8:
+                    continue
+                aspect=bh/max(1.0,bw)
+                if aspect<0.25 or aspect>8.0:
+                    continue
+                ink_region=proc[y:y+bh,x:x+bw]
+                if ink_region.size==0:
+                    continue
+                ink=float(np.count_nonzero(ink_region))/max(1,ink_region.size)
+                if ink<0.06 or ink>0.92:
+                    continue
+                bx1=max(0,x-2)
+                by1=max(0,y-2)
+                bx2=min(w,x+bw+2)
+                by2=min(h,y+bh+2)
+                box=(bx1,by1,bx2,by2)
+                skip=False
+                for ex in exist:
+                    if self._iou(box,ex)>0.65:
+                        skip=True
+                        break
+                if skip:
+                    continue
+                for prev in seen:
+                    if self._iou(box,prev)>0.7:
+                        skip=True
+                        break
+                if skip:
+                    continue
+                res.append(box)
+                exist.append(box)
+                seen.append(box)
         res.sort(key=lambda b:(b[1],b[0]))
-        return res[:48]
+        return res[:72]
     def _overlaps_ui(self,box,ui_results):
         bx1,by1,bx2,by2=box
         for el in ui_results:
