@@ -4558,6 +4558,227 @@ class UIModelRegistry:
                 log(f"ui_model_init_fail:{uid}:{e}")
         self._merge_meta(mapping)
         return self._load_model(uid,path,device)
+    def model_path(self,uid):
+        if not uid:
+            return None
+        with self.lock:
+            items=self.meta.setdefault("items",{})
+            info=items.get(uid)
+            if info is None:
+                fname=self._fname(uid)
+                info={"file":fname,"classes":self.num_classes,"created":time.time(),"updated":time.time()}
+                items[uid]=info
+                self._save()
+            fname=info.get("file") or self._fname(uid)
+        path=os.path.join(models_dir,fname)
+        if not os.path.exists(path):
+            try:
+                self._write_default(path)
+            except Exception as e:
+                log(f"ui_model_path_init_fail:{uid}:{e}")
+        return path
+class UIModelTrainer:
+    def __init__(self,inspector):
+        self.inspector=inspector
+        self.registry=inspector.registry
+        self.device=inspector.device
+        self.buffers=collections.defaultdict(lambda:collections.deque(maxlen=512))
+        self.queue=queue.Queue()
+        self.worker=threading.Thread(target=self._loop,daemon=True)
+        self.worker.start()
+        self.bootstrap_thread=threading.Thread(target=self._bootstrap,daemon=True)
+        self.bootstrap_thread.start()
+    def submit(self,samples):
+        try:
+            if not samples:
+                return
+            packed=[]
+            for item in samples:
+                if len(item)!=7:
+                    continue
+                uid,visual,layout,interaction,label,weight,ts=item
+                if visual is None or layout is None or interaction is None:
+                    continue
+                try:
+                    ts_val=float(ts)
+                except:
+                    ts_val=0.0
+                packed.append((uid,np.asarray(visual,dtype=np.float32),np.asarray(layout,dtype=np.float32),np.asarray(interaction,dtype=np.float32),float(label),float(weight),ts_val))
+            if packed:
+                self.queue.put(("samples",packed))
+        except Exception as e:
+            log(f"ui_trainer_submit_error:{e}")
+    def _loop(self):
+        while True:
+            item=self.queue.get()
+            if item is None:
+                break
+            kind,data=item
+            if kind in ("samples","bootstrap"):
+                self._handle_samples(data)
+    def _handle_samples(self,data):
+        try:
+            for uid,visual,layout,interaction,label,weight,ts in data:
+                if not uid:
+                    continue
+                buf=self.buffers[uid]
+                buf.append((visual,layout,interaction,label,max(0.05,weight),ts))
+            self._train_ready()
+        except Exception as e:
+            log(f"ui_trainer_handle_error:{e}")
+    def _train_ready(self):
+        for uid,buf in list(self.buffers.items()):
+            if len(buf)>=8:
+                try:
+                    self._train_uid(uid,list(buf))
+                except Exception as e:
+                    log(f"ui_trainer_train_error:{uid}:{e}")
+    def _train_uid(self,uid,samples):
+        path=self.registry.model_path(uid)
+        if not path:
+            return
+        model=UIReasoner(self.registry.num_classes)
+        try:
+            if os.path.exists(path):
+                ModelIO.load(model,path)
+        except Exception as e:
+            log(f"ui_trainer_model_load_fail:{uid}:{e}")
+        model.to(self.device)
+        opt=optim.AdamW(model.parameters(),lr=3e-4,weight_decay=1e-5)
+        batch_size=8
+        epochs=max(1,min(3,len(samples)//batch_size))
+        ts_vals=[]
+        for epoch in range(epochs):
+            random.shuffle(samples)
+            for i in range(0,len(samples),batch_size):
+                batch=samples[i:i+batch_size]
+                if not batch:
+                    continue
+                visuals=np.stack([b[0] for b in batch])
+                layouts=np.stack([b[1] for b in batch])
+                inters=np.stack([b[2] for b in batch])
+                labels=np.array([b[3] for b in batch],dtype=np.float32)
+                weights=np.array([b[4] for b in batch],dtype=np.float32)
+                ts_vals.extend([b[5] for b in batch if b[5]])
+                visuals_t=torch.from_numpy(visuals).to(self.device)
+                layouts_t=torch.from_numpy(layouts).to(self.device)
+                inters_t=torch.from_numpy(inters).to(self.device)
+                labels_t=torch.from_numpy(labels).to(self.device)
+                weights_t=torch.from_numpy(weights).to(self.device)
+                opt.zero_grad()
+                logits,_=model(visuals_t,layouts_t,inters_t)
+                if logits.ndim==1:
+                    logits=logits.unsqueeze(0)
+                if logits.shape[-1]==1:
+                    pred=logits.view(-1)
+                    loss=F.binary_cross_entropy_with_logits(pred,labels_t,reduction="none")
+                else:
+                    target_idx=(labels_t>0.5).long()
+                    loss=F.cross_entropy(logits,target_idx,reduction="none")
+                loss=(loss*weights_t).mean()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(),1.0)
+                opt.step()
+        model_cpu=UIReasoner(self.registry.num_classes)
+        model_cpu.load_state_dict(model.state_dict())
+        model_cpu.eval()
+        ModelIO.save(model_cpu,path)
+        model.eval()
+        with self.registry.lock:
+            self.registry.cache[uid]=model.to(self.inspector.device).eval()
+        if ts_vals:
+            start=min(ts_vals)
+            end=max(ts_vals)
+        else:
+            now=time.time()
+            start=now
+            end=now
+        ModelMeta.update([path],{"start":start,"end":end},{"ui_model":uid})
+        trimmed=list(samples)[-128:]
+        self.buffers[uid]=collections.deque(trimmed,maxlen=512)
+    def _bootstrap(self):
+        try:
+            days=[d for d in sorted(os.listdir(exp_dir),reverse=True) if os.path.isdir(os.path.join(exp_dir,d))]
+            loaded=0
+            for day in days:
+                events_path=os.path.join(exp_dir,day,"events.jsonl")
+                frames_dir=os.path.join(exp_dir,day,"frames")
+                if not os.path.exists(events_path) or not os.path.isdir(frames_dir):
+                    continue
+                tail=collections.deque(maxlen=256)
+                with open(events_path,"r",encoding="utf-8") as f:
+                    for line in f:
+                        tail.append(line)
+                for line in tail:
+                    try:
+                        event=json.loads(line)
+                    except:
+                        continue
+                    frame_id=str(event.get("frame_id") or "")
+                    if not frame_id:
+                        continue
+                    frame_file=os.path.join(frames_dir,f"{frame_id}.png")
+                    if not os.path.exists(frame_file):
+                        continue
+                    img=cv2.imread(frame_file)
+                    if img is None or img.size==0:
+                        continue
+                    base=cv2.resize(img,(1280,800))
+                    events=[event]
+                    cands=self.inspector._candidates(base,events)
+                    collected=[]
+                    for (x1,y1,x2,y2) in cands:
+                        if x2-x1<12 or y2-y1<12:
+                            continue
+                        patch=base[y1:y2,x1:x2]
+                        if patch.size==0:
+                            continue
+                        visual=cv2.resize(patch,(128,128)).astype(np.float32)/255.0
+                        visual=np.transpose(visual,(2,0,1))
+                        layout=self.inspector._layout_vec(base.shape,x1,y1,x2,y2).squeeze(0).detach().cpu().numpy()
+                        interaction=self.inspector._interaction_vec(events,x1,y1,x2,y2,base.shape).squeeze(0).detach().cpu().numpy()
+                        signature=self.inspector._interaction_signature(layout.tolist(),interaction.tolist())
+                        uid=self.inspector._stable_key(signature,(x1,y1,x2,y2))
+                        label=1.0 if self._event_hits_box(event,x1,y1,x2,y2,base.shape[1],base.shape[0]) else 0.0
+                        weight=1.2 if label and event.get("source")=="user" else (0.9 if label else 0.5)
+                        raw_ts=self.inspector._safe_time(event)
+                        if raw_ts is None:
+                            raw_ts=event.get("ts") or 0.0
+                        try:
+                            ts=float(raw_ts)
+                        except:
+                            ts=0.0
+                        collected.append((uid,visual,layout,interaction,label,weight,ts))
+                    if collected:
+                        self.queue.put(("bootstrap",collected))
+                        loaded+=1
+                    if loaded>=320:
+                        return
+        except Exception as e:
+            log(f"ui_trainer_bootstrap_error:{e}")
+    def _event_hits_box(self,event,x1,y1,x2,y2,w,h):
+        pts=self._event_points(event,w,h)
+        for px,py in pts:
+            if px>=x1 and px<=x2 and py>=y1 and py<=y2:
+                return True
+        return False
+    def _event_points(self,event,w,h):
+        pts=[]
+        def add(lx,ly):
+            try:
+                x=int(float(lx)/2560.0*w)
+                y=int(float(ly)/1600.0*h)
+                if x>=0 and y>=0 and x<=w and y<=h:
+                    pts.append((x,y))
+            except:
+                return
+        add(event.get("press_lx"),event.get("press_ly"))
+        add(event.get("release_lx"),event.get("release_ly"))
+        moves=event.get("moves") or []
+        for mv in moves:
+            if isinstance(mv,(list,tuple)) and len(mv)>=3:
+                add(mv[1],mv[2])
+        return pts
     def save(self,uid,model):
         if not uid or model is None:
             return
@@ -4598,6 +4819,7 @@ class UIInspector:
         self.window_hwnd=0
         self.out_features=1
         self._refresh_schema(True)
+        self.trainer=UIModelTrainer(self)
     def analyze(self,img,events):
         self._refresh_schema()
         self.window_hwnd=int(self.st.selected_hwnd or 0)
@@ -4605,6 +4827,7 @@ class UIInspector:
         cands=self._candidates(base,events)
         results=[]
         out_features=max(1,len(self.labels))
+        train_samples=[]
         with torch.no_grad():
             for (x1,y1,x2,y2) in cands:
                 if x2-x1<20 or y2-y1<16:
@@ -4612,7 +4835,9 @@ class UIInspector:
                 patch=base[y1:y2,x1:x2]
                 if patch.size==0:
                     continue
-                visual=torch.from_numpy(cv2.resize(patch,(128,128))).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
+                visual_arr=cv2.resize(patch,(128,128)).astype(np.float32)/255.0
+                visual_arr=np.transpose(visual_arr,(2,0,1))
+                visual=torch.from_numpy(visual_arr).unsqueeze(0).to(self.device)
                 layout_tensor=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
                 inter_tensor=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
@@ -4624,7 +4849,10 @@ class UIInspector:
                 if model is None:
                     continue
                 logits,rep=model(visual,layout_tensor,inter_tensor)
-                conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item()) if logits.shape[-1]>0 else 0.5
+                if logits.shape[-1]==1:
+                    conf=float(torch.sigmoid(logits.view(-1)).item())
+                else:
+                    conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item())
                 enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
                 score=float(max(0.0,min(1.0,enhanced)))
                 pref_key=result_id
@@ -4635,6 +4863,8 @@ class UIInspector:
                     score=1.0-score
                 interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
                 results.append({"id":result_id,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature})
+                label,weight,ts=self._label_from_events((x1,y1,x2,y2),events,base.shape)
+                train_samples.append((result_id,visual_arr,layout_tensor.squeeze(0).detach().cpu().numpy(),inter_tensor.squeeze(0).detach().cpu().numpy(),label,weight,ts))
                 self._update_memory(signature,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
@@ -4643,6 +4873,8 @@ class UIInspector:
         data_points=self._collect_data(base,img,events,results)
         self.st.ui_elements=results
         cleaned=self.st.set_data_points(data_points)
+        if train_samples:
+            self.trainer.submit(train_samples)
         with open(ui_cache_path,"w",encoding="utf-8") as f:
             json.dump(results,f,ensure_ascii=False,indent=2)
             f.flush()
@@ -4800,6 +5032,54 @@ class UIInspector:
         stat["count"]=min(480,stat.get("count",0)+1)
         stat["last"]=time.time()
         self.signature_stats[signature]=stat
+    def _label_from_events(self,bounds,events,shape):
+        x1,y1,x2,y2=bounds
+        w=shape[1]
+        h=shape[0]
+        hits=[]
+        ts_vals=[]
+        for e in events or []:
+            if e.get("type") not in ["left","right","middle"]:
+                continue
+            pts=self._event_points(e,w,h)
+            if not pts:
+                continue
+            matched=False
+            for px,py in pts:
+                if px>=x1 and px<=x2 and py>=y1 and py<=y2:
+                    matched=True
+                    weight=1.2 if e.get("source")=="user" else 0.9
+                    hits.append(weight)
+                    t=self._safe_time(e)
+                    if t is not None:
+                        ts_vals.append(float(t))
+                    break
+            if matched:
+                continue
+        if hits:
+            ts_val=ts_vals[-1] if ts_vals else time.time()
+            return 1.0,max(hits),ts_val
+        fallback=None
+        if events:
+            fallback=self._safe_time(events[-1])
+        return 0.0,0.6,float(fallback) if fallback is not None else time.time()
+    def _event_points(self,event,w,h):
+        pts=[]
+        def add(lx,ly):
+            try:
+                x=int(float(lx)/2560.0*w)
+                y=int(float(ly)/1600.0*h)
+            except:
+                return
+            if x<0 or y<0 or x>w or y>h:
+                return
+            pts.append((x,y))
+        add(event.get("press_lx"),event.get("press_ly"))
+        add(event.get("release_lx"),event.get("release_ly"))
+        for mv in event.get("moves") or []:
+            if isinstance(mv,(list,tuple)) and len(mv)>=3:
+                add(mv[1],mv[2])
+        return pts
     def _prototype_score(self,signature,rep):
         proto=self.prototype.get(signature)
         if proto is None:
