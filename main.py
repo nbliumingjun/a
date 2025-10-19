@@ -27,6 +27,8 @@ meta_path=os.path.join(models_dir,"model_meta.json")
 ui_cache_path=os.path.join(base_dir,"ui_elements.json")
 data_cache_path=os.path.join(base_dir,"window_data.json")
 schema_path=os.path.join(base_dir,"ui_schema.json")
+ui_model_meta_path=os.path.join(models_dir,"ui_models_meta.json")
+data_model_meta_path=os.path.join(models_dir,"data_models_meta.json")
 for d in [base_dir,exp_dir,models_dir,logs_dir]:
     os.makedirs(d,exist_ok=True)
 log_path=os.path.join(logs_dir,"app.log")
@@ -1438,6 +1440,128 @@ class ModelMeta:
         m["version"]=v
         m["updated_at"]=now
         ModelMeta.write(m)
+    @staticmethod
+    def merge(payload):
+        if not isinstance(payload,dict):
+            return
+        base=ModelMeta.read()
+        if not isinstance(base,dict):
+            base={}
+        for k,v in payload.items():
+            base[k]=v
+        ModelMeta.write(base)
+class DataModelRegistry:
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.meta=self._load()
+        self.mapping_cache=None
+    def _load(self):
+        try:
+            with open(data_model_meta_path,"r",encoding="utf-8") as f:
+                data=json.load(f)
+                if isinstance(data,dict):
+                    if "items" not in data or not isinstance(data.get("items"),dict):
+                        data["items"]={}
+                    return data
+        except:
+            pass
+        return {"items":{}}
+    def _save(self):
+        with open(data_model_meta_path,"w",encoding="utf-8") as f:
+            json.dump(self.meta,f,ensure_ascii=False,indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    def _fname(self,key):
+        safe=re.sub(r"[^0-9a-zA-Z]+","",str(key))
+        if not safe:
+            safe=hashlib.sha1(str(key).encode("utf-8")).hexdigest()[:16]
+        return f"data_{safe}.npz"
+    def _path(self,key):
+        return os.path.join(models_dir,self._fname(key))
+    def _write_file(self,path,info):
+        payload={}
+        norm=info.get("norm") if isinstance(info,dict) else None
+        if isinstance(norm,(list,tuple)) and len(norm)==4:
+            payload["norm"]=np.array([float(norm[0]),float(norm[1]),float(norm[2]),float(norm[3])],dtype=np.float32)
+        absb=info.get("abs") if isinstance(info,dict) else None
+        if isinstance(absb,(list,tuple)) and len(absb)==4:
+            payload["abs"]=np.array([float(absb[0]),float(absb[1]),float(absb[2]),float(absb[3])],dtype=np.float32)
+        win=info.get("window") if isinstance(info,dict) else None
+        if isinstance(win,(list,tuple)) and len(win)==2:
+            payload["window"]=np.array([float(win[0]),float(win[1])],dtype=np.float32)
+        val=info.get("value") if isinstance(info,dict) else None
+        if isinstance(val,(int,float)):
+            payload["value"]=np.array([float(val)],dtype=np.float32)
+        name=info.get("name") if isinstance(info,dict) else None
+        if isinstance(name,str) and name:
+            payload["name"]=np.array([ord(c) for c in name[:32]],dtype=np.int32)
+        if not payload:
+            payload["empty"]=np.zeros(1,dtype=np.float32)
+        buf=io.BytesIO()
+        np.savez_compressed(buf,**payload)
+        with open(path,"wb") as f:
+            f.write(buf.getvalue())
+            f.flush()
+            os.fsync(f.fileno())
+    def ensure(self,key,info):
+        if not key:
+            return
+        with self.lock:
+            items=self.meta.setdefault("items",{})
+            record=items.get(key)
+            fname=self._fname(key)
+            path=os.path.join(models_dir,fname)
+            updated={"file":fname,"updated":time.time()}
+            if isinstance(info,dict):
+                updated["norm"]=info.get("norm")
+                updated["abs"]=info.get("abs")
+                updated["window"]=info.get("window")
+                updated["value"]=info.get("value")
+                updated["name"]=info.get("name")
+            if record is None or record.get("file")!=fname:
+                items[key]=updated
+            else:
+                record.update(updated)
+            self._save()
+        try:
+            self._write_file(path,info if isinstance(info,dict) else {})
+        except Exception as e:
+            log(f"data_model_write_fail:{key}:{e}")
+        self._sync_meta()
+    def remove(self,key):
+        if not key:
+            return
+        path=None
+        with self.lock:
+            record=self.meta.setdefault("items",{}).pop(key,None)
+            self._save()
+            if record:
+                fname=record.get("file")
+                if fname:
+                    path=os.path.join(models_dir,fname)
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                log(f"data_model_remove_fail:{key}:{e}")
+        self._sync_meta()
+    def sync(self,items):
+        if not isinstance(items,list):
+            return
+        for entry in items:
+            if not isinstance(entry,dict):
+                continue
+            key=entry.get("key")
+            if not key:
+                continue
+            info={"norm":entry.get("norm_bounds"),"abs":entry.get("abs_bounds"),"window":entry.get("window_size"),"value":entry.get("value"),"name":entry.get("name")}
+            self.ensure(key,info)
+    def _sync_meta(self):
+        with self.lock:
+            mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
+        if self.mapping_cache!=mapping:
+            self.mapping_cache=dict(mapping)
+            ModelMeta.merge({"data_models":mapping})
 class Foreground:
     GA_ROOT=2
     DWMWA_CLOAKED=14
@@ -1612,6 +1736,11 @@ class State(QObject):
         self.hyper.set_save_callback(self._save_hparams)
         self.strategy.attach_hparams(self.hyper)
         self.validator=AutoValidator(self)
+        self.data_registry=DataModelRegistry()
+        try:
+            self.ui_registry=UIModelRegistry()
+        except NameError:
+            self.ui_registry=None
         self.io_q=queue.Queue(maxsize=1024)
         self.io_thread=threading.Thread(target=self._io_worker,daemon=True)
         self.io_thread.start()
@@ -1817,17 +1946,37 @@ class State(QObject):
         sanitized=self._sanitize_data_points(items if isinstance(items,list) else [],cw,ch)
         with self.rect_lock:
             self.data_points=[dict(p) for p in sanitized]
+        if getattr(self,"data_registry",None):
+            self.data_registry.sync(sanitized)
         return [dict(p) for p in sanitized]
     def remove_data_point(self,key):
         if not key:
             return (self.current_data_snapshot(),False)
+        removed_key=None
         with self.rect_lock:
             if not isinstance(self.data_points,list):
                 return ([],False)
             current=[dict(p) for p in self.data_points]
-            remain=[p for p in current if p.get("key")!=key]
-            if len(remain)==len(current):
+            target=None
+            removed_key=key
+            for p in current:
+                if p.get("key")==key:
+                    target=p
+                    break
+            if target is None:
+                alias=None
+                with self._data_id_lock:
+                    alias=self._data_alias_map.get(key)
+                if alias:
+                    for p in current:
+                        if p.get("key")==alias:
+                            target=p
+                            removed_key=alias
+                            break
+            if target is None:
                 return (current,False)
+            removed_key=target.get("key") if isinstance(target,dict) and target.get("key") else removed_key
+            remain=[p for p in current if p.get("key")!=removed_key]
             self.data_points=[dict(p) for p in remain]
         try:
             with open(data_cache_path,"w",encoding="utf-8") as f:
@@ -1836,6 +1985,17 @@ class State(QObject):
                 os.fsync(f.fileno())
         except Exception as e:
             log(f"data remove save fail:{e}")
+        if removed_key and getattr(self,"data_registry",None):
+            self.data_registry.remove(removed_key)
+        if removed_key:
+            with self._data_id_lock:
+                if removed_key in self.data_color_map:
+                    del self.data_color_map[removed_key]
+                if removed_key in self._data_id_map:
+                    del self._data_id_map[removed_key]
+                aliases=[k for k,v in self._data_alias_map.items() if v==removed_key]
+                for alias in aliases:
+                    del self._data_alias_map[alias]
         return ([dict(p) for p in remain],True)
     def current_data_snapshot(self):
         with self.rect_lock:
@@ -4229,6 +4389,119 @@ class UIReasoner(nn.Module):
         rep=self.fusion(fused)
         logits=self.head(rep)
         return logits,rep
+class UIModelRegistry:
+    def __init__(self):
+        self.lock=threading.Lock()
+        self.meta=self._load()
+        schema=self.meta.get("_schema",{}) if isinstance(self.meta,dict) else {}
+        self.num_classes=max(1,int(schema.get("num_classes",1)))
+        self.cache={}
+        self.mapping_cache=None
+    def _load(self):
+        try:
+            with open(ui_model_meta_path,"r",encoding="utf-8") as f:
+                data=json.load(f)
+                if isinstance(data,dict):
+                    if "_schema" not in data or not isinstance(data.get("_schema"),dict):
+                        data["_schema"]={"num_classes":1}
+                    if "items" not in data or not isinstance(data.get("items"),dict):
+                        data["items"]={}
+                    return data
+        except:
+            pass
+        return {"_schema":{"num_classes":1},"items":{}}
+    def _save(self):
+        with open(ui_model_meta_path,"w",encoding="utf-8") as f:
+            json.dump(self.meta,f,ensure_ascii=False,indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+    def _fname(self,uid):
+        safe=re.sub(r"[^0-9a-zA-Z]+","",str(uid))
+        if not safe:
+            safe=hashlib.sha1(str(uid).encode("utf-8")).hexdigest()[:16]
+        return f"ui_{safe}.npz"
+    def set_num_classes(self,count):
+        count=max(1,int(count))
+        with self.lock:
+            if count==self.num_classes:
+                return
+            self.num_classes=count
+            self.meta.setdefault("_schema",{})["num_classes"]=count
+            self.cache.clear()
+            self._save()
+            mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
+        self._merge_meta(mapping)
+    def _write_default(self,path):
+        cls=globals().get("UIReasoner")
+        if cls is None:
+            raise RuntimeError("UIReasoner未定义")
+        model=cls(self.num_classes)
+        ModelIO.save(model,path)
+    def _load_model(self,uid,path,device):
+        with self.lock:
+            cached=self.cache.get(uid)
+        if cached is not None and getattr(cached.head,"out_features",None)==self.num_classes:
+            cached.to(device)
+            cached.eval()
+            return cached
+        cls=globals().get("UIReasoner")
+        if cls is None:
+            raise RuntimeError("UIReasoner未定义")
+        model=cls(self.num_classes)
+        try:
+            if os.path.exists(path):
+                ModelIO.load(model,path)
+        except Exception as e:
+            log(f"ui_model_load_fail:{uid}:{e}")
+            self._write_default(path)
+            ModelIO.load(model,path)
+        model.to(device)
+        model.eval()
+        with self.lock:
+            self.cache[uid]=model
+        return model
+    def get_model(self,uid,device,num_classes):
+        if not uid:
+            return None
+        if num_classes!=self.num_classes:
+            self.set_num_classes(num_classes)
+        with self.lock:
+            items=self.meta.setdefault("items",{})
+            fname=self._fname(uid)
+            path=os.path.join(models_dir,fname)
+            info=items.get(uid)
+            if info is None:
+                info={"file":fname,"classes":self.num_classes,"created":time.time(),"updated":time.time()}
+            else:
+                info["file"]=fname
+                info["classes"]=self.num_classes
+                info["updated"]=time.time()
+            items[uid]=info
+            self._save()
+            mapping={k:v.get("file") for k,v in items.items()}
+        if not os.path.exists(path):
+            try:
+                self._write_default(path)
+            except Exception as e:
+                log(f"ui_model_init_fail:{uid}:{e}")
+        self._merge_meta(mapping)
+        return self._load_model(uid,path,device)
+    def save(self,uid,model):
+        if not uid or model is None:
+            return
+        with self.lock:
+            info=self.meta.setdefault("items",{}).get(uid)
+            path=os.path.join(models_dir,info.get("file")) if info and info.get("file") else None
+        if not path:
+            return
+        try:
+            ModelIO.save(model,path)
+        except Exception as e:
+            log(f"ui_model_save_fail:{uid}:{e}")
+    def _merge_meta(self,mapping):
+        if self.mapping_cache!=mapping:
+            self.mapping_cache=dict(mapping)
+            ModelMeta.merge({"ui_models":mapping})
 class UIInspector:
     def __init__(self,st):
         self.st=st
@@ -4236,6 +4509,11 @@ class UIInspector:
         self.schema_mtime=0.0
         self.labels=[]
         self.max_items=schema_defaults.get("max_items",48)
+        reg=getattr(self.st,"ui_registry",None)
+        if reg is None:
+            reg=UIModelRegistry()
+            setattr(self.st,"ui_registry",reg)
+        self.registry=reg
         self.model=None
         self.prototype={}
         self.prototype_count={}
@@ -4246,6 +4524,7 @@ class UIInspector:
         self.digit_clf=DigitClassifier()
         self.digit_ensemble=DigitEnsemble(self.digit_clf)
         self.window_hwnd=0
+        self.out_features=1
         self._refresh_schema(True)
     def analyze(self,img,events):
         self._refresh_schema()
@@ -4253,6 +4532,7 @@ class UIInspector:
         base=cv2.resize(img,(1280,800))
         cands=self._candidates(base,events)
         results=[]
+        out_features=max(1,len(self.labels))
         with torch.no_grad():
             for (x1,y1,x2,y2) in cands:
                 if x2-x1<20 or y2-y1<16:
@@ -4263,15 +4543,18 @@ class UIInspector:
                 visual=torch.from_numpy(cv2.resize(patch,(128,128))).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
                 layout_tensor=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
                 inter_tensor=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
-                logits,rep=self.model(visual,layout_tensor,inter_tensor)
-                conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item()) if logits.shape[-1]>0 else 0.5
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
                 inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
                 inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
                 signature=self._interaction_signature(layout_vals,inter_list)
+                result_id=self._stable_key(signature,(x1,y1,x2,y2))
+                model=self.registry.get_model(result_id,self.device,out_features)
+                if model is None:
+                    continue
+                logits,rep=model(visual,layout_tensor,inter_tensor)
+                conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item()) if logits.shape[-1]>0 else 0.5
                 enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
                 score=float(max(0.0,min(1.0,enhanced)))
-                result_id=self._stable_key(signature,(x1,y1,x2,y2))
                 pref_key=result_id
                 pref=self.st.preference_for_label(pref_key)
                 if pref=="ignore":
@@ -4319,13 +4602,12 @@ class UIInspector:
         self.labels=labels
         self.max_items=limit
         out_features=max(1,len(self.labels))
-        need_new=self.model is None or changed
-        if not need_new and getattr(self.model.head,"out_features",None)!=out_features:
-            need_new=True
-        if need_new:
-            self.model=UIReasoner(out_features)
-            self.model.eval()
-            self.model.to(self.device)
+        schema_changed=force or changed or self.out_features!=out_features
+        self.out_features=out_features
+        if hasattr(self,"registry") and self.registry:
+            self.registry.set_num_classes(out_features)
+        if schema_changed:
+            self.model=None
             self.prototype={}
             self.prototype_count={}
             self.memory.clear()
