@@ -4605,7 +4605,7 @@ class UIInspector:
                 existing_abs.append(tuple(entry.get("bounds",[0,0,0,0])))
         combined=deduped+extras
         combined.sort(key=lambda item:item.get("confidence",0.0),reverse=True)
-        return combined[:64]
+        return combined[:96]
     def _build_data_entry(self,name,bounds,value,text,confidence,key,base_shape,orig_shape):
         pref=self.st.preference_for_data(name)
         bw=max(1,base_shape[1])
@@ -4718,9 +4718,14 @@ class UIInspector:
                 self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,0.0)
                 return None
             best_txt,best_val,best_conf=fallback
-        if best_conf<0.6:
-            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,best_conf)
-        return best_txt,best_val,max(best_conf,0.5)
+        shape_conf=self._digit_shape_confidence(crop,best_txt)
+        if shape_conf<0.45:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,shape_conf)
+            return None
+        final_conf=max(best_conf,shape_conf)
+        if final_conf<0.6:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,final_conf)
+        return best_txt,best_val,max(final_conf,0.5)
     def _register_miss(self,img,abs_bounds,norm_bounds,confidence):
         try:
             if img is None or img.size==0:
@@ -4869,6 +4874,12 @@ class UIInspector:
         if not text:
             return None
         raw=str(text)
+        if not raw.strip():
+            return None
+        total=sum(1 for ch in raw if not ch.isspace())
+        digits=sum(1 for ch in raw if ch.isdigit())
+        if total==0 or digits/total<0.75:
+            return None
         if any(ch in raw for ch in ["-","."]):
             return None
         if re.search(r"[^0-9\s]",raw):
@@ -4890,6 +4901,109 @@ class UIInspector:
         if value<0:
             return None
         return joined,value
+    def _digit_shape_confidence(self,img,text):
+        if img is None or img.size==0:
+            return 0.0
+        digits=sum(1 for ch in str(text) if ch.isdigit())
+        if digits==0:
+            return 0.0
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        blur=cv2.GaussianBlur(norm,(3,3),0)
+        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,21,7)
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(2,3))
+        proc=cv2.morphologyEx(thr,cv2.MORPH_CLOSE,kernel,iterations=1)
+        contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        valid=[]
+        for c in contours:
+            x,y,w,h=cv2.boundingRect(c)
+            area=w*h
+            if area<12:
+                continue
+            if w<2 or h<5:
+                continue
+            ratio=h/max(1.0,w)
+            if ratio<0.5 or ratio>6.5:
+                continue
+            valid.append((x,y,w,h))
+        if not valid:
+            return 0.0
+        valid.sort(key=lambda b:b[0])
+        pw=proc.shape[1]
+        ink=float(np.count_nonzero(proc))/max(1,proc.size)
+        if ink<0.04 or ink>0.68:
+            return 0.0
+        comp_ratio=len(valid)/max(1.0,float(digits))
+        if comp_ratio<0.4 or comp_ratio>2.4:
+            return 0.0
+        span=valid[-1][0]+valid[-1][2]-valid[0][0]
+        coverage=float(span)/max(1,pw)
+        baseline=float(np.median([y+h for _,y,_,h in valid]))
+        align=sum(1 for _,y,_,h in valid if abs((y+h)-baseline)<=max(3,int(max(1,h)*0.12)))
+        align_ratio=align/max(1,len(valid))
+        structure=max(0.0,min(1.0,coverage*0.6+align_ratio*0.4))
+        sharp=cv2.Canny(norm,40,120)
+        edge=float(np.count_nonzero(sharp))/max(1,sharp.size)
+        if edge<0.02:
+            return 0.0
+        detail=min(1.0,edge*5.0)
+        balance=1.0-abs(comp_ratio-1.0)
+        balance=max(0.0,min(1.0,balance))
+        return float(max(0.0,min(1.0,0.35*structure+0.35*balance+0.3*detail)))
+    def _digit_block_confidence(self,img):
+        if img is None or img.size==0:
+            return 0.0
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img
+        norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
+        blur=cv2.GaussianBlur(norm,(5,5),0)
+        thr=cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,25,9)
+        kernel=cv2.getStructuringElement(cv2.MORPH_RECT,(2,3))
+        proc=cv2.morphologyEx(thr,cv2.MORPH_CLOSE,kernel,iterations=2)
+        contours,_=cv2.findContours(proc,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        valid=0
+        widths=[]
+        heights=[]
+        h=proc.shape[0]
+        w=proc.shape[1]
+        for c in contours:
+            x,y,bw,bh=cv2.boundingRect(c)
+            if bw<3 or bh<6:
+                continue
+            if bw>int(w*0.95) or bh>int(h*0.95):
+                continue
+            ratio=bh/max(1.0,bw)
+            if ratio<0.4 or ratio>7.0:
+                continue
+            area=bw*bh
+            if area<20:
+                continue
+            valid+=1
+            widths.append(float(bw))
+            heights.append(float(bh))
+        if valid==0:
+            return 0.0
+        ink=float(np.count_nonzero(proc))/max(1,proc.size)
+        if ink<0.03 or ink>0.75:
+            return 0.0
+        mean_w=float(sum(widths))/len(widths)
+        mean_h=float(sum(heights))/len(heights)
+        ar=mean_h/max(1.0,mean_w)
+        if ar<0.6 or ar>4.5:
+            return 0.0
+        edge=cv2.Canny(norm,40,120)
+        edge_ratio=float(np.count_nonzero(edge))/max(1,edge.size)
+        if edge_ratio<0.02:
+            return 0.0
+        density=min(1.0,max(0.0,ink*1.6))
+        component=min(1.0,max(0.0,valid/8.0))
+        detail=min(1.0,edge_ratio*4.5)
+        return float(max(0.0,min(1.0,0.4*density+0.35*component+0.25*detail)))
     def _ocr_digits(self,img):
         if img is None or img.size==0:
             return "",0.0
@@ -5063,7 +5177,7 @@ class UIInspector:
             score=max(0.0,min(1.0,var*1.4+contrast*0.9+bonus))
             value=float(np.mean(patch))
             res.append((box[0],box[1],box[2],box[3],score,value))
-        limit=max(12,min(64,self.max_items*2))
+        limit=max(12,min(96,self.max_items*2))
         res=sorted(res,key=lambda r:r[4],reverse=True)[:limit]
         return res
     def _global_digit_scan(self,img,existing):
@@ -5076,7 +5190,7 @@ class UIInspector:
             norm=clahe.apply(norm)
         except:
             pass
-        blurs=[cv2.GaussianBlur(norm,(3,3),0),cv2.GaussianBlur(norm,(5,5),0)]
+        blurs=[cv2.GaussianBlur(norm,(3,3),0),cv2.GaussianBlur(norm,(5,5),0),cv2.GaussianBlur(norm,(7,7),0)]
         masks=[]
         for blur in blurs:
             masks.append(cv2.adaptiveThreshold(blur,255,cv2.ADAPTIVE_THRESH_MEAN_C,cv2.THRESH_BINARY_INV,21,7))
@@ -5131,6 +5245,10 @@ class UIInspector:
                         skip=True
                         break
                 if skip:
+                    continue
+                region=img[by1:by2,bx1:bx2]
+                likelihood=self._digit_block_confidence(region)
+                if likelihood<0.35:
                     continue
                 res.append(box)
                 exist.append(box)
