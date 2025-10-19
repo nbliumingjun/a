@@ -5399,22 +5399,23 @@ class Main(QMainWindow):
             combo.currentTextChanged.connect(lambda val,lab=name:self.on_data_pref_changed(lab,val))
             self.data_table.setCellWidget(idx,4,combo)
             self.data_pref_editors.append(combo)
+            stable_key=it.get("key") or name
             color=it.get("color")
-            key=it.get("key")
-            if key and (not color or len(color)!=3):
-                color=self.state.ensure_data_color(key)
-                it["color"]=list(color)
+            if not isinstance(color,(list,tuple)) or len(color)!=3:
+                color=self.state.ensure_data_color(stable_key)
+                it["color"]=[int(color[0]),int(color[1]),int(color[2])]
             if color and len(color)==3:
-                col=tuple(int(c) for c in color)
-                r=int(col[2])
-                g=int(col[1])
-                b=int(col[0])
+                b=int(color[0])
+                g=int(color[1])
+                r=int(color[2])
                 bg=QColor((r+255)//2,(g+255)//2,(b+255)//2)
+                fg=QColor(0,0,0) if 0.299*r+0.587*g+0.114*b>186 else QColor(255,255,255)
                 for col_idx in range(4):
                     item=self.data_table.item(idx,col_idx)
                     if item:
                         item.setBackground(bg)
-                combo.setStyleSheet(f"background-color: rgba({r},{g},{b},120);")
+                        item.setForeground(fg)
+                combo.setStyleSheet(f"background-color: rgba({r},{g},{b},120); color: rgb({fg.red()},{fg.green()},{fg.blue()});")
             else:
                 combo.setStyleSheet("")
     def refresh_windows(self):
