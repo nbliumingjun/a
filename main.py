@@ -113,10 +113,11 @@ def _ver(name,modname=None):
             return pr.get_distribution(modname or name).version
         except:
             return ""
-def deps_check():
+def deps_check(auto_prompt=True):
     core=[("numpy","numpy"),("cv2","opencv-python"),("psutil","psutil"),("mss","mss"),("PySide6","PySide6"),("win32gui","pywin32"),("win32con","pywin32"),("win32api","pywin32"),("win32process","pywin32"),("torch","torch"),("torchvision","torchvision"),("scipy","scipy"),("sklearn","scikit-learn"),("pynvml","pynvml"),("comtypes","comtypes"),("pytesseract","pytesseract")]
     attempt=0
     max_attempts=3
+    notice=None
     while True:
         miss=[]
         for mod,pkg in core:
@@ -126,7 +127,8 @@ def deps_check():
             break
         attempt+=1
         pkg_names=sorted(set(pkg for _,pkg in miss))
-        _msgbox("依赖准备","检测到缺失依赖:\n"+"\n".join(pkg_names)+"\n系统将自动安装")
+        if auto_prompt:
+            _msgbox("依赖准备","检测到缺失依赖:\n"+"\n".join(pkg_names)+"\n系统将自动安装")
         cmd=[sys.executable,"-m","pip","install"]+pkg_names
         try:
             print("installing dependency bundle:"+" ".join(pkg_names))
@@ -146,9 +148,10 @@ def deps_check():
             print(hint)
         if attempt>=max_attempts:
             remain=sorted(set(mod for mod,_ in miss))
-            msg="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)+f"\n请检查网络或权限设置，并查看日志:{log_path}"
-            print(msg)
-            _msgbox("依赖安装",msg)
+            notice="自动安装失败，请手动安装缺失依赖: "+", ".join(remain)+f"\n请检查网络或权限设置，并查看日志:{log_path}"
+            print(notice)
+            if auto_prompt:
+                _msgbox("依赖安装",notice)
             break
         time.sleep(1)
     miss_final=[]
@@ -157,14 +160,24 @@ def deps_check():
             miss_final.append(mod)
     if miss_final:
         msg="依赖未满足:"+",".join(miss_final)
-        _msgbox("依赖检查",msg)
-        raise RuntimeError(msg)
-    d={"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml"),"comtypes":_ver("comtypes"),"pytesseract":_ver("pytesseract")}
+        if auto_prompt:
+            _msgbox("依赖检查",msg)
+        data={"ready":False,"missing":miss_final,"message":notice or msg}
+        with open(deps_path,"w",encoding="utf-8") as f:
+            json.dump(data,f,ensure_ascii=False,indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        return data
+    d={"ready":True,"missing":[],"message":"","versions":{"numpy":_ver("numpy"),"opencv-python":_ver("opencv-python","opencv-python"),"psutil":_ver("psutil"),"mss":_ver("mss"),"PySide6":_ver("PySide6"),"pywin32":_ver("pywin32","pywin32"),"torch":_ver("torch"),"torchvision":_ver("torchvision"),"scipy":_ver("scipy"),"scikit-learn":_ver("scikit-learn","scikit-learn"),"pynvml":_ver("pynvml"),"comtypes":_ver("comtypes"),"pytesseract":_ver("pytesseract")}}
     with open(deps_path,"w",encoding="utf-8") as f:
         json.dump(d,f,ensure_ascii=False,indent=2)
         f.flush()
         os.fsync(f.fileno())
-deps_check()
+    return d
+deps_status=deps_check()
+DEPS_READY=bool(deps_status.get("ready"))
+DEPS_MISSING=list(deps_status.get("missing") or [])
+DEPS_MESSAGE=str(deps_status.get("message") or "")
 import numpy as np
 import cv2
 import psutil
@@ -1719,6 +1732,7 @@ class State(QObject):
     signal_ui_ready=Signal(list)
     signal_data_ready=Signal(list)
     signal_window_stats=Signal(list)
+    signal_deps=Signal(bool,object,str)
     MARK=0x22ACE777
     def __init__(self):
         super().__init__()
@@ -1813,9 +1827,28 @@ class State(QObject):
         self._pending_window=None
         self._pending_waiter=None
         self._pending_lock=threading.Lock()
+        self.deps_ready=DEPS_READY
+        self.deps_missing=list(DEPS_MISSING)
+        self.deps_message=DEPS_MESSAGE
+        self.deps_ready_event=threading.Event()
+        if self.deps_ready:
+            self.deps_ready_event.set()
+        else:
+            self.deps_ready_event.clear()
+        self._deps_refresh_lock=threading.Lock()
+        self._deps_refreshing=False
+        self._model_thread_started=False
         self._init_day_files()
-        threading.Thread(target=self._ensure_model_bg,daemon=True).start()
+        self._start_model_thread()
         self.signal_window_stats.emit([])
+    def _start_model_thread(self):
+        if self._model_thread_started:
+            return
+        if not self.deps_ready:
+            self.signal_modelprog.emit(0,"等待依赖")
+            return
+        self._model_thread_started=True
+        threading.Thread(target=self._ensure_model_bg,daemon=True).start()
     def _ensure_model_bg(self):
         try:
             self.signal_modelprog.emit(1,"准备模型")
@@ -1831,7 +1864,46 @@ class State(QObject):
             log(f"model ensure error:{e}")
             self.signal_tip.emit(f"模型错误:{e}")
             self.model_ready_event.set()
+    def trigger_deps_retry(self,auto):
+        if self.deps_ready:
+            return
+        with self._deps_refresh_lock:
+            if self._deps_refreshing:
+                return
+            self._deps_refreshing=True
+        self.signal_tip.emit("自动重试依赖" if auto else "正在检查依赖")
+        def worker():
+            ready=False
+            missing=[]
+            message=""
+            try:
+                status=deps_check(auto_prompt=not auto)
+                ready=bool(status.get("ready"))
+                missing=list(status.get("missing") or [])
+                message=str(status.get("message") or "")
+                self.deps_ready=ready
+                self.deps_missing=missing
+                self.deps_message=message
+                if ready:
+                    self.deps_ready_event.set()
+                    self.signal_tip.emit("依赖已就绪")
+                else:
+                    self.deps_ready_event.clear()
+                    txt=message or ("依赖缺失:"+"、".join(missing) if missing else "依赖未就绪")
+                    self.signal_tip.emit(txt)
+            finally:
+                with self._deps_refresh_lock:
+                    self._deps_refreshing=False
+            if not ready and not message and not missing:
+                message="依赖检查失败"
+            self.signal_deps.emit(ready,missing,message)
+            if ready:
+                self._start_model_thread()
+        threading.Thread(target=worker,daemon=True).start()
     def wait_model(self,timeout=0):
+        if not self.deps_ready_event.wait(timeout):
+            if not self.deps_ready:
+                raise ModelIntegrityError(self.deps_message or "依赖未就绪")
         self.model_ready_event.wait(timeout)
         if self.model_error:
             raise ModelIntegrityError(self.model_error)
@@ -5589,8 +5661,12 @@ class Main(QMainWindow):
         self.cmb=QComboBox()
         self.btn_opt=QPushButton("优化")
         self.btn_ui=QPushButton("识别")
+        self.btn_retry=QPushButton("重试依赖")
         self.chk_preview=QCheckBox("预览开关")
         self.chk_preview.setChecked(self.state.preview_on)
+        self.btn_opt.setEnabled(False)
+        self.btn_ui.setEnabled(False)
+        self.btn_retry.setEnabled(False)
         self.lbl_mode=QLabel("模式:初始化")
         self.lbl_fps=QLabel("帧率:0")
         self.lbl_rec=QLabel("0B")
@@ -5659,6 +5735,7 @@ class Main(QMainWindow):
         lb.addWidget(self.lbl_ver)
         lb.addStretch(1)
         lb.addWidget(self.lbl_tip,2)
+        lb.addWidget(self.btn_retry)
         lb.addWidget(self.progress,2)
         lb.addWidget(self.model_progress,2)
         root=QVBoxLayout()
@@ -5670,6 +5747,7 @@ class Main(QMainWindow):
         self.setCentralWidget(box)
         self.btn_opt.clicked.connect(self.on_opt)
         self.btn_ui.clicked.connect(self.on_ui)
+        self.btn_retry.clicked.connect(self.on_retry_deps)
         self.chk_preview.stateChanged.connect(self.on_preview_changed)
         self.cmb.currentIndexChanged.connect(self.on_sel_changed)
         self.state.signal_preview.connect(self.on_preview)
@@ -5680,6 +5758,7 @@ class Main(QMainWindow):
         self.state.signal_tip.connect(self.on_tip)
         self.state.signal_optprog.connect(self.on_optprog)
         self.state.signal_modelprog.connect(self.on_modelprog)
+        self.state.signal_deps.connect(self.on_deps)
         self.state.signal_ui_ready.connect(self.on_ui_ready)
         self.state.signal_data_ready.connect(self.on_data_ready)
         self.on_data_ready([])
@@ -5699,6 +5778,8 @@ class Main(QMainWindow):
         self.usage_timer=QTimer(self)
         self.usage_timer.timeout.connect(self.on_usage)
         self.usage_timer.start(1000)
+        self.deps_retry_timer=QTimer(self)
+        self.deps_retry_timer.timeout.connect(self.on_auto_retry_deps)
         self.learning_thread=None
         self.training_thread=None
         self._optim_flag=threading.Event()
@@ -5712,6 +5793,10 @@ class Main(QMainWindow):
         self.start_wait_timer=QTimer(self)
         self.start_wait_timer.timeout.connect(self.on_model_ready_check)
         self.start_wait_timer.start(200)
+        self._deps_ready=self.state.deps_ready
+        self.on_deps(self.state.deps_ready,self.state.deps_missing,self.state.deps_message)
+        if not self.state.deps_ready:
+            self.deps_retry_timer.start(8000)
         self.refresh_windows()
     def preview_enabled(self):
         return self.chk_preview.isChecked()
@@ -5758,6 +5843,29 @@ class Main(QMainWindow):
         self.lbl_ver.setText(s)
     def on_tip(self,s):
         self.lbl_tip.setText(s)
+    def on_deps(self,ready,missing,message):
+        self._deps_ready=ready
+        busy=getattr(self.state,"_deps_refreshing",False)
+        if ready:
+            if self.deps_retry_timer.isActive():
+                self.deps_retry_timer.stop()
+            if self.state.model_ready_event.is_set() and not self.state.optimizing and not self._ui_busy:
+                self.btn_opt.setEnabled(True)
+                self.btn_ui.setEnabled(True)
+            else:
+                self.btn_opt.setEnabled(False)
+                self.btn_ui.setEnabled(False)
+            self.btn_retry.setEnabled(False)
+            if not self.state.model_ready_event.is_set():
+                self.lbl_tip.setText("依赖已就绪，等待模型")
+        else:
+            info=message or ("依赖缺失:"+"、".join(missing) if missing else "依赖未就绪")
+            self.lbl_tip.setText(info)
+            self.btn_opt.setEnabled(False)
+            self.btn_ui.setEnabled(False)
+            self.btn_retry.setEnabled(not busy)
+            if not self.deps_retry_timer.isActive():
+                self.deps_retry_timer.start(8000)
     def on_optprog(self,val,txt):
         self.progress.setValue(int(val))
         info=f"{int(val)}%"
@@ -5770,6 +5878,17 @@ class Main(QMainWindow):
         if txt:
             info=f"{info} {txt}"
         self.model_progress.setFormat(info)
+    def on_retry_deps(self):
+        if self._deps_ready:
+            return
+        self.btn_retry.setEnabled(False)
+        self.state.trigger_deps_retry(False)
+    def on_auto_retry_deps(self):
+        if self._deps_ready:
+            if self.deps_retry_timer.isActive():
+                self.deps_retry_timer.stop()
+            return
+        self.state.trigger_deps_retry(True)
     def on_ui_ready(self,items):
         self.ui_table.setRowCount(0)
         limited=items[:60]
@@ -6211,7 +6330,14 @@ class Main(QMainWindow):
         self._ui_last_frame=None
         self.set_mode("learning",force=True)
     def on_model_ready_check(self):
+        if not self.state.deps_ready:
+            info=self.state.deps_message or ("依赖缺失:"+"、".join(self.state.deps_missing) if self.state.deps_missing else "依赖未就绪")
+            self.lbl_tip.setText(info)
+            self.btn_opt.setEnabled(False)
+            self.btn_ui.setEnabled(False)
+            return
         if not self.state.model_ready_event.is_set():
+            self.lbl_tip.setText("模型准备中")
             return
         self.start_wait_timer.stop()
         if self.state.model_error:
@@ -6221,6 +6347,9 @@ class Main(QMainWindow):
         self.state.running=True
         self.state.stop_event.clear()
         self.lbl_tip.setText("资源已就绪，进入学习模式")
+        if not self.state.optimizing and not self._ui_busy:
+            self.btn_opt.setEnabled(True)
+            self.btn_ui.setEnabled(True)
         self.set_mode("learning",force=True)
     def closeEvent(self,event):
         self.state.stop_event.set()
