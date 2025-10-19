@@ -675,9 +675,9 @@ class PolicyTransformer(nn.Module):
 class PolicyHead(nn.Module):
     def __init__(self,dim=192):
         super().__init__()
-        self.fc=nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,dim),nn.GELU(),nn.Linear(dim,2))
+        self.core=nn.Sequential(nn.LayerNorm(dim),nn.Linear(dim,dim),nn.GELU())
     def forward(self,x):
-        return self.fc(x)
+        return self.core(x)
 class PolicyModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -686,8 +686,14 @@ class PolicyModel(nn.Module):
         self.temporal=nn.GRU(192,192,batch_first=True)
         self.transformer=PolicyTransformer()
         self.head=PolicyHead(192)
+        self.click_proj=nn.Linear(192,2)
+        self.path_proj=nn.Linear(192,1)
+        self.data_map_proj=nn.Linear(192,1)
+        self.data_head=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,192),nn.GELU(),nn.Linear(192,16))
         self.value=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,192),nn.GELU(),nn.Linear(192,1))
-    def forward(self,img,context,history=None):
+        self.traj_encoder=nn.GRU(4,192,batch_first=True)
+        self.sequence_attn=nn.MultiheadAttention(192,6,batch_first=True)
+    def forward(self,img,context,history=None,trajectory=None,traj_mask=None):
         feat=self.backbone(img)
         feat=self.reducer(feat)
         B,C,H,W=feat.shape
@@ -697,12 +703,25 @@ class PolicyModel(nn.Module):
             tokens=torch.cat([h,tokens],dim=1)
         if context is not None and context.shape[1]>0:
             tokens=torch.cat([context,tokens],dim=1)
-        enc=self.transformer(tokens)
-        out=self.head(enc)
-        value=self.value(enc.mean(dim=1))
-        logits=out[:, -H*W:, :]
-        logits=logits.view(B,H,W,2).permute(0,3,1,2)
-        return logits,value
+        if trajectory is not None and trajectory.shape[1]>0:
+            traj_feat,_=self.traj_encoder(trajectory)
+            if traj_mask is not None and traj_mask.shape[:2]==traj_feat.shape[:2]:
+                mask=traj_mask.unsqueeze(-1)
+                denom=mask.sum(dim=1).clamp(min=1.0)
+                pooled=(traj_feat*mask).sum(dim=1)/denom
+            else:
+                pooled=traj_feat.mean(dim=1)
+            tokens=torch.cat([pooled.unsqueeze(1),tokens],dim=1)
+        attn,_=self.sequence_attn(tokens,tokens,tokens,need_weights=False)
+        enc=self.transformer(attn)
+        core=self.head(enc)
+        value=self.value(core.mean(dim=1))
+        tail=core[:, -H*W:, :]
+        logits=self.click_proj(tail).view(B,H,W,2).permute(0,3,1,2)
+        path=self.path_proj(tail).view(B,H,W).unsqueeze(1)
+        data_map=self.data_map_proj(tail).view(B,H,W).unsqueeze(1)
+        data_vec=self.data_head(core.mean(dim=1))
+        return logits,value,path,data_map,data_vec
 class ModelInitializer:
     @staticmethod
     def default_bytes():
@@ -1124,9 +1143,17 @@ class StrategyEngine:
         ctx=self.set_context(events or [])
         hist=self._history_tensor()
         with torch.no_grad():
-            logits,value=self.model(ten,ctx,hist)
+            logits,value,path_map,data_map,data_vec=self.model(ten,ctx,hist,None,None)
             prob=torch.sigmoid(logits)
-            value_score=float(torch.sigmoid(value).mean().item())
+            base_value=float(torch.sigmoid(value).mean().item())
+            path_heat=torch.sigmoid(path_map)[0,0].detach().cpu().numpy()
+            data_heat=torch.sigmoid(data_map)[0,0].detach().cpu().numpy()
+            vec=torch.tanh(data_vec).detach().cpu().numpy()
+        if vec.size>0:
+            data_strength=float(np.mean(vec))
+            value_score=0.7*base_value+0.3*(0.5+0.5*data_strength)
+        else:
+            value_score=base_value
         self.last_value=value_score
         left=prob[0,0].cpu().numpy()
         self.frame_memory.append(left)
@@ -1152,6 +1179,9 @@ class StrategyEngine:
         risk_factor=float(decision[0,2].item())
         gate=float(min(1.0,max(0.0,0.32*gate_plan+0.36*multi_factor+0.2*risk_factor+0.12*value_score)))
         score=cv2.resize(left,(w,h),interpolation=cv2.INTER_CUBIC)
+        path_overlay=cv2.resize(path_heat,(w,h),interpolation=cv2.INTER_CUBIC)
+        data_overlay=cv2.resize(data_heat,(w,h),interpolation=cv2.INTER_CUBIC)
+        score=np.clip(score*0.55+path_overlay*0.3+data_overlay*0.15,0,1)
         goal=self.synthesize_goal_map(ui_elements,w,h)
         if goal is not None:
             if not self.prefers_high:
@@ -1306,32 +1336,52 @@ class StrategyEngine:
             if len(batch)==4:
                 img,ctx,label,hist=batch
                 bs=img.shape[0]
+                data=torch.zeros((bs,16),dtype=torch.float32)
+                traj=torch.zeros((bs,1,4),dtype=torch.float32)
+                mask=torch.ones((bs,1),dtype=torch.float32)
                 val=torch.zeros((bs,1),dtype=torch.float32)
                 adv=torch.zeros((bs,1),dtype=torch.float32)
                 weight=torch.ones((bs,1),dtype=torch.float32)
-            else:
+            elif len(batch)==7:
                 img,ctx,label,hist,val,adv,weight=batch
+                bs=img.shape[0]
+                data=torch.zeros((bs,16),dtype=torch.float32)
+                traj=torch.zeros((bs,1,4),dtype=torch.float32)
+                mask=torch.ones((bs,1),dtype=torch.float32)
+            else:
+                img,ctx,label,hist,data,traj,mask,val,adv,weight=batch
             processed+=1
             img=img.to(self.device)
             ctx=ctx.to(self.device).float()
             hist=hist.to(self.device).float()
             label=label.to(self.device).float()
+            data=data.to(self.device).float()
+            traj=traj.to(self.device).float()
+            mask=mask.to(self.device).float()
             opt.zero_grad()
             val_t=val.to(self.device).float()
             adv_t=adv.to(self.device).float()
             weight_t=weight.to(self.device).float()
-            logits,value=self.model(img,ctx,hist)
-            if logits.shape[-2:]!=label.shape[-2:]:
-                label=F.interpolate(label,size=logits.shape[-2:],mode="bilinear",align_corners=False)
-            base_loss=F.binary_cross_entropy_with_logits(logits,label)
-            weighted=F.binary_cross_entropy_with_logits(logits,label,reduction="none")
+            logits,value,path_pred,data_map_pred,data_vec=self.model(img,ctx,hist,traj,mask)
+            click_target=label[:,0:2]
+            path_target=label[:,2:3]
+            map_target=label[:,3:4]
+            if logits.shape[-2:]!=click_target.shape[-2:]:
+                click_target=F.interpolate(click_target,size=logits.shape[-2:],mode="bilinear",align_corners=False)
+                path_target=F.interpolate(path_target,size=logits.shape[-2:],mode="bilinear",align_corners=False)
+                map_target=F.interpolate(map_target,size=logits.shape[-2:],mode="bilinear",align_corners=False)
+            base_loss=F.binary_cross_entropy_with_logits(logits,click_target)
+            weighted=F.binary_cross_entropy_with_logits(logits,click_target,reduction="none")
             rl_loss=(weighted*(weight_t.view(weight_t.shape[0],1,1,1))).mean()
             value_loss=F.smooth_l1_loss(value,val_t)
             prob=torch.sigmoid(logits)
             entropy=-(prob*torch.log(prob+1e-6)+(1-prob)*torch.log(1-prob+1e-6)).mean()
             entropy_weight=self.hparams.adaptive_entropy() if self.hparams else 0.02
             neg_factor=torch.relu(-adv_t).mean()
-            loss=0.55*base_loss+0.35*rl_loss+0.5*value_loss-entropy_weight*entropy+0.05*neg_factor
+            path_loss=F.mse_loss(torch.sigmoid(path_pred),path_target)
+            map_loss=F.mse_loss(torch.sigmoid(data_map_pred),map_target)
+            data_loss=F.smooth_l1_loss(data_vec,data)
+            loss=0.4*base_loss+0.25*rl_loss+0.3*value_loss+0.12*path_loss+0.08*map_loss+0.15*data_loss-entropy_weight*entropy+0.05*neg_factor
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(),1.0)
             nn.utils.clip_grad_norm_(self.semantic.parameters(),1.0)
@@ -1755,6 +1805,9 @@ class State(QObject):
         with self.rect_lock:
             self.data_points=[dict(p) for p in sanitized]
         return [dict(p) for p in sanitized]
+    def current_data_snapshot(self):
+        with self.rect_lock:
+            return [dict(p) for p in self.data_points] if isinstance(self.data_points,list) else []
     def _rescale_data_points(self,cr):
         try:
             cw=max(0,int(cr[2]-cr[0]))
@@ -2417,7 +2470,49 @@ class State(QObject):
                     mm.append((sec,int(sx),int(sy),int(ins)))
                     mm_ns.append(ns)
             duration=release_sec-press_sec if release_sec and press_sec else 0.0
+            snapshot=self.current_data_snapshot()
+            traj_seq=[]
+            if mm:
+                start=mm[0][0]
+                end=mm[-1][0]
+                span=max(end-start,1e-3)
+                for sec,lx,ly,inside in mm:
+                    traj_seq.append({"t":max(0.0,min(1.0,(sec-start)/span)),"x":max(0.0,min(1.0,float(lx)/2560.0)),"y":max(0.0,min(1.0,float(ly)/1600.0)),"inside":int(inside)})
+            if not traj_seq:
+                traj_seq.append({"t":0.0,"x":max(0.0,min(1.0,float(plx)/2560.0)),"y":max(0.0,min(1.0,float(ply)/1600.0)),"inside":int(ins_press)})
+            if all(item.get("t",0.0)<0.999 for item in traj_seq):
+                traj_seq.append({"t":1.0,"x":max(0.0,min(1.0,float(rlx)/2560.0)),"y":max(0.0,min(1.0,float(rly)/1600.0)),"inside":int(ins_release)})
+            path_points=[(max(0.0,min(1.0,float(plx)/2560.0)),max(0.0,min(1.0,float(ply)/1600.0)))]
+            path_points.extend((item.get("x",0.0),item.get("y",0.0)) for item in traj_seq)
+            path_points.append((max(0.0,min(1.0,float(rlx)/2560.0)),max(0.0,min(1.0,float(rly)/1600.0))))
+            data_links=[]
+            for item in snapshot:
+                nb=item.get("norm_bounds")
+                if not isinstance(nb,(list,tuple)) or len(nb)!=4:
+                    continue
+                try:
+                    nx1=float(nb[0])
+                    ny1=float(nb[1])
+                    nx2=float(nb[2])
+                    ny2=float(nb[3])
+                except:
+                    continue
+                nx1=max(0.0,min(1.0,nx1))
+                ny1=max(0.0,min(1.0,ny1))
+                nx2=max(nx1,min(1.0,nx2))
+                ny2=max(ny1,min(1.0,ny2))
+                hit=False
+                for (nx,ny) in path_points:
+                    if nx>=nx1 and nx<=nx2 and ny>=ny1 and ny<=ny2:
+                        hit=True
+                        break
+                if not hit:
+                    continue
+                data_links.append({"key":item.get("key"),"value":item.get("value"),"preference":item.get("preference"),"norm_bounds":[nx1,ny1,nx2,ny2],"confidence":float(item.get("confidence",0.5))})
             obj={"id":str(uuid.uuid4()),"source":source,"mode":mode or "unknown","type":typ,"press_t":press_sec,"press_t_ns":press_ns,"press_x":px,"press_y":py,"press_lx":plx,"press_ly":ply,"release_t":release_sec,"release_t_ns":release_ns,"release_x":rx,"release_y":ry,"release_lx":rlx,"release_ly":rly,"moves":mm,"moves_ns":mm_ns,"window_title":self.selected_title,"rect":[0,0,2560,1600],"frame_id":frame_id,"ins_press":int(ins_press),"ins_release":int(ins_release),"clip_ids":clip_ids or [],"session_id":self.session_id,"duration":float(duration)}
+            obj["trajectory"]=traj_seq
+            obj["data_snapshot"]=snapshot
+            obj["data_bindings"]=data_links
             self.events_writer.append(obj)
             self.event_count+=1
             self.signal_counts.emit(self.event_count)
@@ -2425,6 +2520,33 @@ class State(QObject):
             if hasattr(self,"hyper"):
                 self.hyper.observe_event(obj)
                 self.hyper.adjust()
+        except:
+            pass
+    def record_missed_region(self,img,meta):
+        try:
+            if img is None or img.size==0:
+                return
+            self._init_day_files()
+            day=os.path.join(exp_dir,self.day_tag)
+            miss_dir=os.path.join(day,"missed")
+            os.makedirs(miss_dir,exist_ok=True)
+            stamp=time.time_ns()
+            path=os.path.join(miss_dir,f"{stamp}.png")
+            resized=cv2.resize(img,(2560,1600),interpolation=cv2.INTER_LANCZOS4)
+            ok,buf=cv2.imencode(".png",resized,[int(cv2.IMWRITE_PNG_COMPRESSION),self.png_comp])
+            if not ok:
+                return
+            with open(path,"wb") as f:
+                f.write(buf.tobytes())
+                f.flush()
+                os.fsync(f.fileno())
+            entry=dict(meta)
+            entry["id"]=str(uuid.uuid4())
+            entry["path"]=path
+            entry["timestamp"]=time.time()
+            meta_path=os.path.join(miss_dir,"meta.jsonl")
+            with open(meta_path,"a",encoding="utf-8") as f:
+                f.write(json.dumps(entry,ensure_ascii=False)+"\n")
         except:
             pass
     def _update_activity(self,event):
@@ -3239,12 +3361,20 @@ class OptimizerThread(threading.Thread):
             return False
         fr=frames.get(fid)
         if not fr:
-            return False
-        try:
-            w=int(fr.get("w",0))
-            h=int(fr.get("h",0))
-        except:
-            return False
+            size=e.get("frame_size") if isinstance(e.get("frame_size"),(list,tuple)) else None
+            if not size or len(size)<2:
+                return False
+            try:
+                w=int(size[0])
+                h=int(size[1])
+            except:
+                return False
+        else:
+            try:
+                w=int(fr.get("w",0))
+                h=int(fr.get("h",0))
+            except:
+                return False
         if w<=0 or h<=0:
             return False
         try:
@@ -3281,12 +3411,16 @@ class OptimizerThread(threading.Thread):
                         continue
                     fid=e.get("frame_id")
                     fr=frames.get(fid)
+                    if not fr and e.get("frame_path"):
+                        fr={"path":e.get("frame_path"),"w":(e.get("frame_size") or [2560,1600])[0],"h":(e.get("frame_size") or [2560,1600])[1]}
                     if not fr:
                         continue
                     img=self._get_frame_image(fr.get("path"))
+                    if img is None and e.get("frame_path"):
+                        img=self._get_frame_image(e.get("frame_path"))
                     if img is None:
                         continue
-                    label=self._make_label(e,img.shape[1],img.shape[0])
+                    label,data_vec,traj=self._make_label(e,img.shape[1],img.shape[0])
                     if label is None:
                         continue
                     ctx=self._context_tensor(list(hist),len(hist)-1)
@@ -3295,7 +3429,7 @@ class OptimizerThread(threading.Thread):
                     tensor_img=torch.from_numpy(cv2.resize(img,size)).permute(2,0,1).float()/255.0
                     reward=self._reward_of_event(e)
                     value,adv,weight=self._rl_signal(reward)
-                    pending.append((tensor_img,ctx,label,hist_t,value,adv,weight))
+                    pending.append((tensor_img,ctx,label,data_vec,traj,hist_t,value,adv,weight))
                     if len(pending)>=bs:
                         produced+=1
                         yield self._stack_batch(pending[:bs])
@@ -3309,29 +3443,44 @@ class OptimizerThread(threading.Thread):
     def _stack_batch(self,samples):
         imgs=[]
         ctxs=[]
-        labels=[]
+        grids=[]
+        datas=[]
+        trajs=[]
+        lengths=[]
         hists=[]
         vals=[]
         advs=[]
         weights=[]
-        for (img,ctx,label,hist,val,adv,weight) in samples:
+        for (img,ctx,label,data_vec,traj,hist,val,adv,weight) in samples:
             imgs.append(img.float())
-            if isinstance(ctx,torch.Tensor):
-                ctxs.append(ctx.to(torch.float32))
-            else:
-                ctxs.append(torch.tensor(ctx,dtype=torch.float32))
-            if isinstance(label,torch.Tensor):
-                labels.append(label.to(torch.float32))
-            else:
-                labels.append(torch.tensor(label,dtype=torch.float32))
-            if isinstance(hist,torch.Tensor):
-                hists.append(hist.to(torch.float32))
-            else:
-                hists.append(torch.tensor(hist,dtype=torch.float32))
+            ctxs.append(ctx.to(torch.float32) if isinstance(ctx,torch.Tensor) else torch.tensor(ctx,dtype=torch.float32))
+            grids.append(label.to(torch.float32) if isinstance(label,torch.Tensor) else torch.tensor(label,dtype=torch.float32))
+            datas.append(data_vec.to(torch.float32) if isinstance(data_vec,torch.Tensor) else torch.tensor(data_vec,dtype=torch.float32))
+            traj_tensor=traj if isinstance(traj,torch.Tensor) else torch.tensor(traj,dtype=torch.float32)
+            if traj_tensor.ndim==1:
+                traj_tensor=traj_tensor.unsqueeze(0)
+            if traj_tensor.numel()==0 or traj_tensor.shape[0]==0:
+                traj_tensor=torch.zeros((1,4),dtype=torch.float32)
+            trajs.append(traj_tensor.to(torch.float32))
+            lengths.append(int(traj_tensor.shape[0]))
+            hists.append(hist.to(torch.float32) if isinstance(hist,torch.Tensor) else torch.tensor(hist,dtype=torch.float32))
             vals.append(float(val))
             advs.append(float(adv))
             weights.append(float(weight))
-        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(labels,dim=0),torch.stack(hists,dim=0),torch.tensor(vals,dtype=torch.float32).unsqueeze(1),torch.tensor(advs,dtype=torch.float32).unsqueeze(1),torch.tensor(weights,dtype=torch.float32).unsqueeze(1))
+        max_len=max(lengths) if lengths else 1
+        padded=[]
+        mask_list=[]
+        for traj_tensor,length in zip(trajs,lengths):
+            steps=traj_tensor.shape[0]
+            if steps<max_len:
+                pad=torch.zeros((max_len-steps,traj_tensor.shape[1]),dtype=torch.float32)
+                padded.append(torch.cat([traj_tensor,pad],dim=0))
+            else:
+                padded.append(traj_tensor[:max_len])
+            mask=torch.zeros((max_len,),dtype=torch.float32)
+            mask[:min(length,max_len)]=1.0
+            mask_list.append(mask)
+        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(grids,dim=0),torch.stack(hists,dim=0),torch.stack(datas,dim=0),torch.stack(padded,dim=0),torch.stack(mask_list,dim=0),torch.tensor(vals,dtype=torch.float32).unsqueeze(1),torch.tensor(advs,dtype=torch.float32).unsqueeze(1),torch.tensor(weights,dtype=torch.float32).unsqueeze(1))
     def _reward_of_event(self,e):
         if not isinstance(e,dict):
             return 0.0
@@ -3392,46 +3541,158 @@ class OptimizerThread(threading.Thread):
                 continue
             fid=e.get("frame_id")
             fr=frames.get(fid)
+            if not fr and e.get("frame_path"):
+                fr={"path":e.get("frame_path"),"w":(e.get("frame_size") or [2560,1600])[0],"h":(e.get("frame_size") or [2560,1600])[1]}
             if not fr:
                 continue
             img=self._get_frame_image(fr.get("path"))
+            if img is None and e.get("frame_path"):
+                img=self._get_frame_image(e.get("frame_path"))
             if img is None:
                 continue
             size=self.st.policy_resolution
             img=cv2.resize(img,size)
-            label=self._make_label(e,img.shape[1],img.shape[0])
+            label,data_vec,traj=self._make_label(e,img.shape[1],img.shape[0])
             if label is None:
                 continue
             ctx=self._context_tensor(events,idx)
             hist=self._history_tensor(events,idx)
             reward=self._reward_of_event(e)
-            seqs.append((img,ctx,label,hist,reward))
+            seqs.append((img,ctx,label,data_vec,traj,hist,reward))
         random.shuffle(seqs)
         batches=[]
         bs=self.batch_size
         for i in range(0,len(seqs),bs):
             chunk=seqs[i:i+bs]
             samples=[]
-            for (img,ctx,label,hist,reward) in chunk:
+            for (img,ctx,label,data_vec,traj,hist,reward) in chunk:
                 value,adv,weight=self._rl_signal(reward)
-                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,hist,value,adv,weight))
+                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,data_vec,traj,hist,value,adv,weight))
             if not samples:
                 continue
             batches.append(self._stack_batch(samples))
         return batches
+    def _trajectory_points(self,e,w,h):
+        pts=[]
+        traj=e.get("trajectory")
+        if isinstance(traj,list) and traj:
+            for item in traj:
+                if not isinstance(item,dict):
+                    continue
+                try:
+                    t=float(item.get("t",0.0))
+                    x=float(item.get("x",0.0))
+                    y=float(item.get("y",0.0))
+                    inside=float(item.get("inside",0.0))
+                except:
+                    continue
+                if x>1.0 or y>1.0:
+                    x=x/2560.0
+                    y=y/1600.0
+                pts.append((t,x,y,inside))
+        if not pts:
+            moves=e.get("moves") if isinstance(e.get("moves"),list) else []
+            for mv in moves:
+                if not isinstance(mv,(list,tuple)) or len(mv)<4:
+                    continue
+                try:
+                    t=float(mv[0])
+                    x=float(mv[1])/2560.0
+                    y=float(mv[2])/1600.0
+                    inside=float(mv[3])
+                except:
+                    continue
+                pts.append((t,x,y,inside))
+        if not pts:
+            px=float(e.get("press_lx",0))/2560.0
+            py=float(e.get("press_ly",0))/1600.0
+            rx=float(e.get("release_lx",px*2560.0))/2560.0
+            ry=float(e.get("release_ly",py*1600.0))/1600.0
+            pts=[(0.0,px,py,1.0),(max(1.0,float(e.get("duration",0.06))),rx,ry,float(e.get("ins_release",0)))]
+        pts=[(p[0],max(0.0,min(1.0,p[1])),max(0.0,min(1.0,p[2])),max(0.0,min(1.0,p[3]))) for p in pts]
+        pts.sort(key=lambda item:item[0])
+        start=pts[0][0]
+        end=pts[-1][0]
+        span=max(end-start,1e-3)
+        norm=[((p[0]-start)/span, p[1], p[2], p[3]) for p in pts]
+        return norm
+    def _data_targets(self,e,grid_h,grid_w):
+        data_map=np.zeros((grid_h,grid_w),dtype=np.float32)
+        vec=np.zeros((8,2),dtype=np.float32)
+        bindings=e.get("data_bindings") if isinstance(e.get("data_bindings"),list) else []
+        idx=0
+        for b in bindings:
+            if idx>=8:
+                break
+            if not isinstance(b,dict):
+                continue
+            nb=b.get("norm_bounds")
+            if not isinstance(nb,(list,tuple)) or len(nb)!=4:
+                continue
+            try:
+                nx1=float(nb[0])
+                ny1=float(nb[1])
+                nx2=float(nb[2])
+                ny2=float(nb[3])
+            except:
+                continue
+            nx1=max(0.0,min(1.0,nx1))
+            ny1=max(0.0,min(1.0,ny1))
+            nx2=max(nx1+1e-4,min(1.0,nx2))
+            ny2=max(ny1+1e-4,min(1.0,ny2))
+            gx1=int(max(0,min(grid_w-1,math.floor(nx1*grid_w))))
+            gy1=int(max(0,min(grid_h-1,math.floor(ny1*grid_h))))
+            gx2=int(max(gx1+1,min(grid_w,math.ceil(nx2*grid_w))))
+            gy2=int(max(gy1+1,min(grid_h,math.ceil(ny2*grid_h))))
+            weight=float(max(0.0,min(1.0,b.get("confidence",0.5))))
+            val=float(b.get("value",0.0) or 0.0)
+            score=(math.tanh(val/500.0)+1.0)/2.0
+            pref=str(b.get("preference",""))
+            pref_norm=1.0 if pref.lower().startswith("high") or pref.startswith("越高") else (-1.0 if pref.lower().startswith("low") or pref.startswith("越低") else 0.0)
+            vec[idx,0]=score
+            vec[idx,1]=pref_norm
+            data_map[gy1:gy2,gx1:gx2]+=weight*score
+            idx+=1
+        if data_map.max()>0:
+            data_map=data_map/data_map.max()
+        return data_map,vec.reshape(-1)
+    def _trajectory_tensor(self,points):
+        if not points:
+            return torch.zeros((1,4),dtype=torch.float32)
+        arr=np.zeros((len(points),4),dtype=np.float32)
+        for i,(t,x,y,inside) in enumerate(points):
+            arr[i,0]=float(max(0.0,min(1.0,t)))
+            arr[i,1]=float(max(0.0,min(1.0,x)))
+            arr[i,2]=float(max(0.0,min(1.0,y)))
+            arr[i,3]=float(max(0.0,min(1.0,inside)))
+        return torch.from_numpy(arr)
     def _make_label(self,e,w,h):
         x=int(float(e.get("press_lx",0))/2560.0*w)
         y=int(float(e.get("press_ly",0))/1600.0*h)
         if x<0 or x>=w or y<0 or y>=h:
-            return None
+            return None,None,None
         grid_h=13
         grid_w=20
         gx=int(max(0,min(grid_w-1,round(x*grid_w/max(1,w)))))
         gy=int(max(0,min(grid_h-1,round(y*grid_h/max(1,h)))))
-        label=torch.zeros((2,grid_h,grid_w),dtype=torch.float32)
-        label[0,gy,gx]=1.0 if e.get("type")=="left" else 0.0
-        label[1,gy,gx]=1.0 if e.get("type")=="right" else 0.0
-        return label
+        grid=torch.zeros((4,grid_h,grid_w),dtype=torch.float32)
+        if e.get("type")=="left":
+            grid[0,gy,gx]=1.0
+        if e.get("type")=="right":
+            grid[1,gy,gx]=1.0
+        points=self._trajectory_points(e,w,h)
+        for _,nx,ny,inside in points:
+            tx=int(max(0,min(grid_w-1,round(nx*(grid_w-1)))))
+            ty=int(max(0,min(grid_h-1,round(ny*(grid_h-1)))))
+            grid[2,ty,tx]+=1.0+inside*0.2
+        total=float(grid[2].sum())
+        if total>0:
+            grid[2]=grid[2]/total
+        data_map,data_vec=self._data_targets(e,grid_h,grid_w)
+        grid[3]=torch.from_numpy(data_map.astype(np.float32))
+        data_tensor=torch.from_numpy(data_vec.astype(np.float32))
+        traj_tensor=self._trajectory_tensor(points)
+        return grid,data_tensor,traj_tensor
     def _context_tensor(self,events,idx):
         ctx=[]
         dim=self.st.strategy.context_dim
@@ -3489,7 +3750,56 @@ class OptimizerThread(threading.Thread):
                 if len(enriched)+len(aug)>=30:
                     break
             enriched.extend(aug[:max(0,30-len(enriched))])
+        missed=self._load_missed_events(limit=24)
+        if missed:
+            enriched.extend(missed)
         return enriched
+    def _load_missed_events(self,limit=24):
+        entries=[]
+        for d in sorted(glob.glob(os.path.join(exp_dir,"*")),reverse=True):
+            meta=os.path.join(d,"missed","meta.jsonl")
+            if not os.path.exists(meta):
+                continue
+            try:
+                with open(meta,"r",encoding="utf-8") as f:
+                    for line in f:
+                        if len(entries)>=limit:
+                            break
+                        entry=json.loads(line)
+                        if isinstance(entry,dict):
+                            entries.append(entry)
+            except:
+                continue
+            if len(entries)>=limit:
+                break
+        picked=sorted(entries,key=lambda e:e.get("timestamp",0),reverse=True)[:limit]
+        events=[]
+        for entry in picked:
+            path=entry.get("path")
+            if not path or not os.path.exists(path):
+                continue
+            win=entry.get("window_size") or [2560,1600]
+            try:
+                w=int(win[0]) if isinstance(win,(list,tuple)) else 2560
+                h=int(win[1]) if isinstance(win,(list,tuple)) else 1600
+            except:
+                w=2560
+                h=1600
+            nb=entry.get("norm_bounds") or [0.0,0.0,1.0,1.0]
+            try:
+                cx=float(nb[0]+nb[2])/2.0
+                cy=float(nb[1]+nb[3])/2.0
+            except:
+                cx=0.5
+                cy=0.5
+            press_lx=int(max(0,min(2560,cx*2560.0)))
+            press_ly=int(max(0,min(1600,cy*1600.0)))
+            key=entry.get("key") or entry.get("id") or f"miss_{uuid.uuid4()}"
+            binding={"key":key,"value":entry.get("value"),"preference":entry.get("preference","ignore"),"norm_bounds":nb,"confidence":float(entry.get("confidence",0.3))}
+            eid=entry.get("id") or str(uuid.uuid4())
+            event={"id":eid,"source":"user","mode":"learning","type":"left","press_lx":press_lx,"press_ly":press_ly,"release_lx":press_lx,"release_ly":press_ly,"duration":0.05,"ins_press":1,"ins_release":1,"frame_id":eid,"frame_path":path,"frame_size":[w,h],"trajectory":[{"t":0.0,"x":cx,"y":cy,"inside":1.0},{"t":1.0,"x":cx,"y":cy,"inside":1.0}],"data_bindings":[binding]}
+            events.append(event)
+        return events
     def _augment_event(self,e):
         base=dict(e)
         base["id"]=str(uuid.uuid4())
@@ -3570,17 +3880,19 @@ class OptimizerThread(threading.Thread):
     def _create_default_batches(self):
         hp=getattr(self.st,"hyper",None)
         bs=int(max(2,hp.values.get("batch_size",6))) if hp else 4
-        img=torch.zeros((bs,3,200,320),dtype=torch.float32)
-        ctx=torch.zeros((bs,8,self.st.strategy.context_dim),dtype=torch.float32)
-        hist=torch.zeros((bs,12,self.st.strategy.context_dim),dtype=torch.float32)
-        label=torch.zeros((bs,2,13,20),dtype=torch.float32)
-        cx=random.randint(2,17)
-        cy=random.randint(1,11)
-        label[:,0,cy,cx]=1.0
-        val=torch.zeros((bs,1),dtype=torch.float32)
-        adv=torch.zeros((bs,1),dtype=torch.float32)
-        weight=torch.ones((bs,1),dtype=torch.float32)
-        return [(img,ctx,label,hist,val,adv,weight)]
+        samples=[]
+        for _ in range(bs):
+            img=torch.zeros((3,200,320),dtype=torch.float32)
+            ctx=torch.zeros((8,self.st.strategy.context_dim),dtype=torch.float32)
+            hist=torch.zeros((12,self.st.strategy.context_dim),dtype=torch.float32)
+            label=torch.zeros((4,13,20),dtype=torch.float32)
+            cx=random.randint(2,17)
+            cy=random.randint(1,11)
+            label[0,cy,cx]=1.0
+            data_vec=torch.zeros(16,dtype=torch.float32)
+            traj=torch.zeros((1,4),dtype=torch.float32)
+            samples.append((img,ctx,label,data_vec,traj,hist,0.0,0.0,1.0))
+        return [self._stack_batch(samples)]
 class UIATextExtractor:
     def __init__(self):
         self.lock=threading.Lock()
@@ -3667,6 +3979,66 @@ class DigitClassifier:
         else:
             prob=0.75
         return pred,prob
+class DigitEnsemble:
+    def __init__(self,clf):
+        self.clf=clf
+    def detect(self,img):
+        if img is None or img.size==0:
+            return None
+        gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
+        variants=[gray]
+        for k in [3,5]:
+            blur=cv2.GaussianBlur(gray,(k,k),0)
+            variants.append(blur)
+            try:
+                clahe=cv2.createCLAHE(clipLimit=2.0,tileGridSize=(8,8))
+                variants.append(clahe.apply(blur))
+            except:
+                pass
+        best_txt=None
+        best_val=None
+        best_conf=0.0
+        for variant in variants:
+            thr=cv2.adaptiveThreshold(variant,255,cv2.ADAPTIVE_THRESH_GAUSSIAN_C,cv2.THRESH_BINARY_INV,31,7)
+            contours,_=cv2.findContours(thr,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            boxes=[]
+            for c in contours:
+                x,y,w,h=cv2.boundingRect(c)
+                if w*h<20:
+                    continue
+                boxes.append((x,y,w,h))
+            if not boxes:
+                boxes=[(0,0,thr.shape[1],thr.shape[0])]
+            boxes.sort(key=lambda b:b[0])
+            digits=[]
+            probs=[]
+            for x,y,w,h in boxes:
+                pad=max(1,int(min(w,h)*0.25))
+                y1=max(0,y-pad)
+                y2=min(thr.shape[0],y+h+pad)
+                x1=max(0,x-pad)
+                x2=min(thr.shape[1],x+w+pad)
+                crop=thr[y1:y2,x1:x2]
+                if crop.size==0:
+                    continue
+                pred,prob=self.clf.classify(crop)
+                digits.append(str(pred))
+                probs.append(float(prob))
+            if not digits:
+                continue
+            text="".join(digits)
+            try:
+                val=int(text)
+            except:
+                continue
+            conf=sum(probs)/len(probs) if probs else 0.0
+            if conf>best_conf:
+                best_conf=conf
+                best_txt=text
+                best_val=val
+        if best_txt is None:
+            return None
+        return best_txt,best_val,best_conf
 class AutoValidator(threading.Thread):
     def __init__(self,st):
         super().__init__(daemon=True)
@@ -3755,9 +4127,11 @@ class UIInspector:
         self.prototype={}
         self.prototype_count={}
         self.memory=collections.deque(maxlen=500)
+        self.signature_stats={}
         self.data_history=collections.defaultdict(lambda:collections.deque(maxlen=32))
         self.uia=UIATextExtractor()
         self.digit_clf=DigitClassifier()
+        self.digit_ensemble=DigitEnsemble(self.digit_clf)
         self.window_hwnd=0
         self._refresh_schema(True)
     def analyze(self,img,events):
@@ -3783,7 +4157,9 @@ class UIInspector:
                 conf=float(prob[0,idx].item())
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
                 inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
-                enhanced=self._refine(raw_label,conf,inter_vec,rep)
+                inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
+                signature=self._interaction_signature(layout_vals,inter_list)
+                enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
                 score=float(max(0.0,min(1.0,enhanced)))
                 pref_key="control"
                 pref=self.st.preference_for_label(pref_key)
@@ -3791,10 +4167,9 @@ class UIInspector:
                     score=0.0
                 elif pref=="lower":
                     score=1.0-score
-                inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
                 interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
-                results.append({"type":pref_key,"raw_label":raw_label,"display":raw_label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key})
-                self._update_memory(raw_label,rep)
+                results.append({"type":pref_key,"raw_label":raw_label,"display":raw_label,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature})
+                self._update_memory(signature,rep)
         results=self._merge(results)
         limit=self._dynamic_limit(events)
         if len(results)>limit:
@@ -3838,9 +4213,10 @@ class UIInspector:
             self.model=UIReasoner(len(self.labels))
             self.model.eval()
             self.model.to(self.device)
-            self.prototype={k:torch.zeros(128,device=self.device) for k in self.labels}
-            self.prototype_count={k:1.0 for k in self.labels}
+            self.prototype={}
+            self.prototype_count={}
             self.memory.clear()
+            self.signature_stats={}
     def _dynamic_limit(self,events):
         density=self.st.activity_density()
         event_count=len(events) if events else 0
@@ -3908,38 +4284,50 @@ class UIInspector:
             p=v/total
             ent-=p*math.log(p+1e-9)
         return ent
-    def _refine(self,label,conf,inter,rep):
-        weight=conf
-        click_density=inter[0] if len(inter)>0 else 0.0
-        avg_dur=inter[2] if len(inter)>2 else 0.0
-        entropy=inter[6] if len(inter)>6 else 0.0
-        value_hint=float(getattr(self.st.strategy,"last_value",0.0)) if hasattr(self.st,"strategy") else 0.0
-        if label=="button":
-            weight=conf*0.7+min(1.0,click_density/5.0)*0.3
-        elif label=="input":
-            weight=conf*0.6+min(1.0,avg_dur*3.0)*0.4
-        elif label=="menu":
-            weight=conf*0.5+min(1.0,entropy/1.5)*0.5
-        elif label=="panel":
-            density=inter[3] if len(inter)>3 else 0.0
-            weight=conf*0.6+min(1.0,max(density,0.1))*0.4
-        weight=weight*(0.85+0.3*value_hint)
-        proto=self._prototype_score(label,rep)
-        memory=self._memory_vote(label)
-        weight=weight*0.6+proto*0.25+memory*0.15
-        return max(0.0,min(1.0,weight))
-    def _update_memory(self,label,rep):
-        if label not in self.prototype:
-            self.prototype[label]=torch.zeros(128,device=self.device)
-            self.prototype_count[label]=1.0
-        proto=self.prototype[label]
-        count=self.prototype_count[label]
+    def _interaction_signature(self,layout_vals,inter_list):
+        try:
+            area=float(layout_vals[0]) if layout_vals else 0.0
+        except:
+            area=0.0
+        clicks=float(inter_list[0]) if inter_list else 0.0
+        entropy=float(inter_list[6]) if len(inter_list)>6 else 0.0
+        ai=float(inter_list[1]) if len(inter_list)>1 else 0.0
+        dur=float(inter_list[2]) if len(inter_list)>2 else 0.0
+        bins=(int(min(9,area*10.0)),int(min(9,clicks)),int(min(9,entropy*4.0)),int(min(9,ai)),int(min(9,dur*10.0)))
+        return f"sig_{bins[0]}_{bins[1]}_{bins[2]}_{bins[3]}_{bins[4]}"
+    def _refine(self,conf,inter,rep,layout_vals,signature):
+        clicks=float(inter[0]) if len(inter)>0 else 0.0
+        ai_ratio=float(inter[1]) if len(inter)>1 else 0.0
+        avg_dur=float(inter[2]) if len(inter)>2 else 0.0
+        entropy=float(inter[6]) if len(inter)>6 else 0.0
+        area=layout_vals[0] if isinstance(layout_vals,list) and layout_vals else 0.0
+        aspect=abs((layout_vals[3]-layout_vals[4]) if isinstance(layout_vals,list) and len(layout_vals)>4 else 0.0)
+        activity=self.st.activity_density()
+        dynamic=math.tanh(clicks*0.25+avg_dur*3.0+entropy*0.45+ai_ratio*0.35)
+        spatial=math.tanh(area*4.0+aspect*3.2)
+        orientation=1.0 if self.st.ui_prefers_high else -1.0
+        base=conf*0.55+dynamic*0.25+spatial*0.15+activity*0.05*orientation
+        proto=self._prototype_score(signature,rep)
+        memory=self._memory_vote(signature)
+        stability=self._stability_metric(signature)
+        score=base*0.55+proto*0.25+memory*0.15+stability*0.05
+        return max(0.0,min(1.0,score))
+    def _update_memory(self,signature,rep):
+        if signature not in self.prototype:
+            self.prototype[signature]=torch.zeros(128,device=self.device)
+            self.prototype_count[signature]=1.0
+        proto=self.prototype[signature]
+        count=self.prototype_count[signature]
         proto=(proto*count+rep.squeeze(0))/(count+1.0)
-        self.prototype[label]=proto
-        self.prototype_count[label]=count+1.0
-        self.memory.append((label,rep.detach().cpu().numpy().tolist()))
-    def _prototype_score(self,label,rep):
-        proto=self.prototype.get(label)
+        self.prototype[signature]=proto
+        self.prototype_count[signature]=count+1.0
+        self.memory.append((signature,rep.detach().cpu().numpy().tolist()))
+        stat=self.signature_stats.get(signature,{"count":0,"last":0.0})
+        stat["count"]=min(480,stat.get("count",0)+1)
+        stat["last"]=time.time()
+        self.signature_stats[signature]=stat
+    def _prototype_score(self,signature,rep):
+        proto=self.prototype.get(signature)
         if proto is None:
             return 0.5
         vec=rep.squeeze(0)
@@ -3947,14 +4335,22 @@ class UIInspector:
             return 0.5
         sim=float(F.cosine_similarity(proto.unsqueeze(0),vec.unsqueeze(0)).item())
         return max(0.0,min(1.0,0.5+0.5*sim))
-    def _memory_vote(self,label):
+    def _memory_vote(self,signature):
         if not self.memory:
             return 0.5
         recent=list(self.memory)[-60:]
         if not recent:
             return 0.5
-        match=sum(1 for lab,_ in recent if lab==label)/len(recent)
+        match=sum(1 for lab,_ in recent if lab==signature)/len(recent)
         return max(0.0,min(1.0,0.35+0.55*match))
+    def _stability_metric(self,signature):
+        stat=self.signature_stats.get(signature)
+        if not stat:
+            return 0.5
+        density=max(0.0,min(1.0,stat.get("count",0)/60.0))
+        span=max(0.0,time.time()-stat.get("last",0.0))
+        freshness=max(0.0,min(1.0,math.exp(-span/12.0)))
+        return max(0.0,min(1.0,0.5*density+0.5*freshness))
     def _candidates(self,img,events):
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
         edges=cv2.Canny(gray,40,120)
@@ -4184,6 +4580,9 @@ class UIInspector:
         screen=self._to_screen_bounds((ax1,ay1,ax2,ay2))
         raw=self.uia.text(screen,self.window_hwnd) if hasattr(self,"uia") and self.uia else ""
         display=self._sanitize_text(raw)
+        ow=max(1,orig_img.shape[1])
+        oh=max(1,orig_img.shape[0])
+        norm_bounds=[max(0.0,min(1.0,float(ax1)/ow)),max(0.0,min(1.0,float(ay1)/oh)),max(0.0,min(1.0,float(ax2)/ow)),max(0.0,min(1.0,float(ay2)/oh))]
         candidates=[]
         if display:
             digits=sum(1 for ch in display if ch.isdigit())
@@ -4211,6 +4610,11 @@ class UIInspector:
             txt,val,conf=cluster
             if all(txt!=c[0] for c in candidates):
                 candidates.append((txt,val,conf))
+        ensemble=self.digit_ensemble.detect(crop)
+        if ensemble:
+            txt,val,conf=ensemble
+            if all(txt!=c[0] for c in candidates):
+                candidates.append((txt,val,conf))
         best_txt=None
         best_val=None
         best_conf=0.0
@@ -4224,9 +4628,23 @@ class UIInspector:
         if best_txt is None:
             fallback=self._fallback_numeric(crop)
             if fallback is None:
+                self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,0.0)
                 return None
             best_txt,best_val,best_conf=fallback
+        if best_conf<0.6:
+            self._register_miss(orig_img,(ax1,ay1,ax2,ay2),norm_bounds,best_conf)
         return best_txt,best_val,max(best_conf,0.5)
+    def _register_miss(self,img,abs_bounds,norm_bounds,confidence):
+        try:
+            if img is None or img.size==0:
+                return
+            ax1,ay1,ax2,ay2=abs_bounds
+            meta={"bounds":[int(ax1),int(ay1),int(ax2),int(ay2)],"norm_bounds":[float(norm_bounds[0]),float(norm_bounds[1]),float(norm_bounds[2]),float(norm_bounds[3])],"window_size":[int(img.shape[1]),int(img.shape[0])],"confidence":float(max(0.0,min(1.0,confidence))),"value":None,"preference":"ignore"}
+            digest=hashlib.sha1((str(meta["bounds"])+str(time.time_ns())).encode("utf-8")).hexdigest()[:10]
+            meta["key"]=f"miss_{digest}"
+            self.st.record_missed_region(img,meta)
+        except:
+            pass
     def _fallback_numeric(self,img):
         if img is None or img.size==0:
             return None
@@ -4443,7 +4861,9 @@ class UIInspector:
             return "",0.0
         conf=float(sum(scores)/len(scores)) if scores else 0.0
         ink=float(np.count_nonzero(thr))/max(1,thr.size)
-        if conf<0.55 or ink<0.06 or ink>0.42:
+        ink_min=0.045 if np.var(norm)<900 else 0.06
+        ink_max=0.48 if np.var(norm)>3200 else 0.42
+        if conf<0.5 or ink<ink_min or ink>ink_max:
             return "",0.0
         edge=cv2.Canny(norm,40,120)
         detail=float(np.count_nonzero(edge))/max(1,edge.size)
@@ -4494,7 +4914,9 @@ class UIInspector:
         if len(filtered)>=max(1,len(boxes)//2):
             boxes=filtered
         ink=float(np.count_nonzero(proc))/max(1,proc.size)
-        if ink<0.04 or ink>0.75:
+        ink_min=0.03 if np.var(norm)<700 else 0.05
+        ink_max=0.82 if np.var(norm)>2800 else 0.75
+        if ink<ink_min or ink>ink_max:
             return None
         digits=[]
         probs=[]
@@ -4527,14 +4949,19 @@ class UIInspector:
             log(f"data_region_error:{e}")
             return []
         res=[]
+        variance=float(np.var(gray))
+        area_min=40 if variance>1500 else 24
+        area_max=80000 if variance>3200 else 48000
+        ratio_low=0.08 if variance<900 else 0.12
+        ratio_high=0.95 if variance>2600 else 0.88
         for idx in range(1,num):
             x,y,w,h,area=stats[idx]
-            if area<60 or area>48000:
+            if area<area_min or area>area_max:
                 continue
-            if w<10 or h<10:
+            if w<6 or h<8:
                 continue
             ratio=area/(w*h+1e-6)
-            if ratio<0.12 or ratio>0.88:
+            if ratio<ratio_low or ratio>ratio_high:
                 continue
             box=(int(x),int(y),int(x+w),int(y+h))
             if self._overlaps_ui(box,ui_results):
@@ -4545,7 +4972,8 @@ class UIInspector:
             patch=region.astype(np.float32)/255.0
             var=float(np.var(patch))
             contrast=float(patch.max()-patch.min())
-            score=max(0.0,min(1.0,var*1.6+contrast*0.9))
+            bonus=0.12 if variance<800 else 0.0
+            score=max(0.0,min(1.0,var*1.4+contrast*0.9+bonus))
             value=float(np.mean(patch))
             res.append((box[0],box[1],box[2],box[3],score,value))
         limit=max(12,min(64,self.max_items*2))
