@@ -38,7 +38,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","model_token":"","model_token_env":"","model_token_mode":"auto","model_mirrors":[],"ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/hf-internal-testing/tiny-random-agent-policy/resolve/main/","model_file":"aaa_policy_v2.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","model_token":"","model_token_env":"","model_token_mode":"auto","model_mirrors":["builtin://default"],"ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
 default_ui_identifiers=[]
 schema_defaults={"identifiers":default_ui_identifiers,"max_items":48}
 def ensure_config():
@@ -451,6 +451,9 @@ class ModelManifest:
         s=str(src).strip()
         if not s:
             return []
+        if s.lower().startswith("builtin://"):
+            cand=self._builtin_fallback(s.split("://",1)[1] if "://" in s else "")
+            return [cand] if cand else []
         if "://" in s:
             if s.endswith(self.file):
                 return [s]
@@ -461,6 +464,34 @@ class ModelManifest:
         if expanded.endswith(self.file):
             return [expanded]
         return [os.path.join(expanded,self.file)]
+    def _builtin_fallback(self,name):
+        base=Path(self.package_dir)
+        try:
+            base.mkdir(parents=True,exist_ok=True)
+        except:
+            pass
+        prefer=[self.file,"default_policy.npz","aaa_policy_v2.npz"]
+        seen=set()
+        for tag in prefer:
+            if not tag or tag in seen:
+                continue
+            seen.add(tag)
+            cand=base/tag
+            if cand.exists():
+                return str(cand)
+        target=self.target_path()
+        if os.path.exists(target):
+            return target
+        try:
+            data=ModelInitializer.default_bytes()
+            cand=base/self.file
+            with open(cand,"wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            return str(cand)
+        except:
+            return None
     def _is_remote(self,source):
         if not source:
             return False
@@ -4712,7 +4743,7 @@ class UIModelRegistry:
             self.cache.clear()
             self._save()
             mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
-        self._sync_meta(mapping)
+        self._ensure_mapping(mapping)
     def _write_default(self,path):
         cls=globals().get("UIReasoner")
         if cls is None:
@@ -4766,7 +4797,7 @@ class UIModelRegistry:
                 self._write_default(path)
             except Exception as e:
                 log(f"ui_model_init_fail:{uid}:{e}")
-        self._sync_meta(mapping)
+        self._ensure_mapping(mapping)
         return self._load_model(uid,path,device)
     def model_path(self,uid):
         if not uid:
@@ -5012,6 +5043,19 @@ class UIModelTrainer:
             return
         self.mapping_cache=dict(mapping)
         ModelMeta.merge({"ui_models":mapping})
+    def _ensure_mapping(self,mapping):
+        if mapping is None:
+            return
+        handler=getattr(self,"_sync_meta",None)
+        if callable(handler):
+            try:
+                handler(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_sync_attr_error")
+            except Exception as e:
+                log(f"ui_registry_sync_fail:{e}")
+        self._apply_mapping(mapping)
     def _sync_meta(self,mapping):
         if self.mapping_cache==mapping:
             return
