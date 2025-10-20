@@ -38,7 +38,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/hf-internal-testing/tiny-random-agent-policy/resolve/main/","model_file":"aaa_policy_v2.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","model_token":"","model_token_env":"","model_token_mode":"auto","model_mirrors":["builtin://default"],"ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"builtin://default","model_file":"aaa_policy_v2.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","model_token":"","model_token_env":"","model_token_mode":"auto","model_mirrors":["builtin://default"],"ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
 default_ui_identifiers=[]
 schema_defaults={"identifiers":default_ui_identifiers,"max_items":48}
 def ensure_config():
@@ -399,7 +399,7 @@ class ModelManifest:
             except:
                 pass
         if progress_cb:
-            progress_cb(5,"下载模型")
+            progress_cb(5,"准备模型")
         tmp=self._download_with_progress(progress_cb)
         if not tmp:
             try:
@@ -409,7 +409,7 @@ class ModelManifest:
             fall=self._recover_fallback(progress_cb)
             if fall:
                 return fall
-            raise RuntimeError("模型下载失败")
+            raise RuntimeError("模型准备失败")
         calc=self._hash(tmp)
         if self.sha_value:
             if calc!=self.sha_value:
@@ -554,6 +554,9 @@ class ModelManifest:
         sources=self._sources()
         first=True
         for source in sources:
+            if self._is_remote(source):
+                log(f"model remote source skipped:{source}")
+                continue
             if not first and os.path.exists(tmp):
                 try:
                     os.remove(tmp)
@@ -573,81 +576,8 @@ class ModelManifest:
                         cb(90,"复制模型")
                     return tmp
                 except Exception as e:
-                    log(f"model download error:{local}:{e}")
+                    log(f"model prepare error:{local}:{e}")
                     continue
-            if not self._is_remote(source):
-                continue
-            attempts=0
-            auth_required=self.token_mode=="always"
-            while attempts<3:
-                try:
-                    existing=os.path.getsize(tmp) if os.path.exists(tmp) else 0
-                    headers={"User-Agent":"Mozilla/5.0"}
-                    token=self._current_token(False)
-                    if (auth_required or self.token_mode=="always") and token:
-                        headers["Authorization"]=f"Bearer {token}"
-                    if existing>0:
-                        headers["Range"]=f"bytes={existing}-"
-                    req=urllib.request.Request(source,headers=headers)
-                    done=existing
-                    total=0
-                    with urllib.request.urlopen(req,timeout=60) as r:
-                        total=r.length or 0
-                        cr=r.headers.get("Content-Range")
-                        if cr:
-                            try:
-                                total=int(cr.split("/")[-1])
-                            except:
-                                total=0
-                        status=getattr(r,"status",200)
-                        if existing>0 and (status!=206 or not cr):
-                            existing=0
-                            with open(tmp,"wb") as f:
-                                f.truncate(0)
-                            done=0
-                        mode="ab" if existing>0 else "wb"
-                        chunk=262144
-                        with open(tmp,mode) as f:
-                            if existing>0:
-                                f.seek(0,os.SEEK_END)
-                            while True:
-                                data=r.read(chunk)
-                                if not data:
-                                    break
-                                f.write(data)
-                                done+=len(data)
-                                if cb and total>0:
-                                    cb(min(90,int(done*80/max(1,total))+10),"下载中")
-                            f.flush()
-                            os.fsync(f.fileno())
-                    if total and done<total:
-                        raise IOError("incomplete download")
-                    if cb:
-                        cb(95,"下载完成")
-                    return tmp
-                except urllib.error.HTTPError as e:
-                    code=getattr(e,"code",None)
-                    log(f"model download error:{source}:{e}")
-                    if code in (401,403):
-                        if self.token_mode=="manual":
-                            break
-                        auth_required=True
-                        refreshed=self._current_token(True)
-                        if not refreshed:
-                            log("model auth token unavailable")
-                            break
-                        attempts+=1
-                        time.sleep(1)
-                        continue
-                except Exception as e:
-                    log(f"model download error:{source}:{e}")
-                attempts+=1
-                time.sleep(1)
-            if os.path.exists(tmp):
-                try:
-                    os.remove(tmp)
-                except:
-                    pass
         return None
     def _hash(self,path):
         h=hashlib.sha256()
