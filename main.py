@@ -1,4 +1,4 @@
-import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,re,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,ssl,io,base64,subprocess
+import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,re,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,urllib.error,urllib.parse,ssl,io,base64,subprocess
 from pathlib import Path
 os.environ["QT_ENABLE_HIGHDPI_SCALING"]="1"
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"]="1"
@@ -38,7 +38,7 @@ def log(s):
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {s}\n")
     except:
         pass
-cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
+cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","model_token":"","model_token_env":"","model_token_mode":"auto","model_mirrors":[],"ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
 default_ui_identifiers=[]
 schema_defaults={"identifiers":default_ui_identifiers,"max_items":48}
 def ensure_config():
@@ -70,6 +70,22 @@ def ensure_config():
         if "__default__" not in data_prefs:
             data_prefs["__default__"]=cfg_defaults["data_preferences"]["__default__"]
         merged["data_preferences"]=data_prefs
+        mirrors=merged.get("model_mirrors")
+        if isinstance(mirrors,str):
+            mirrors=[mirrors] if mirrors else []
+        elif isinstance(mirrors,(list,tuple)):
+            mirrors=[str(m) for m in mirrors if m]
+        else:
+            mirrors=[]
+        merged["model_mirrors"]=mirrors
+        token=str(merged.get("model_token") or "")
+        merged["model_token"]=token
+        token_env=str(merged.get("model_token_env") or "")
+        merged["model_token_env"]=token_env
+        mode=str(merged.get("model_token_mode") or "auto").lower()
+        if mode not in ("auto","always","manual"):
+            mode="auto"
+        merged["model_token_mode"]=mode
         with open(cfg_path,"w",encoding="utf-8") as f:
             json.dump(merged,f,ensure_ascii=False,indent=2)
             f.flush()
@@ -344,11 +360,27 @@ class RewardComposer:
         return max(0.0,min(2.2,reward))
 class ModelManifest:
     def __init__(self,cfg):
-        self.repo=cfg.get("model_repo",cfg_defaults["model_repo"])
-        self.file=cfg.get("model_file",cfg_defaults["model_file"])
-        self.sha_value=cfg.get("model_sha256",cfg_defaults["model_sha256"]) or ""
+        base=dict(cfg_defaults)
+        if isinstance(cfg,dict):
+            base.update(cfg)
+        self.cfg=base
+        self.repo=str(base.get("model_repo") or "")
+        self.file=str(base.get("model_file") or cfg_defaults["model_file"])
+        self.sha_value=str(base.get("model_sha256") or "")
+        self.token=str(base.get("model_token") or "")
+        self.token_env=str(base.get("model_token_env") or "")
+        mode=str(base.get("model_token_mode") or "auto")
+        self.token_mode=mode.lower() if isinstance(mode,str) else "auto"
+        if self.token_mode not in ("auto","always","manual"):
+            self.token_mode="auto"
+        mirrors=base.get("model_mirrors") or []
+        if isinstance(mirrors,str):
+            mirrors=[mirrors]
+        self.mirrors=[str(m).strip() for m in mirrors if str(m).strip()]
+        self._token_cache=None
+        self.package_dir=str((Path(__file__).resolve().parent/"models"))
     def url(self):
-        return self.repo+self.file
+        return (self.repo or "")+self.file
     def target_path(self):
         return os.path.join(models_dir,self.file)
     def ensure(self,progress_cb=None):
@@ -393,56 +425,198 @@ class ModelManifest:
         if progress_cb:
             progress_cb(100,"模型准备完成")
         return path
+    def _sources(self):
+        base=[]
+        if self.repo:
+            base.append(self.repo)
+        base.extend(self.mirrors)
+        if not base:
+            base.append(self.repo or "")
+        urls=[]
+        seen=set()
+        for raw in base:
+            for item in self._expand_source(raw):
+                if not item:
+                    continue
+                if item in seen:
+                    continue
+                seen.add(item)
+                urls.append(item)
+        if not urls:
+            urls.append(self.url())
+        return urls
+    def _expand_source(self,src):
+        if not src:
+            return []
+        s=str(src).strip()
+        if not s:
+            return []
+        if "://" in s:
+            if s.endswith(self.file):
+                return [s]
+            if s.endswith("/") or s.endswith("\\"):
+                return [s+self.file]
+            return [s.rstrip("/\\")+"/"+self.file]
+        expanded=os.path.expanduser(os.path.expandvars(s))
+        if expanded.endswith(self.file):
+            return [expanded]
+        return [os.path.join(expanded,self.file)]
+    def _is_remote(self,source):
+        if not source:
+            return False
+        low=source.lower()
+        return low.startswith("http://") or low.startswith("https://") or low.startswith("ftp://")
+    def _local_candidate(self,source):
+        if not source:
+            return None
+        if self._is_remote(source):
+            return None
+        parsed=urllib.parse.urlparse(source)
+        if parsed.scheme and parsed.scheme.lower()=="file":
+            path=urllib.request.url2pathname(parsed.path or "")
+            if parsed.netloc:
+                if os.name=="nt":
+                    prefix="\\\\"+parsed.netloc if not parsed.netloc.startswith("\\") else parsed.netloc
+                else:
+                    prefix="//"+parsed.netloc
+                path=prefix+path
+            return os.path.abspath(path)
+        if "://" in source:
+            return None
+        expanded=os.path.expanduser(os.path.expandvars(source))
+        return os.path.abspath(expanded)
+    def _current_token(self,force=False):
+        if force:
+            self._token_cache=None
+        if self._token_cache is not None:
+            return self._token_cache
+        token=str(self.token or "")
+        if not token and self.token_env:
+            token=os.environ.get(self.token_env,"") or token
+        if not token:
+            for env_key in ["AAA_MODEL_TOKEN","HF_TOKEN","HUGGINGFACEHUB_API_TOKEN"]:
+                env_val=os.environ.get(env_key)
+                if env_val:
+                    token=env_val
+                    break
+        if not token:
+            try:
+                with open(cfg_path,"r",encoding="utf-8") as f:
+                    data=json.load(f)
+                if isinstance(data,dict):
+                    token=str(data.get("model_token") or token)
+                    env_key=str(data.get("model_token_env") or "")
+                    if not token and env_key:
+                        token=os.environ.get(env_key,"") or token
+                    mode=str(data.get("model_token_mode") or self.token_mode)
+                    if isinstance(mode,str):
+                        mode=mode.lower()
+                        if mode in ("auto","always","manual"):
+                            self.token_mode=mode
+            except:
+                pass
+        self._token_cache=str(token or "").strip()
+        return self._token_cache
     def _download_with_progress(self,cb):
-        url=self.url()
         target=self.target_path()
         tmp=target+".tmp"
-        attempts=0
-        while attempts<3:
-            try:
-                existing=os.path.getsize(tmp) if os.path.exists(tmp) else 0
-                headers={"User-Agent":"Mozilla/5.0"}
-                if existing>0:
-                    headers["Range"]=f"bytes={existing}-"
-                req=urllib.request.Request(url,headers=headers)
-                with urllib.request.urlopen(req,timeout=60) as r:
-                    total=r.length or 0
-                    cr=r.headers.get("Content-Range")
-                    if cr:
-                        try:
-                            total=int(cr.split("/")[-1])
-                        except:
-                            total=0
-                    status=getattr(r,"status",200)
-                    if existing>0 and (status!=206 or not cr):
-                        existing=0
-                        with open(tmp,"wb") as f:
-                            f.truncate(0)
-                    mode="ab" if existing>0 else "wb"
+        sources=self._sources()
+        first=True
+        for source in sources:
+            if not first and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except:
+                    pass
+            first=False
+            local=self._local_candidate(source)
+            if local and os.path.exists(local):
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except:
+                    pass
+                try:
+                    shutil.copy2(local,tmp)
+                    if cb:
+                        cb(90,"复制模型")
+                    return tmp
+                except Exception as e:
+                    log(f"model download error:{local}:{e}")
+                    continue
+            if not self._is_remote(source):
+                continue
+            attempts=0
+            auth_required=self.token_mode=="always"
+            while attempts<3:
+                try:
+                    existing=os.path.getsize(tmp) if os.path.exists(tmp) else 0
+                    headers={"User-Agent":"Mozilla/5.0"}
+                    token=self._current_token(False)
+                    if (auth_required or self.token_mode=="always") and token:
+                        headers["Authorization"]=f"Bearer {token}"
+                    if existing>0:
+                        headers["Range"]=f"bytes={existing}-"
+                    req=urllib.request.Request(source,headers=headers)
                     done=existing
-                    chunk=262144
-                    with open(tmp,mode) as f:
-                        if existing>0:
-                            f.seek(0,os.SEEK_END)
-                        while True:
-                            data=r.read(chunk)
-                            if not data:
-                                break
-                            f.write(data)
-                            done+=len(data)
-                            if cb and total>0:
-                                cb(min(90,int(done*80/max(1,total))+10),"下载中")
-                        f.flush()
-                        os.fsync(f.fileno())
-                if total and done<total:
-                    raise IOError("incomplete download")
-                if cb:
-                    cb(95,"下载完成")
-                return tmp
-            except Exception as e:
-                log(f"model download error:{e}")
+                    total=0
+                    with urllib.request.urlopen(req,timeout=60) as r:
+                        total=r.length or 0
+                        cr=r.headers.get("Content-Range")
+                        if cr:
+                            try:
+                                total=int(cr.split("/")[-1])
+                            except:
+                                total=0
+                        status=getattr(r,"status",200)
+                        if existing>0 and (status!=206 or not cr):
+                            existing=0
+                            with open(tmp,"wb") as f:
+                                f.truncate(0)
+                            done=0
+                        mode="ab" if existing>0 else "wb"
+                        chunk=262144
+                        with open(tmp,mode) as f:
+                            if existing>0:
+                                f.seek(0,os.SEEK_END)
+                            while True:
+                                data=r.read(chunk)
+                                if not data:
+                                    break
+                                f.write(data)
+                                done+=len(data)
+                                if cb and total>0:
+                                    cb(min(90,int(done*80/max(1,total))+10),"下载中")
+                            f.flush()
+                            os.fsync(f.fileno())
+                    if total and done<total:
+                        raise IOError("incomplete download")
+                    if cb:
+                        cb(95,"下载完成")
+                    return tmp
+                except urllib.error.HTTPError as e:
+                    code=getattr(e,"code",None)
+                    log(f"model download error:{source}:{e}")
+                    if code in (401,403):
+                        if self.token_mode=="manual":
+                            break
+                        auth_required=True
+                        refreshed=self._current_token(True)
+                        if not refreshed:
+                            log("model auth token unavailable")
+                            break
+                        attempts+=1
+                        time.sleep(1)
+                        continue
+                except Exception as e:
+                    log(f"model download error:{source}:{e}")
                 attempts+=1
                 time.sleep(1)
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except:
+                    pass
         return None
     def _hash(self,path):
         h=hashlib.sha256()
@@ -482,8 +656,21 @@ class ModelManifest:
                     if progress_cb:
                         progress_cb(95,"恢复模型")
                     return target
-        except:
-            pass
+        except Exception as e:
+            log(f"model fallback error:{e}")
+        try:
+            for packaged in self._package_files():
+                target=self.target_path()
+                if os.path.abspath(packaged)!=os.path.abspath(target):
+                    shutil.copy2(packaged,target)
+                if self.sha_value and self._hash(target)!=self.sha_value:
+                    os.remove(target)
+                    continue
+                if progress_cb:
+                    progress_cb(95,"使用内置模型")
+                return target
+        except Exception as e:
+            log(f"model package restore error:{e}")
         try:
             fallback=self._default_model_path()
             if fallback:
@@ -497,8 +684,8 @@ class ModelManifest:
                 if progress_cb:
                     progress_cb(95,"使用本地模型")
                 return target
-        except:
-            pass
+        except Exception as e:
+            log(f"model fallback error:{e}")
         try:
             data=ModelInitializer.default_bytes()
             target=self.target_path()
@@ -535,7 +722,22 @@ class ModelManifest:
         if existing:
             return existing[0]
         return None
+    def _package_files(self):
+        paths=[]
+        try:
+            root=Path(self.package_dir)
+            if root.exists():
+                for name in [self.file,"default_policy.npz"]:
+                    cand=root/name
+                    if cand.exists():
+                        paths.append(str(cand))
+        except:
+            pass
+        return paths
     def _default_model_path(self):
+        packaged=self._package_files()
+        for cand in packaged:
+            return cand
         fallback=os.path.join(models_dir,"default_policy.npz")
         if os.path.exists(fallback):
             return fallback
@@ -4510,7 +4712,7 @@ class UIModelRegistry:
             self.cache.clear()
             self._save()
             mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
-        self._merge_meta(mapping)
+        self._sync_meta(mapping)
     def _write_default(self,path):
         cls=globals().get("UIReasoner")
         if cls is None:
@@ -4564,7 +4766,7 @@ class UIModelRegistry:
                 self._write_default(path)
             except Exception as e:
                 log(f"ui_model_init_fail:{uid}:{e}")
-        self._merge_meta(mapping)
+        self._sync_meta(mapping)
         return self._load_model(uid,path,device)
     def model_path(self,uid):
         if not uid:
@@ -4805,10 +5007,27 @@ class UIModelTrainer:
             ModelIO.save(model,path)
         except Exception as e:
             log(f"ui_model_save_fail:{uid}:{e}")
+    def _apply_mapping(self,mapping):
+        if mapping is None:
+            return
+        self.mapping_cache=dict(mapping)
+        ModelMeta.merge({"ui_models":mapping})
+    def _sync_meta(self,mapping):
+        if self.mapping_cache==mapping:
+            return
+        merge=getattr(self,"_merge_meta",None)
+        if callable(merge):
+            try:
+                merge(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_merge_attr_error")
+        else:
+            log("ui_registry_merge_missing")
+        self._apply_mapping(mapping)
     def _merge_meta(self,mapping):
         if self.mapping_cache!=mapping:
-            self.mapping_cache=dict(mapping)
-            ModelMeta.merge({"ui_models":mapping})
+            self._apply_mapping(mapping)
 class UIInspector:
     def __init__(self,st):
         self.st=st
