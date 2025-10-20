@@ -39,7 +39,7 @@ def log(s):
     except:
         pass
 cfg_defaults={"idle_timeout":10,"screenshot_min_fps":1,"screenshot_max_fps":120,"ui_scale":1.0,"frame_png_compress":3,"save_change_thresh":6.0,"max_disk_gb":10.0,"pre_post_K":3,"block_margin_px":6,"preview_on":True,"model_repo":"https://huggingface.co/datasets/mit-han-lab/aitk-mouse-policy/resolve/main/","model_file":"policy_v1.npz","model_sha256":"","model_fallback":"","model_sha256_backup":"","ui_preferences":{"__default__":"higher"},"hyperparam_state":{},"data_preferences":{"__default__":"higher"}}
-default_ui_identifiers=["generic"]
+default_ui_identifiers=[]
 schema_defaults={"identifiers":default_ui_identifiers,"max_items":48}
 def ensure_config():
     if not os.path.exists(cfg_path):
@@ -4446,42 +4446,50 @@ class AutoValidator(threading.Thread):
         except Exception as e:
             log(f"strategy_validation_error:{e}")
 class UIReasoner(nn.Module):
-    def __init__(self,num_classes):
+    def __init__(self,feature_dim=5):
         super().__init__()
+        fd=max(5,int(feature_dim))
         self.visual=nn.Sequential(nn.Conv2d(3,32,3,2,1),nn.BatchNorm2d(32),nn.GELU(),nn.Conv2d(32,64,3,2,1),nn.BatchNorm2d(64),nn.GELU(),nn.Conv2d(64,128,3,2,1),nn.BatchNorm2d(128),nn.GELU(),nn.Conv2d(128,192,3,2,1),nn.BatchNorm2d(192),nn.GELU(),nn.AdaptiveAvgPool2d((1,1)))
         self.layout_proj=nn.Sequential(nn.Linear(12,128),nn.GELU(),nn.Linear(128,128))
-        self.interaction_proj=nn.Sequential(nn.Linear(18,128),nn.GELU(),nn.Linear(128,128))
+        self.interaction_proj=nn.Sequential(nn.Linear(35,128),nn.GELU(),nn.Linear(128,128))
         self.fusion=nn.Sequential(nn.LayerNorm(448),nn.Linear(448,256),nn.GELU(),nn.Linear(256,128),nn.GELU())
-        self.head=nn.Linear(128,num_classes)
+        self.head=nn.Linear(128,fd)
+        self.feature_dim=fd
     def forward(self,visual,layout,interaction):
         feat=self.visual(visual).view(visual.shape[0],-1)
         lay=self.layout_proj(layout)
         inter=self.interaction_proj(interaction)
         fused=torch.cat([feat,lay,inter],dim=1)
         rep=self.fusion(fused)
-        logits=self.head(rep)
-        return logits,rep
+        raw=self.head(rep)
+        conf=raw[:,0]
+        geom=torch.sigmoid(raw[:,1:]) if raw.shape[1]>1 else raw[:,1:]
+        return conf,geom,rep
 class UIModelRegistry:
     def __init__(self):
         self.lock=threading.Lock()
         self.meta=self._load()
         schema=self.meta.get("_schema",{}) if isinstance(self.meta,dict) else {}
-        self.num_classes=max(1,int(schema.get("num_classes",1)))
+        self.feature_dim=max(5,int(schema.get("feature_dim",5)))
         self.cache={}
         self.mapping_cache=None
+        stored=self.meta.setdefault("_schema",{})
+        if stored.get("feature_dim")!=self.feature_dim:
+            stored["feature_dim"]=self.feature_dim
+            self._save()
     def _load(self):
         try:
             with open(ui_model_meta_path,"r",encoding="utf-8") as f:
                 data=json.load(f)
                 if isinstance(data,dict):
                     if "_schema" not in data or not isinstance(data.get("_schema"),dict):
-                        data["_schema"]={"num_classes":1}
+                        data["_schema"]={"feature_dim":5}
                     if "items" not in data or not isinstance(data.get("items"),dict):
                         data["items"]={}
                     return data
         except:
             pass
-        return {"_schema":{"num_classes":1},"items":{}}
+        return {"_schema":{"feature_dim":5},"items":{}}
     def _save(self):
         with open(ui_model_meta_path,"w",encoding="utf-8") as f:
             json.dump(self.meta,f,ensure_ascii=False,indent=2)
@@ -4492,13 +4500,13 @@ class UIModelRegistry:
         if not safe:
             safe=hashlib.sha1(str(uid).encode("utf-8")).hexdigest()[:16]
         return f"ui_{safe}.npz"
-    def set_num_classes(self,count):
-        count=max(1,int(count))
+    def set_feature_dim(self,count):
+        count=max(5,int(count))
         with self.lock:
-            if count==self.num_classes:
+            if count==self.feature_dim:
                 return
-            self.num_classes=count
-            self.meta.setdefault("_schema",{})["num_classes"]=count
+            self.feature_dim=count
+            self.meta.setdefault("_schema",{})["feature_dim"]=count
             self.cache.clear()
             self._save()
             mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
@@ -4507,19 +4515,19 @@ class UIModelRegistry:
         cls=globals().get("UIReasoner")
         if cls is None:
             raise RuntimeError("UIReasoner未定义")
-        model=cls(self.num_classes)
+        model=cls(self.feature_dim)
         ModelIO.save(model,path)
     def _load_model(self,uid,path,device):
         with self.lock:
             cached=self.cache.get(uid)
-        if cached is not None and getattr(cached.head,"out_features",None)==self.num_classes:
+        if cached is not None and getattr(cached.head,"out_features",None)==self.feature_dim:
             cached.to(device)
             cached.eval()
             return cached
         cls=globals().get("UIReasoner")
         if cls is None:
             raise RuntimeError("UIReasoner未定义")
-        model=cls(self.num_classes)
+        model=cls(self.feature_dim)
         try:
             if os.path.exists(path):
                 ModelIO.load(model,path)
@@ -4532,21 +4540,21 @@ class UIModelRegistry:
         with self.lock:
             self.cache[uid]=model
         return model
-    def get_model(self,uid,device,num_classes):
+    def get_model(self,uid,device):
         if not uid:
             return None
-        if num_classes!=self.num_classes:
-            self.set_num_classes(num_classes)
         with self.lock:
             items=self.meta.setdefault("items",{})
             fname=self._fname(uid)
             path=os.path.join(models_dir,fname)
             info=items.get(uid)
             if info is None:
-                info={"file":fname,"classes":self.num_classes,"created":time.time(),"updated":time.time()}
+                info={"file":fname,"features":self.feature_dim,"created":time.time(),"updated":time.time()}
             else:
                 info["file"]=fname
-                info["classes"]=self.num_classes
+                if "classes" in info:
+                    info.pop("classes",None)
+                info["features"]=self.feature_dim
                 info["updated"]=time.time()
             items[uid]=info
             self._save()
@@ -4566,10 +4574,12 @@ class UIModelRegistry:
             info=items.get(uid)
             if info is None:
                 fname=self._fname(uid)
-                info={"file":fname,"classes":self.num_classes,"created":time.time(),"updated":time.time()}
+                info={"file":fname,"features":self.feature_dim,"created":time.time(),"updated":time.time()}
                 items[uid]=info
                 self._save()
             fname=info.get("file") or self._fname(uid)
+            if "classes" in info:
+                info.pop("classes",None)
         path=os.path.join(models_dir,fname)
         if not os.path.exists(path):
             try:
@@ -4637,7 +4647,7 @@ class UIModelTrainer:
         path=self.registry.model_path(uid)
         if not path:
             return
-        model=UIReasoner(self.registry.num_classes)
+        model=UIReasoner(self.registry.feature_dim)
         try:
             if os.path.exists(path):
                 ModelIO.load(model,path)
@@ -4666,20 +4676,24 @@ class UIModelTrainer:
                 labels_t=torch.from_numpy(labels).to(self.device)
                 weights_t=torch.from_numpy(weights).to(self.device)
                 opt.zero_grad()
-                logits,_=model(visuals_t,layouts_t,inters_t)
-                if logits.ndim==1:
-                    logits=logits.unsqueeze(0)
-                if logits.shape[-1]==1:
-                    pred=logits.view(-1)
-                    loss=F.binary_cross_entropy_with_logits(pred,labels_t,reduction="none")
+                conf_logits,geom_pred,_=model(visuals_t,layouts_t,inters_t)
+                conf_vec=conf_logits.view(-1)
+                conf_loss=F.binary_cross_entropy_with_logits(conf_vec,labels_t,reduction="none")
+                if geom_pred.shape[1]>=4:
+                    target_geom=layouts_t[:,8:12]
+                    geo_loss=F.smooth_l1_loss(geom_pred[:,0:4],target_geom,reduction="none").mean(dim=1)
+                elif geom_pred.shape[1]>0:
+                    target_geom=layouts_t[:,8:8+geom_pred.shape[1]]
+                    geo_loss=F.smooth_l1_loss(geom_pred,target_geom,reduction="none").mean(dim=1)
                 else:
-                    target_idx=(labels_t>0.5).long()
-                    loss=F.cross_entropy(logits,target_idx,reduction="none")
-                loss=(loss*weights_t).mean()
+                    geo_loss=torch.zeros_like(conf_loss)
+                geo_loss=geo_loss*labels_t
+                loss=(conf_loss+0.5*geo_loss)*weights_t
+                loss=loss.mean()
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(),1.0)
                 opt.step()
-        model_cpu=UIReasoner(self.registry.num_classes)
+        model_cpu=UIReasoner(self.registry.feature_dim)
         model_cpu.load_state_dict(model.state_dict())
         model_cpu.eval()
         ModelIO.save(model_cpu,path)
@@ -4817,7 +4831,7 @@ class UIInspector:
         self.digit_clf=DigitClassifier()
         self.digit_ensemble=DigitEnsemble(self.digit_clf)
         self.window_hwnd=0
-        self.out_features=1
+        self.feature_dim=self.registry.feature_dim
         self._refresh_schema(True)
         self.trainer=UIModelTrainer(self)
     def analyze(self,img,events):
@@ -4826,7 +4840,6 @@ class UIInspector:
         base=cv2.resize(img,(1280,800))
         cands=self._candidates(base,events)
         results=[]
-        out_features=max(1,len(self.identifiers))
         train_samples=[]
         with torch.no_grad():
             for (x1,y1,x2,y2) in cands:
@@ -4845,15 +4858,13 @@ class UIInspector:
                 inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
                 signature=self._interaction_signature(layout_vals,inter_list)
                 result_id=self._stable_key(signature,(x1,y1,x2,y2))
-                model=self.registry.get_model(result_id,self.device,out_features)
+                model=self.registry.get_model(result_id,self.device)
                 if model is None:
                     continue
-                logits,rep=model(visual,layout_tensor,inter_tensor)
-                if logits.shape[-1]==1:
-                    conf=float(torch.sigmoid(logits.view(-1)).item())
-                else:
-                    conf=float(torch.softmax(logits,dim=-1).amax(dim=-1).item())
-                enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature)
+                conf_logits,geom_pred,rep=model(visual,layout_tensor,inter_tensor)
+                conf=float(torch.sigmoid(conf_logits.view(-1)).item())
+                geom_vals=geom_pred.detach().cpu().numpy().reshape(-1).tolist() if isinstance(geom_pred,torch.Tensor) else []
+                enhanced=self._refine(conf,inter_vec,rep,layout_vals,signature,geom_vals)
                 score=float(max(0.0,min(1.0,enhanced)))
                 pref_key=result_id
                 pref=self.st.preference_for_identifier(pref_key)
@@ -4862,7 +4873,7 @@ class UIInspector:
                 elif pref=="lower":
                     score=1.0-score
                 interaction_val=float(inter_list[0]) if len(inter_list)>0 else 0.0
-                results.append({"id":result_id,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature})
+                results.append({"id":result_id,"bounds":[int(x1),int(y1),int(x2),int(y2)],"confidence":score,"interaction":interaction_val,"dynamics":inter_list,"layout":layout_vals,"preference":pref,"pref_key":pref_key,"signature":signature,"geometry":geom_vals})
                 label,weight,ts=self._label_from_events((x1,y1,x2,y2),events,base.shape)
                 train_samples.append((result_id,visual_arr,layout_tensor.squeeze(0).detach().cpu().numpy(),inter_tensor.squeeze(0).detach().cpu().numpy(),label,weight,ts))
                 self._update_memory(signature,rep)
@@ -4900,18 +4911,13 @@ class UIInspector:
                     data.update({k:disk.get(k,data.get(k)) for k in ["identifiers","max_items"]})
         except:
             pass
-        identifiers=[i for i in data.get("identifiers",["generic"]) if isinstance(i,str) and i]
-        if not identifiers:
-            identifiers=["generic"]
+        identifiers=[i for i in data.get("identifiers",[]) if isinstance(i,str) and i]
         limit=max(4,min(128,int(data.get("max_items",48))))
         changed=len(identifiers)!=len(self.identifiers) or any(a!=b for a,b in zip(identifiers,self.identifiers))
         self.identifiers=identifiers
         self.max_items=limit
-        out_features=max(1,len(self.identifiers))
-        schema_changed=force or changed or self.out_features!=out_features
-        self.out_features=out_features
-        if hasattr(self,"registry") and self.registry:
-            self.registry.set_num_classes(out_features)
+        schema_changed=force or changed
+        self.feature_dim=self.registry.feature_dim
         if schema_changed:
             self.model=None
             self.prototype={}
@@ -4943,6 +4949,22 @@ class UIInspector:
         last=None
         seq=[]
         now=time.time()
+        diag=max(1.0,math.hypot(x2-x1,y2-y1))
+        area_box=max(1.0,(x2-x1)*(y2-y1))
+        path_lengths=[]
+        curvature_vals=[]
+        curvature_totals=[]
+        straight_scores=[]
+        direction_rates=[]
+        bbox_ratios=[]
+        density_vals=[]
+        dx_vals=[]
+        dy_vals=[]
+        speed_vals=[]
+        step_means=[]
+        step_maxs=[]
+        var_x=[]
+        var_y=[]
         for e in events:
             if e.get("type") not in ["left","right","middle"]:
                 continue
@@ -4959,12 +4981,75 @@ class UIInspector:
                 if t is not None:
                     last=t
                 seq.append(1 if e.get("type")=="left" else 2 if e.get("type")=="right" else 3)
+                pts=[]
+                def add_point(lx,ly):
+                    try:
+                        sx=float(lx)
+                        sy=float(ly)
+                    except:
+                        return
+                    pts.append((sx/2560.0*cw,sy/1600.0*ch))
+                add_point(e.get("press_lx"),e.get("press_ly"))
+                for mv in e.get("moves") or []:
+                    if isinstance(mv,(list,tuple)) and len(mv)>=3:
+                        add_point(mv[1],mv[2])
+                add_point(e.get("release_lx"),e.get("release_ly"))
+                inside=[p for p in pts if p[0]>=x1 and p[0]<=x2 and p[1]>=y1 and p[1]<=y2]
+                if len(inside)>=2:
+                    dists=[math.hypot(inside[i+1][0]-inside[i][0],inside[i+1][1]-inside[i][1]) for i in range(len(inside)-1)]
+                    total=sum(dists)
+                    if total>0:
+                        path_lengths.append(total/diag)
+                        step_means.append(np.mean(dists)/diag if dists else 0.0)
+                        step_maxs.append(max(dists)/diag if dists else 0.0)
+                        dur=float(e.get("duration",0.0))
+                        if dur>0:
+                            speed_vals.append(total/diag/max(dur,1e-3))
+                    start=inside[0]
+                    end=inside[-1]
+                    dx_vals.append((end[0]-start[0])/max(1.0,x2-x1))
+                    dy_vals.append((end[1]-start[1])/max(1.0,y2-y1))
+                    straight_scores.append(math.hypot(end[0]-start[0],end[1]-start[1])/max(1e-6,total))
+                    xs=[p[0] for p in inside]
+                    ys=[p[1] for p in inside]
+                    span_x=max(xs)-min(xs) if xs else 0.0
+                    span_y=max(ys)-min(ys) if ys else 0.0
+                    bbox_ratios.append((span_x+1.0)*(span_y+1.0)/area_box)
+                    density_vals.append(len(inside)/area_box)
+                    var_x.append(float(np.var(xs))/max(1.0,(x2-x1)**2))
+                    var_y.append(float(np.var(ys))/max(1.0,(y2-y1)**2))
+                    angles=[]
+                    turns=0
+                    for i in range(1,len(inside)-1):
+                        v1=(inside[i][0]-inside[i-1][0],inside[i][1]-inside[i-1][1])
+                        v2=(inside[i+1][0]-inside[i][0],inside[i+1][1]-inside[i][1])
+                        n1=math.hypot(v1[0],v1[1])
+                        n2=math.hypot(v2[0],v2[1])
+                        if n1==0 or n2==0:
+                            continue
+                        cos=max(-1.0,min(1.0,(v1[0]*v2[0]+v1[1]*v2[1])/(n1*n2)))
+                        ang=math.acos(cos)
+                        angles.append(ang)
+                        if ang>math.pi/6:
+                            turns+=1
+                    if angles:
+                        curvature_vals.append(sum(angles)/len(angles)/math.pi)
+                        curvature_totals.append(sum(angles)/math.pi)
+                        direction_rates.append(turns/max(1,len(inside)))
+                    else:
+                        curvature_vals.append(0.0)
+                        curvature_totals.append(0.0)
+                        direction_rates.append(0.0)
         avg_dur=np.mean(durations) if durations else 0.0
         std_dur=np.std(durations) if durations else 0.0
         avg_idle=np.mean(idle) if idle else 0.0
         recent_gap=now-last if last else 0.0
         entropy=self._seq_entropy(seq)
         vec=[clicks,ai_click,avg_dur,std_dur,avg_idle,recent_gap,entropy,float(len(seq)),float(sum(1 for s in seq if s==1)),float(sum(1 for s in seq if s==2)),float(sum(1 for s in seq if s==3)),float(len([1 for e in events if e.get("source")=="ai"])),float(len(events)),float(any(seq)),float(sum(1 for d in durations if d>0.3)),float(sum(1 for d in durations if d<0.05)),float(sum(1 for g in idle if g>1.0)),float(max(seq) if seq else 0)]
+        mean=lambda arr:float(np.mean(arr)) if arr else 0.0
+        mx=lambda arr:float(max(arr)) if arr else 0.0
+        std=lambda arr:float(np.std(arr)) if arr else 0.0
+        vec.extend([mean(path_lengths),mx(path_lengths),mean(curvature_vals),std(curvature_vals),mean(straight_scores),std(straight_scores),mean(direction_rates),mean(bbox_ratios),mean(density_vals),mean(dx_vals),mean(dy_vals),mean(speed_vals),mx(speed_vals),mean(step_means),mx(step_maxs),mean(var_x),mean(var_y),mean(curvature_totals)])
         return torch.tensor([vec],dtype=torch.float32)
     def _safe_time(self,e):
         try:
@@ -4993,9 +5078,11 @@ class UIInspector:
         clicks=float(inter_list[0]) if inter_list else 0.0
         entropy=float(inter_list[6]) if len(inter_list)>6 else 0.0
         ai=float(inter_list[1]) if len(inter_list)>1 else 0.0
-        dur=float(inter_list[2]) if len(inter_list)>2 else 0.0
-        bins=(int(min(9,area*10.0)),int(min(9,clicks)),int(min(9,entropy*4.0)),int(min(9,ai)),int(min(9,dur*10.0)))
-        return f"sig_{bins[0]}_{bins[1]}_{bins[2]}_{bins[3]}_{bins[4]}"
+        path=float(inter_list[18]) if len(inter_list)>18 else 0.0
+        curve=float(inter_list[20]) if len(inter_list)>20 else 0.0
+        straight=float(inter_list[22]) if len(inter_list)>22 else 0.0
+        bins=(int(min(9,area*10.0)),int(min(9,clicks)),int(min(9,entropy*4.0)),int(min(9,ai)),int(min(9,path*3.0)),int(min(9,curve*6.0)),int(min(9,straight*5.0)))
+        return f"sig_{bins[0]}_{bins[1]}_{bins[2]}_{bins[3]}_{bins[4]}_{bins[5]}_{bins[6]}"
     def _stable_key(self,signature,bounds):
         try:
             x1,y1,x2,y2=bounds
@@ -5003,22 +5090,35 @@ class UIInspector:
             x1=y1=x2=y2=0
         payload=f"{signature}_{int(x1)}_{int(y1)}_{int(x2)}_{int(y2)}"
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
-    def _refine(self,conf,inter,rep,layout_vals,signature):
+    def _refine(self,conf,inter,rep,layout_vals,signature,geom_pred):
         clicks=float(inter[0]) if len(inter)>0 else 0.0
         ai_ratio=float(inter[1]) if len(inter)>1 else 0.0
         avg_dur=float(inter[2]) if len(inter)>2 else 0.0
         entropy=float(inter[6]) if len(inter)>6 else 0.0
+        path_span=float(inter[18]) if len(inter)>18 else 0.0
+        path_linearity=float(inter[22]) if len(inter)>22 else 0.0
         area=layout_vals[0] if isinstance(layout_vals,list) and layout_vals else 0.0
         aspect=abs((layout_vals[3]-layout_vals[4]) if isinstance(layout_vals,list) and len(layout_vals)>4 else 0.0)
         activity=self.st.activity_density()
-        dynamic=math.tanh(clicks*0.25+avg_dur*3.0+entropy*0.45+ai_ratio*0.35)
-        spatial=math.tanh(area*4.0+aspect*3.2)
+        dynamic=math.tanh(clicks*0.25+avg_dur*3.0+entropy*0.35+ai_ratio*0.3+path_span*0.2)
+        spatial=0.5+0.5*math.tanh(area*4.0+aspect*3.2)
         orientation=1.0 if self.st.ui_prefers_high else -1.0
-        base=conf*0.55+dynamic*0.25+spatial*0.15+activity*0.05*orientation
+        geom_vals=list(geom_pred) if isinstance(geom_pred,list) else (geom_pred.tolist() if isinstance(geom_pred,np.ndarray) else [])
+        target=None
+        if isinstance(layout_vals,list) and len(layout_vals)>=12:
+            target=layout_vals[8:12]
+        geom_score=0.5
+        if target and geom_vals:
+            diffs=[abs(float(geom_vals[i])-float(target[i])) for i in range(min(len(geom_vals),len(target)))]
+            if diffs:
+                geom_score=max(0.0,min(1.0,1.0-sum(diffs)/len(diffs)*1.4))
+        path_quality=max(0.0,min(1.0,math.tanh(path_span)))
+        straight_bonus=max(0.0,min(1.0,path_linearity))
+        base=conf*0.45+dynamic*0.2+spatial*0.1+activity*0.05*orientation+geom_score*0.15+path_quality*0.05
         proto=self._prototype_score(signature,rep)
         memory=self._memory_vote(signature)
         stability=self._stability_metric(signature)
-        score=base*0.55+proto*0.25+memory*0.15+stability*0.05
+        score=base*0.5+proto*0.25+memory*0.15+stability*0.05+straight_bonus*0.05
         return max(0.0,min(1.0,score))
     def _update_memory(self,signature,rep):
         if signature not in self.prototype:
