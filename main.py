@@ -880,6 +880,9 @@ class PolicyModel(nn.Module):
         self.value=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,192),nn.GELU(),nn.Linear(192,1))
         self.traj_encoder=nn.GRU(4,192,batch_first=True)
         self.sequence_attn=nn.MultiheadAttention(192,6,batch_first=True)
+        self.traj_fusion=nn.Linear(384,192)
+        self.quality_head=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,96),nn.GELU(),nn.Linear(96,1))
+        self.tempo_head=nn.Sequential(nn.LayerNorm(192),nn.Linear(192,96),nn.GELU(),nn.Linear(96,1))
     def forward(self,img,context,history=None,trajectory=None,traj_mask=None):
         feat=self.backbone(img)
         feat=self.reducer(feat)
@@ -890,6 +893,7 @@ class PolicyModel(nn.Module):
             tokens=torch.cat([h,tokens],dim=1)
         if context is not None and context.shape[1]>0:
             tokens=torch.cat([context,tokens],dim=1)
+        traj_summary=torch.zeros((B,192),dtype=tokens.dtype,device=tokens.device)
         if trajectory is not None and trajectory.shape[1]>0:
             traj_feat,_=self.traj_encoder(trajectory)
             if traj_mask is not None and traj_mask.shape[:2]==traj_feat.shape[:2]:
@@ -898,17 +902,23 @@ class PolicyModel(nn.Module):
                 pooled=(traj_feat*mask).sum(dim=1)/denom
             else:
                 pooled=traj_feat.mean(dim=1)
+            traj_summary=pooled
             tokens=torch.cat([pooled.unsqueeze(1),tokens],dim=1)
         attn,_=self.sequence_attn(tokens,tokens,tokens,need_weights=False)
         enc=self.transformer(attn)
         core=self.head(enc)
-        value=self.value(core.mean(dim=1))
+        pooled_core=core.mean(dim=1)
+        value=self.value(pooled_core)
         tail=core[:, -H*W:, :]
         logits=self.click_proj(tail).view(B,H,W,2).permute(0,3,1,2)
         path=self.path_proj(tail).view(B,H,W).unsqueeze(1)
         data_map=self.data_map_proj(tail).view(B,H,W).unsqueeze(1)
-        data_vec=self.data_head(core.mean(dim=1))
-        return logits,value,path,data_map,data_vec
+        data_vec=self.data_head(pooled_core)
+        fusion=torch.cat([pooled_core,traj_summary],dim=-1)
+        fused=self.traj_fusion(fusion)
+        drag_quality=self.quality_head(fused)
+        tempo=self.tempo_head(fused)
+        return logits,value,path,data_map,data_vec,drag_quality,tempo
 class ModelInitializer:
     @staticmethod
     def default_bytes():
@@ -943,6 +953,37 @@ class ModelIO:
                 if k in d.files:
                     current[k]=torch.from_numpy(d[k])
         model.load_state_dict(current,strict=False)
+def ensure_initial_model_file():
+    try:
+        existing=[f for f in os.listdir(models_dir) if f.lower().endswith('.npz')]
+    except:
+        existing=[]
+    if existing:
+        return
+    target=os.path.join(models_dir,cfg_defaults['model_file'])
+    try:
+        data=ModelInitializer.default_bytes()
+    except:
+        data=None
+    if not data:
+        return
+    try:
+        with open(target,'wb') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except:
+        try:
+            fallback=os.path.join(models_dir,'default_policy.npz')
+            with open(fallback,'wb') as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.abspath(fallback)!=os.path.abspath(target):
+                shutil.copy2(fallback,target)
+        except:
+            pass
+ensure_initial_model_file()
 class TemporalPlanner(nn.Module):
     def __init__(self,dim=192):
         super().__init__()
@@ -1139,6 +1180,8 @@ class StrategyEngine:
         self.scene_state=None
         self.loaded_path=None
         self.last_value=0.0
+        self.last_drag_quality=0.5
+        self.last_tempo=0.5
         self.hparams=None
         self.prefers_high=True
         self.pref_map={"__default__":"higher"}
@@ -1244,6 +1287,49 @@ class StrategyEngine:
             return torch.zeros((1,0,self.context_dim),dtype=torch.float32,device=self.device)
         hist=torch.stack(list(self.temporal_memory),dim=1)
         return hist[:,-12:,:]
+    def _trajectory_from_events(self,events):
+        if not events:
+            return None,None
+        last=None
+        for e in reversed(events):
+            if isinstance(e,dict) and e.get("type") in ["left","right","middle"]:
+                last=e
+                break
+        if last is None:
+            return None,None
+        moves=last.get("moves") if isinstance(last.get("moves"),list) else []
+        pts=[]
+        subset=[mv for mv in moves if isinstance(mv,(list,tuple)) and len(mv)>=4]
+        if subset:
+            subset=subset[-64:]
+            start=float(subset[0][0])
+            end=float(subset[-1][0])
+            span=max(end-start,1e-3)
+            for mv in subset:
+                try:
+                    sec=float(mv[0])
+                    x=float(mv[1])/2560.0
+                    y=float(mv[2])/1600.0
+                    inside=float(mv[3])
+                except:
+                    continue
+                t=(sec-start)/span if span>0 else 0.0
+                pts.append([max(0.0,min(1.0,t)),max(0.0,min(1.0,x)),max(0.0,min(1.0,y)),max(0.0,min(1.0,inside))])
+        if not pts:
+            try:
+                px=float(last.get("press_lx",last.get("press_x",0)))/2560.0
+                py=float(last.get("press_ly",last.get("press_y",0)))/1600.0
+                rx=float(last.get("release_lx",last.get("release_x",px*2560.0)))/2560.0
+                ry=float(last.get("release_ly",last.get("release_y",py*1600.0)))/1600.0
+            except:
+                px=0.0
+                py=0.0
+                rx=px
+                ry=py
+            pts=[[0.0,max(0.0,min(1.0,px)),max(0.0,min(1.0,py)),float(max(0.0,min(1.0,last.get("ins_press",0))))],[1.0,max(0.0,min(1.0,rx)),max(0.0,min(1.0,ry)),float(max(0.0,min(1.0,last.get("ins_release",0))))]]
+        arr=torch.tensor(pts,dtype=torch.float32,device=self.device).unsqueeze(0)
+        mask=torch.ones((1,arr.shape[1]),dtype=torch.float32,device=self.device)
+        return arr,mask
     def update_temporal(self,embedding):
         if embedding is None:
             return
@@ -1329,19 +1415,29 @@ class StrategyEngine:
         hp_vals=self.hparams.values if self.hparams else {"confidence_floor":0.18,"primary_threshold":0.55,"long_press_threshold":0.78,"drag_threshold":0.58,"multi_gate":0.5,"confidence_margin":0.1,"drag_steps":28,"parallel_streams":1}
         ctx=self.set_context(events or [])
         hist=self._history_tensor()
+        traj_in,mask_in=self._trajectory_from_events(events or [])
+        traj_arg=traj_in if traj_in is not None else None
+        mask_arg=mask_in if traj_in is not None else None
         with torch.no_grad():
-            logits,value,path_map,data_map,data_vec=self.model(ten,ctx,hist,None,None)
+            logits,value,path_map,data_map,data_vec,qual_raw,tempo_raw=self.model(ten,ctx,hist,traj_arg,mask_arg)
             prob=torch.sigmoid(logits)
             base_value=float(torch.sigmoid(value).mean().item())
             path_heat=torch.sigmoid(path_map)[0,0].detach().cpu().numpy()
             data_heat=torch.sigmoid(data_map)[0,0].detach().cpu().numpy()
             vec=torch.tanh(data_vec).detach().cpu().numpy()
+            drag_quality=float(torch.sigmoid(qual_raw).mean().item())
+            tempo_score=float(torch.sigmoid(tempo_raw).mean().item())
+        drag_quality=max(0.0,min(1.0,drag_quality))
+        tempo_score=max(0.0,min(1.0,tempo_score))
         if vec.size>0:
             data_strength=float(np.mean(vec))
-            value_score=0.7*base_value+0.3*(0.5+0.5*data_strength)
+            value_score=0.55*base_value+0.25*(0.5+0.5*data_strength)+0.2*drag_quality
         else:
-            value_score=base_value
+            value_score=0.7*base_value+0.3*drag_quality
+        value_score=value_score*(0.65+0.35*tempo_score)
         self.last_value=value_score
+        self.last_drag_quality=drag_quality
+        self.last_tempo=tempo_score
         left=prob[0,0].cpu().numpy()
         self.frame_memory.append(left)
         frame_embed=self.embed_frame(img)
@@ -1364,11 +1460,13 @@ class StrategyEngine:
             decision=self.decision(scene_vec,plan_vec,ui_summary)
         multi_factor=float(decision[0,1].item())
         risk_factor=float(decision[0,2].item())
-        gate=float(min(1.0,max(0.0,0.32*gate_plan+0.36*multi_factor+0.2*risk_factor+0.12*value_score)))
+        gate=float(min(1.0,max(0.0,0.24*gate_plan+0.28*multi_factor+0.18*risk_factor+0.14*value_score+0.1*drag_quality+0.06*tempo_score)))
         score=cv2.resize(left,(w,h),interpolation=cv2.INTER_CUBIC)
         path_overlay=cv2.resize(path_heat,(w,h),interpolation=cv2.INTER_CUBIC)
         data_overlay=cv2.resize(data_heat,(w,h),interpolation=cv2.INTER_CUBIC)
-        score=np.clip(score*0.55+path_overlay*0.3+data_overlay*0.15,0,1)
+        quality_factor=0.55+0.45*drag_quality
+        tempo_factor=0.5+0.5*tempo_score
+        score=np.clip(score*(0.4+0.25*quality_factor)+path_overlay*(0.3+0.2*quality_factor)+data_overlay*(0.15+0.1*tempo_factor),0,1)
         goal=self.synthesize_goal_map(ui_elements,w,h)
         if goal is not None:
             if not self.prefers_high:
@@ -1383,7 +1481,7 @@ class StrategyEngine:
         y,x=np.unravel_index(np.argmax(score),score.shape)
         conf=float(score[y,x])
         grid=(score.shape[1],score.shape[0])
-        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical,"value":value_score}
+        base={"kind":"idle","heat":score,"confidence":conf,"grid":grid,"tactical":tactical,"value":value_score,"quality":drag_quality,"tempo":tempo_score}
         if conf<hp_vals.get("confidence_floor",0.18):
             return base
         btn="left" if conf>hp_vals.get("primary_threshold",0.55) or risk_factor>0.45 else "right"
@@ -1394,11 +1492,11 @@ class StrategyEngine:
         vx/=norm
         vy/=norm
         def make_tap(ix,iy,button,conf_level):
-            return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":0.06+0.04*gate,"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy))}
+            return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":(0.06+0.04*gate)*(0.6+0.5*tempo_score),"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy)),"quality":drag_quality,"tempo":tempo_score}
         if conf>hp_vals.get("long_press_threshold",0.78):
-            act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":0.35+0.45*gate,"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y))}
-        elif conf>hp_vals.get("drag_threshold",0.58):
-            extent=max(score.shape[1],score.shape[0])*0.18*(0.6+conf)
+            act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":(0.35+0.45*gate)*(0.6+0.6*tempo_score),"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y)),"quality":drag_quality,"tempo":tempo_score}
+        elif conf>hp_vals.get("drag_threshold",0.58) and (drag_quality>0.35 or risk_factor>0.35):
+            extent=max(score.shape[1],score.shape[0])*0.18*(0.6+conf)*(0.6+0.8*drag_quality)
             dx=vx*extent
             dy=vy*extent
             ex=int(max(0,min(score.shape[1]-1,round(x+dx))))
@@ -1406,14 +1504,14 @@ class StrategyEngine:
             if ex==x and ey==y:
                 ex=int(max(0,min(score.shape[1]-1,round(x+(random.random()-0.5)*extent))))
                 ey=int(max(0,min(score.shape[0]-1,round(y+(random.random()-0.5)*extent))))
-            steps=max(8,int(hp_vals.get("drag_steps",28)))
+            steps=max(8,int(hp_vals.get("drag_steps",28)*(0.7+0.6*tempo_score)))
             drag_path=[]
             for i in range(steps):
                 u=i/max(steps-1,1)
                 ix=int(round(x+(ex-x)*u))
                 iy=int(round(y+(ey-y)*u))
                 drag_path.append((ix,iy))
-            act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":0.18+0.22*gate,"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey))}
+            act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":(0.18+0.22*gate)*(0.65+0.55*tempo_score),"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey)),"quality":drag_quality,"tempo":tempo_score}
         else:
             act=make_tap(x,y,btn,conf)
         peaks=self.local_maxima(score,top=8,dist=36)
@@ -1435,6 +1533,8 @@ class StrategyEngine:
                 seq.append(item)
             for item in seq:
                 item["heat_shape"]=grid
+                item.setdefault("quality",drag_quality)
+                item.setdefault("tempo",tempo_score)
             if parallel>1:
                 streams=[]
                 for idx,item in enumerate(seq):
@@ -1442,12 +1542,14 @@ class StrategyEngine:
                     if len(streams)<=target:
                         streams.append([])
                     streams[target].append(item)
-                combo={"kind":"parallel","streams":streams,"grid":grid,"confidence":conf,"heat":score,"button":btn}
+                combo={"kind":"parallel","streams":streams,"grid":grid,"confidence":conf,"heat":score,"button":btn,"quality":drag_quality,"tempo":tempo_score}
                 return combo
-            combo={"kind":"combo","sequence":seq,"grid":grid,"confidence":conf,"heat":score,"button":btn}
+            combo={"kind":"combo","sequence":seq,"grid":grid,"confidence":conf,"heat":score,"button":btn,"quality":drag_quality,"tempo":tempo_score}
             return combo
         act["heat"]=score
         act["heat_shape"]=grid
+        act.setdefault("quality",drag_quality)
+        act.setdefault("tempo",tempo_score)
         return act
     def _ui_summary_tensor(self,ui_elements,w,h):
         vec=torch.zeros((1,self.context_dim),dtype=torch.float32,device=self.device)
@@ -1487,7 +1589,7 @@ class StrategyEngine:
             coords.append((int(x),int(y),float(score[y,x])))
         coords.sort(key=lambda t:t[2],reverse=True)
         plan=[]
-        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(self.last_value>0.62)
+        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(self.last_value>0.62)+int(self.last_drag_quality>0.55)
         used=set()
         for x,y,val in coords:
             if len(plan)>=budget:
@@ -1520,7 +1622,24 @@ class StrategyEngine:
         for batch in batches:
             if batch is None:
                 continue
-            if len(batch)==4:
+            quality=None
+            timing=None
+            if len(batch)==12:
+                img,ctx,label,hist,data,traj,mask,val,adv,weight,quality,timing=batch
+            elif len(batch)==10:
+                img,ctx,label,hist,data,traj,mask,val,adv,weight=batch
+                bs=img.shape[0]
+                quality=torch.zeros((bs,1),dtype=torch.float32)
+                timing=torch.zeros((bs,1),dtype=torch.float32)
+            elif len(batch)==7:
+                img,ctx,label,hist,val,adv,weight=batch
+                bs=img.shape[0]
+                data=torch.zeros((bs,16),dtype=torch.float32)
+                traj=torch.zeros((bs,1,4),dtype=torch.float32)
+                mask=torch.ones((bs,1),dtype=torch.float32)
+                quality=torch.zeros((bs,1),dtype=torch.float32)
+                timing=torch.zeros((bs,1),dtype=torch.float32)
+            elif len(batch)==4:
                 img,ctx,label,hist=batch
                 bs=img.shape[0]
                 data=torch.zeros((bs,16),dtype=torch.float32)
@@ -1529,14 +1648,13 @@ class StrategyEngine:
                 val=torch.zeros((bs,1),dtype=torch.float32)
                 adv=torch.zeros((bs,1),dtype=torch.float32)
                 weight=torch.ones((bs,1),dtype=torch.float32)
-            elif len(batch)==7:
-                img,ctx,label,hist,val,adv,weight=batch
-                bs=img.shape[0]
-                data=torch.zeros((bs,16),dtype=torch.float32)
-                traj=torch.zeros((bs,1,4),dtype=torch.float32)
-                mask=torch.ones((bs,1),dtype=torch.float32)
+                quality=torch.zeros((bs,1),dtype=torch.float32)
+                timing=torch.zeros((bs,1),dtype=torch.float32)
             else:
                 img,ctx,label,hist,data,traj,mask,val,adv,weight=batch
+                bs=img.shape[0]
+                quality=torch.zeros((bs,1),dtype=torch.float32) if quality is None else quality
+                timing=torch.zeros((bs,1),dtype=torch.float32) if timing is None else timing
             processed+=1
             img=img.to(self.device)
             ctx=ctx.to(self.device).float()
@@ -1549,7 +1667,9 @@ class StrategyEngine:
             val_t=val.to(self.device).float()
             adv_t=adv.to(self.device).float()
             weight_t=weight.to(self.device).float()
-            logits,value,path_pred,data_map_pred,data_vec=self.model(img,ctx,hist,traj,mask)
+            quality_t=(quality if quality is not None else torch.zeros((img.shape[0],1),dtype=torch.float32)).to(self.device).float()
+            timing_t=(timing if timing is not None else torch.zeros((img.shape[0],1),dtype=torch.float32)).to(self.device).float()
+            logits,value,path_pred,data_map_pred,data_vec,drag_q_pred,tempo_pred=self.model(img,ctx,hist,traj,mask)
             click_target=label[:,0:2]
             path_target=label[:,2:3]
             map_target=label[:,3:4]
@@ -1568,7 +1688,10 @@ class StrategyEngine:
             path_loss=F.mse_loss(torch.sigmoid(path_pred),path_target)
             map_loss=F.mse_loss(torch.sigmoid(data_map_pred),map_target)
             data_loss=F.smooth_l1_loss(data_vec,data)
-            loss=0.4*base_loss+0.25*rl_loss+0.3*value_loss+0.12*path_loss+0.08*map_loss+0.15*data_loss-entropy_weight*entropy+0.05*neg_factor
+            quality_loss=F.mse_loss(torch.sigmoid(drag_q_pred),quality_t)
+            tempo_loss=F.mse_loss(torch.sigmoid(tempo_pred),timing_t)
+            align_penalty=(torch.abs(torch.sigmoid(path_pred)-path_target)*(quality_t.view(-1,1,1,1)+0.1)).mean()
+            loss=0.36*base_loss+0.22*rl_loss+0.26*value_loss+0.12*path_loss+0.08*map_loss+0.14*data_loss+0.1*quality_loss+0.08*tempo_loss+0.05*align_penalty-entropy_weight*entropy+0.05*neg_factor
             loss.backward()
             nn.utils.clip_grad_norm_(self.model.parameters(),1.0)
             nn.utils.clip_grad_norm_(self.semantic.parameters(),1.0)
@@ -3928,7 +4051,7 @@ class OptimizerThread(threading.Thread):
                         img=self._get_frame_image(e.get("frame_path"))
                     if img is None:
                         continue
-                    label,data_vec,traj=self._make_label(e,img.shape[1],img.shape[0])
+                    label,data_vec,traj,quality,timing=self._make_label(e,img.shape[1],img.shape[0])
                     if label is None:
                         continue
                     ctx=self._context_tensor(list(hist),len(hist)-1)
@@ -3936,8 +4059,10 @@ class OptimizerThread(threading.Thread):
                     size=self.st.policy_resolution
                     tensor_img=torch.from_numpy(cv2.resize(img,size)).permute(2,0,1).float()/255.0
                     reward=self._reward_of_event(e)
-                    value,adv,weight=self._rl_signal(reward)
-                    pending.append((tensor_img,ctx,label,data_vec,traj,hist_t,value,adv,weight))
+                    q_val=float(quality.reshape(-1)[0].item()) if isinstance(quality,torch.Tensor) else float(quality)
+                    t_val=float(timing.reshape(-1)[0].item()) if isinstance(timing,torch.Tensor) else float(timing)
+                    value,adv,weight=self._rl_signal(reward,q_val,t_val)
+                    pending.append((tensor_img,ctx,label,data_vec,traj,hist_t,value,adv,weight,quality,timing))
                     if len(pending)>=bs:
                         produced+=1
                         yield self._stack_batch(pending[:bs])
@@ -3959,7 +4084,20 @@ class OptimizerThread(threading.Thread):
         vals=[]
         advs=[]
         weights=[]
-        for (img,ctx,label,data_vec,traj,hist,val,adv,weight) in samples:
+        qualities=[]
+        timings=[]
+        for sample in samples:
+            if len(sample)>=11:
+                img,ctx,label,data_vec,traj,hist,val,adv,weight,quality,timing=sample[:11]
+            elif len(sample)==10:
+                img,ctx,label,data_vec,traj,hist,val,adv,weight,quality=sample
+                timing=torch.tensor([0.5],dtype=torch.float32)
+            elif len(sample)==9:
+                img,ctx,label,data_vec,traj,hist,val,adv,weight=sample
+                quality=torch.tensor([0.5],dtype=torch.float32)
+                timing=torch.tensor([0.5],dtype=torch.float32)
+            else:
+                raise ValueError("unexpected sample format")
             imgs.append(img.float())
             ctxs.append(ctx.to(torch.float32) if isinstance(ctx,torch.Tensor) else torch.tensor(ctx,dtype=torch.float32))
             grids.append(label.to(torch.float32) if isinstance(label,torch.Tensor) else torch.tensor(label,dtype=torch.float32))
@@ -3975,6 +4113,14 @@ class OptimizerThread(threading.Thread):
             vals.append(float(val))
             advs.append(float(adv))
             weights.append(float(weight))
+            q_tensor=quality if isinstance(quality,torch.Tensor) else torch.tensor([float(quality)],dtype=torch.float32)
+            if q_tensor.ndim==0:
+                q_tensor=q_tensor.unsqueeze(0)
+            qualities.append(q_tensor.reshape(1).to(torch.float32))
+            t_tensor=timing if isinstance(timing,torch.Tensor) else torch.tensor([float(timing)],dtype=torch.float32)
+            if t_tensor.ndim==0:
+                t_tensor=t_tensor.unsqueeze(0)
+            timings.append(t_tensor.reshape(1).to(torch.float32))
         max_len=max(lengths) if lengths else 1
         padded=[]
         mask_list=[]
@@ -3988,7 +4134,7 @@ class OptimizerThread(threading.Thread):
             mask=torch.zeros((max_len,),dtype=torch.float32)
             mask[:min(length,max_len)]=1.0
             mask_list.append(mask)
-        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(grids,dim=0),torch.stack(hists,dim=0),torch.stack(datas,dim=0),torch.stack(padded,dim=0),torch.stack(mask_list,dim=0),torch.tensor(vals,dtype=torch.float32).unsqueeze(1),torch.tensor(advs,dtype=torch.float32).unsqueeze(1),torch.tensor(weights,dtype=torch.float32).unsqueeze(1))
+        return (torch.stack(imgs,dim=0),torch.stack(ctxs,dim=0),torch.stack(grids,dim=0),torch.stack(hists,dim=0),torch.stack(datas,dim=0),torch.stack(padded,dim=0),torch.stack(mask_list,dim=0),torch.tensor(vals,dtype=torch.float32).unsqueeze(1),torch.tensor(advs,dtype=torch.float32).unsqueeze(1),torch.tensor(weights,dtype=torch.float32).unsqueeze(1),torch.stack(qualities,dim=0),torch.stack(timings,dim=0))
     def _reward_of_event(self,e):
         if not isinstance(e,dict):
             return 0.0
@@ -3996,6 +4142,7 @@ class OptimizerThread(threading.Thread):
             reward=float(self.reward_engine.evaluate(e))
         except:
             reward=0.0
+        quality=self._event_quality(e)
         if reward<=0.0:
             dur=max(0.0,float(e.get("duration",0.0) or 0.0))
             base=0.08+min(0.36,dur*0.4)
@@ -4004,17 +4151,20 @@ class OptimizerThread(threading.Thread):
             elif e.get("type")=="right":
                 base+=0.08
             reward=base
-        return max(0.0,min(2.2,reward))
-    def _rl_signal(self,reward):
+        reward=reward*(0.65+0.25*quality)+quality*0.35
+        return max(0.0,min(2.4,reward))
+    def _rl_signal(self,reward,quality=None,timing=None):
         r=float(reward)
-        self.trace=self.trace*self.gamma*self.lam+r
-        self.baseline=self.baseline*0.97+r*0.03
+        q=float(quality) if quality is not None else 0.5
+        t=float(timing) if timing is not None else 0.5
+        self.trace=self.trace*self.gamma*self.lam+r+0.2*q+0.05*(t-0.5)
+        self.baseline=self.baseline*0.96+r*0.03+0.04*q
         adv=self.trace-self.baseline
         adv=max(-2.5,min(2.5,adv))
         value=max(-3.0,min(3.0,self.trace))
-        weight=max(0.1,min(2.5,0.5+abs(adv)*0.7))
+        weight=max(0.2,min(2.8,0.5+abs(adv)*0.6+q*0.3+t*0.2))
         if adv<0:
-            weight*=0.6
+            weight*=0.6*(0.8+0.2*(1.0-min(1.0,max(0.0,q))))
         return value,adv,weight
     def _sort_events(self,events):
         return sorted(events,key=lambda e:self._event_time(e) or 0)
@@ -4060,22 +4210,24 @@ class OptimizerThread(threading.Thread):
                 continue
             size=self.st.policy_resolution
             img=cv2.resize(img,size)
-            label,data_vec,traj=self._make_label(e,img.shape[1],img.shape[0])
+            label,data_vec,traj,quality,timing=self._make_label(e,img.shape[1],img.shape[0])
             if label is None:
                 continue
             ctx=self._context_tensor(events,idx)
             hist=self._history_tensor(events,idx)
             reward=self._reward_of_event(e)
-            seqs.append((img,ctx,label,data_vec,traj,hist,reward))
+            seqs.append((img,ctx,label,data_vec,traj,hist,reward,quality,timing))
         random.shuffle(seqs)
         batches=[]
         bs=self.batch_size
         for i in range(0,len(seqs),bs):
             chunk=seqs[i:i+bs]
             samples=[]
-            for (img,ctx,label,data_vec,traj,hist,reward) in chunk:
-                value,adv,weight=self._rl_signal(reward)
-                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,data_vec,traj,hist,value,adv,weight))
+            for (img,ctx,label,data_vec,traj,hist,reward,quality,timing) in chunk:
+                q_val=float(quality.reshape(-1)[0].item()) if isinstance(quality,torch.Tensor) else float(quality)
+                t_val=float(timing.reshape(-1)[0].item()) if isinstance(timing,torch.Tensor) else float(timing)
+                value,adv,weight=self._rl_signal(reward,q_val,t_val)
+                samples.append((torch.from_numpy(img).permute(2,0,1).float()/255.0,ctx,label,data_vec,traj,hist,value,adv,weight,quality,timing))
             if not samples:
                 continue
             batches.append(self._stack_batch(samples))
@@ -4174,6 +4326,105 @@ class OptimizerThread(threading.Thread):
             arr[i,2]=float(max(0.0,min(1.0,y)))
             arr[i,3]=float(max(0.0,min(1.0,inside)))
         return torch.from_numpy(arr)
+    def _trajectory_metrics(self,points,data_map,e):
+        if not points:
+            return 0.0,0.0,1.0,0.5,0.0
+        length=0.0
+        inside_sum=0.0
+        smooth=0.0
+        for idx,(t,x,y,inside) in enumerate(points):
+            inside_sum+=inside
+            if idx>0:
+                dx=x-points[idx-1][1]
+                dy=y-points[idx-1][2]
+                length+=math.sqrt(dx*dx+dy*dy)
+            if idx>1:
+                ax=points[idx-1][1]-points[idx-2][1]
+                ay=points[idx-1][2]-points[idx-2][2]
+                bx=x-points[idx-1][1]
+                by=y-points[idx-1][2]
+                denom=math.sqrt(ax*ax+ay*ay)*math.sqrt(bx*bx+by*by)+1e-6
+                smooth+=max(-1.0,min(1.0,(ax*bx+ay*by)/denom))
+        inside_ratio=inside_sum/max(1,len(points))
+        smooth_norm=1.0 if len(points)<3 else (smooth/max(1,len(points)-2)+1.0)/2.0
+        length_norm=min(1.0,length*0.9)
+        density=0.0
+        if isinstance(data_map,np.ndarray) and data_map.size>0:
+            h,w=data_map.shape
+            vals=[]
+            for (_,x,y,_) in points:
+                gx=int(max(0,min(w-1,round(x*(w-1))))) if w>1 else 0
+                gy=int(max(0,min(h-1,round(y*(h-1))))) if h>1 else 0
+                vals.append(float(data_map[gy,gx]))
+            if vals:
+                density=max(0.0,min(1.0,sum(vals)/len(vals)))
+        else:
+            density=inside_ratio
+        coverage=0.0
+        conf_total=0.0
+        bindings=e.get("data_bindings") if isinstance(e.get("data_bindings"),list) else []
+        for b in bindings:
+            nb=b.get("norm_bounds")
+            if not isinstance(nb,(list,tuple)) or len(nb)!=4:
+                continue
+            try:
+                nx1=float(nb[0])
+                ny1=float(nb[1])
+                nx2=float(nb[2])
+                ny2=float(nb[3])
+            except:
+                continue
+            nx1=max(0.0,min(1.0,nx1))
+            ny1=max(0.0,min(1.0,ny1))
+            nx2=max(nx1,min(1.0,nx2))
+            ny2=max(ny1,min(1.0,ny2))
+            hits=0
+            total=len(points)
+            for (_,x,y,_) in points:
+                if x>=nx1 and x<=nx2 and y>=ny1 and y<=ny2:
+                    hits+=1
+            ratio=hits/max(1,total)
+            pref=str(b.get("preference",""))
+            bias=0.5
+            pl=pref.lower()
+            if pl.startswith("high") or pref.startswith("越高"):
+                bias=1.0
+            elif pl.startswith("low") or pref.startswith("越低"):
+                bias=0.6
+            elif pl.startswith("无关") or pl.startswith("ignore"):
+                bias=0.3
+            conf=float(max(0.0,min(1.0,b.get("confidence",0.5))))
+            coverage+=conf*ratio*bias
+            conf_total+=conf
+        coverage_norm=coverage/max(conf_total,1e-6)
+        coverage_norm=max(0.0,min(1.0,coverage_norm))
+        return length_norm,inside_ratio,smooth_norm,coverage_norm,density
+    def _trajectory_quality(self,points,e,data_map):
+        length_norm,inside_ratio,smooth_norm,coverage_norm,density=self._trajectory_metrics(points,data_map,e)
+        base=0.35*length_norm+0.25*inside_ratio+0.2*coverage_norm+0.2*density
+        quality=0.7*base+0.3*smooth_norm
+        return max(0.0,min(1.0,quality))
+    def _timing_target(self,e,points,quality,data_map):
+        length_norm,inside_ratio,smooth_norm,coverage_norm,density=self._trajectory_metrics(points,data_map,e)
+        try:
+            duration=float(e.get("duration",0.0) or 0.0)
+        except:
+            duration=0.0
+        dur_norm=max(0.0,min(1.0,duration/1.6))
+        tempo=0.4*dur_norm+0.2*length_norm+0.15*inside_ratio+0.15*density+0.1*coverage_norm
+        tempo=0.8*tempo+0.2*max(0.0,min(1.0,quality))
+        tempo=0.5*tempo+0.5*max(0.0,min(1.0,0.6*smooth_norm+0.4*inside_ratio))
+        return max(0.0,min(1.0,tempo))
+    def _event_quality(self,e):
+        win=e.get("frame_size") if isinstance(e.get("frame_size"),(list,tuple)) else [2560,1600]
+        try:
+            w=int(win[0])
+            h=int(win[1])
+        except:
+            w,h=2560,1600
+        points=self._trajectory_points(e,w,h)
+        data_map,_=self._data_targets(e,13,20)
+        return self._trajectory_quality(points,e,data_map)
     def _make_label(self,e,w,h):
         x=int(float(e.get("press_lx",0))/2560.0*w)
         y=int(float(e.get("press_ly",0))/1600.0*h)
@@ -4197,10 +4448,14 @@ class OptimizerThread(threading.Thread):
         if total>0:
             grid[2]=grid[2]/total
         data_map,data_vec=self._data_targets(e,grid_h,grid_w)
+        quality=self._trajectory_quality(points,e,data_map)
+        timing=self._timing_target(e,points,quality,data_map)
         grid[3]=torch.from_numpy(data_map.astype(np.float32))
         data_tensor=torch.from_numpy(data_vec.astype(np.float32))
         traj_tensor=self._trajectory_tensor(points)
-        return grid,data_tensor,traj_tensor
+        quality_tensor=torch.tensor([float(quality)],dtype=torch.float32)
+        timing_tensor=torch.tensor([float(timing)],dtype=torch.float32)
+        return grid,data_tensor,traj_tensor,quality_tensor,timing_tensor
     def _context_tensor(self,events,idx):
         ctx=[]
         dim=self.st.strategy.context_dim
@@ -4399,7 +4654,9 @@ class OptimizerThread(threading.Thread):
             label[0,cy,cx]=1.0
             data_vec=torch.zeros(16,dtype=torch.float32)
             traj=torch.zeros((1,4),dtype=torch.float32)
-            samples.append((img,ctx,label,data_vec,traj,hist,0.0,0.0,1.0))
+            quality=torch.tensor([0.5],dtype=torch.float32)
+            timing=torch.tensor([0.5],dtype=torch.float32)
+            samples.append((img,ctx,label,data_vec,traj,hist,0.0,0.0,1.0,quality,timing))
         return [self._stack_batch(samples)]
 class UIATextExtractor:
     def __init__(self):
