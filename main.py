@@ -4928,9 +4928,9 @@ class UIModelRegistry:
             self.feature_dim=count
             self.meta.setdefault("_schema",{})["feature_dim"]=count
             self.cache.clear()
-            self._save()
-            mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
-        self._ensure_mapping(mapping)
+        self._save()
+        mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
+        self._compat_mapping(mapping)
     def _write_default(self,path):
         cls=globals().get("UIReasoner")
         if cls is None:
@@ -4984,7 +4984,7 @@ class UIModelRegistry:
                 self._write_default(path)
             except Exception as e:
                 log(f"ui_model_init_fail:{uid}:{e}")
-        self._ensure_mapping(mapping)
+        self._compat_mapping(mapping)
         return self._load_model(uid,path,device)
     def model_path(self,uid):
         if not uid:
@@ -5230,6 +5230,24 @@ class UIModelTrainer:
             return
         self.mapping_cache=dict(mapping)
         ModelMeta.merge({"ui_models":mapping})
+    def _compat_mapping(self,mapping):
+        if mapping is None:
+            return
+        handler=getattr(self,"_ensure_mapping",None)
+        if callable(handler):
+            try:
+                handler(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_ensure_attr_error")
+            except Exception as e:
+                log(f"ui_registry_ensure_fail:{e}")
+        fallback=getattr(self,"_apply_mapping",None)
+        if callable(fallback):
+            try:
+                fallback(mapping)
+            except Exception as e:
+                log(f"ui_registry_apply_fail:{e}")
     def _ensure_mapping(self,mapping):
         if mapping is None:
             return
