@@ -5007,6 +5007,70 @@ class UIModelRegistry:
             except Exception as e:
                 log(f"ui_model_path_init_fail:{uid}:{e}")
         return path
+    def save(self,uid,model):
+        if not uid or model is None:
+            return
+        with self.lock:
+            info=self.meta.setdefault("items",{}).get(uid)
+            path=os.path.join(models_dir,info.get("file")) if info and info.get("file") else None
+        if not path:
+            return
+        try:
+            ModelIO.save(model,path)
+        except Exception as e:
+            log(f"ui_model_save_fail:{uid}:{e}")
+    def _apply_mapping(self,mapping):
+        if mapping is None:
+            return
+        self.mapping_cache=dict(mapping)
+        ModelMeta.merge({"ui_models":mapping})
+    def _compat_mapping(self,mapping):
+        if mapping is None:
+            return
+        handler=getattr(self,"_ensure_mapping",None)
+        if callable(handler):
+            try:
+                handler(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_ensure_attr_error")
+            except Exception as e:
+                log(f"ui_registry_ensure_fail:{e}")
+        fallback=getattr(self,"_apply_mapping",None)
+        if callable(fallback):
+            try:
+                fallback(mapping)
+            except Exception as e:
+                log(f"ui_registry_apply_fail:{e}")
+    def _ensure_mapping(self,mapping):
+        if mapping is None:
+            return
+        handler=getattr(self,"_sync_meta",None)
+        if callable(handler):
+            try:
+                handler(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_sync_attr_error")
+            except Exception as e:
+                log(f"ui_registry_sync_fail:{e}")
+        self._apply_mapping(mapping)
+    def _sync_meta(self,mapping):
+        if self.mapping_cache==mapping:
+            return
+        merge=getattr(self,"_merge_meta",None)
+        if callable(merge):
+            try:
+                merge(mapping)
+                return
+            except AttributeError:
+                log("ui_registry_merge_attr_error")
+        else:
+            log("ui_registry_merge_missing")
+        self._apply_mapping(mapping)
+    def _merge_meta(self,mapping):
+        if self.mapping_cache!=mapping:
+            self._apply_mapping(mapping)
 class UIModelTrainer:
     def __init__(self,inspector):
         self.inspector=inspector
@@ -5213,70 +5277,6 @@ class UIModelTrainer:
             if isinstance(mv,(list,tuple)) and len(mv)>=3:
                 add(mv[1],mv[2])
         return pts
-    def save(self,uid,model):
-        if not uid or model is None:
-            return
-        with self.lock:
-            info=self.meta.setdefault("items",{}).get(uid)
-            path=os.path.join(models_dir,info.get("file")) if info and info.get("file") else None
-        if not path:
-            return
-        try:
-            ModelIO.save(model,path)
-        except Exception as e:
-            log(f"ui_model_save_fail:{uid}:{e}")
-    def _apply_mapping(self,mapping):
-        if mapping is None:
-            return
-        self.mapping_cache=dict(mapping)
-        ModelMeta.merge({"ui_models":mapping})
-    def _compat_mapping(self,mapping):
-        if mapping is None:
-            return
-        handler=getattr(self,"_ensure_mapping",None)
-        if callable(handler):
-            try:
-                handler(mapping)
-                return
-            except AttributeError:
-                log("ui_registry_ensure_attr_error")
-            except Exception as e:
-                log(f"ui_registry_ensure_fail:{e}")
-        fallback=getattr(self,"_apply_mapping",None)
-        if callable(fallback):
-            try:
-                fallback(mapping)
-            except Exception as e:
-                log(f"ui_registry_apply_fail:{e}")
-    def _ensure_mapping(self,mapping):
-        if mapping is None:
-            return
-        handler=getattr(self,"_sync_meta",None)
-        if callable(handler):
-            try:
-                handler(mapping)
-                return
-            except AttributeError:
-                log("ui_registry_sync_attr_error")
-            except Exception as e:
-                log(f"ui_registry_sync_fail:{e}")
-        self._apply_mapping(mapping)
-    def _sync_meta(self,mapping):
-        if self.mapping_cache==mapping:
-            return
-        merge=getattr(self,"_merge_meta",None)
-        if callable(merge):
-            try:
-                merge(mapping)
-                return
-            except AttributeError:
-                log("ui_registry_merge_attr_error")
-        else:
-            log("ui_registry_merge_missing")
-        self._apply_mapping(mapping)
-    def _merge_meta(self,mapping):
-        if self.mapping_cache!=mapping:
-            self._apply_mapping(mapping)
 class UIInspector:
     def __init__(self,st):
         self.st=st
