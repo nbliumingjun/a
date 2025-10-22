@@ -247,10 +247,45 @@ def _gpu_util_mem():
     except:
         return None,None
 class RewardComposer:
-    def __init__(self):
+    def __init__(self,hparams=None,cfg=None):
         self.summary={"win_rate":0.5,"objective":0.0,"task":0.0}
         self.lock=threading.Lock()
         self.last_scan=0.0
+        self.hparams=hparams
+        self.cfg=dict(cfg_defaults)
+        if isinstance(cfg,dict):
+            self.cfg.update(cfg)
+        self.history=collections.deque(maxlen=480)
+        self.resources=collections.deque(maxlen=180)
+        self.metric_buffer=collections.deque(maxlen=240)
+        self.span_norm=0.0
+        self.duration_norm=0.0
+        self.inside_norm=0.0
+        self.combo_norm=0.0
+        self.profile_cache=None
+        self.profile_ts=0.0
+    def bind_hparams(self,hparams):
+        self.hparams=hparams
+        self.profile_cache=None
+    def observe_metrics(self,fps,motion,pressure,mode):
+        self.metric_buffer.append((float(fps),float(motion),float(pressure),time.time(),str(mode)))
+        self.profile_cache=None
+    def observe_resource(self,cpu,mem,gpu,vram):
+        now=time.time()
+        self.resources.append((now,float(cpu),float(mem),float(gpu),float(vram)))
+        self.profile_cache=None
+    def record_event(self,duration,span,inside,combo,is_ai):
+        now=time.time()
+        self.history.append((now,float(duration),float(span),float(inside),float(combo),bool(is_ai)))
+        if duration>0:
+            self.duration_norm=duration if self.duration_norm<=0 else self.duration_norm*0.9+duration*0.1
+        if span>0:
+            self.span_norm=span if self.span_norm<=0 else self.span_norm*0.9+span*0.1
+        if inside>=0:
+            self.inside_norm=inside if self.inside_norm<=0 else self.inside_norm*0.9+inside*0.1
+        if combo>=0:
+            self.combo_norm=combo if self.combo_norm<=0 else self.combo_norm*0.9+combo*0.1
+        self.profile_cache=None
     def _scan(self):
         if time.time()-self.last_scan<5.0:
             return
@@ -322,42 +357,134 @@ class RewardComposer:
     def metrics(self):
         self._scan()
         return dict(self.summary)
+    def profile(self):
+        return self._profile()
+    def _profile(self):
+        now=time.time()
+        if self.profile_cache is not None and now-self.profile_ts<0.3:
+            return self.profile_cache
+        metrics=self.metrics()
+        events=list(self.history)
+        if events:
+            duration_avg=sum(e[1] for e in events)/len(events)
+            span_avg=sum(e[2] for e in events)/len(events)
+            inside_avg=sum(e[3] for e in events)/len(events)
+            combo_avg=sum(e[4] for e in events)/len(events)
+            ai_ratio=sum(1 for e in events if e[5])/len(events)
+        else:
+            duration_avg=self.duration_norm if self.duration_norm>0 else 0.2
+            span_avg=self.span_norm if self.span_norm>0 else 160.0
+            inside_avg=self.inside_norm if self.inside_norm>0 else 0.5
+            combo_avg=self.combo_norm if self.combo_norm>0 else 0.0
+            ai_ratio=0.0
+        if self.metric_buffer:
+            metric_recent=[m for m in self.metric_buffer if now-m[3]<=20.0]
+            if not metric_recent:
+                metric_recent=list(self.metric_buffer)
+            fps_avg=sum(m[0] for m in metric_recent)/len(metric_recent)
+            motion_avg=sum(m[1] for m in metric_recent)/len(metric_recent)
+            mode_bias=sum(1.0 if m[4].startswith("train") else 0.0 for m in metric_recent)/len(metric_recent)
+        else:
+            fps_avg=(float(self.cfg.get("screenshot_min_fps",1))+float(self.cfg.get("screenshot_max_fps",120)))/2.0
+            motion_avg=0.0
+            mode_bias=0.0
+        if self.resources:
+            resource_recent=[r for r in self.resources if now-r[0]<=30.0]
+            if not resource_recent:
+                resource_recent=list(self.resources)
+            resource_pressure=sum(max(r[1],r[2],r[3],r[4]) for r in resource_recent)/len(resource_recent)
+        else:
+            resource_pressure=0.0
+        hp=self.hparams.values if self.hparams else {}
+        gamma=float(hp.get("gamma",0.92))
+        lam=float(hp.get("lam",0.85))
+        drag_steps=float(hp.get("drag_steps",28))
+        multi_gate=float(hp.get("multi_gate",0.5))
+        confidence_floor=float(hp.get("confidence_floor",0.18))
+        drag_threshold=float(hp.get("drag_threshold",0.58))
+        fps_low=float(self.cfg.get("screenshot_min_fps",1))
+        fps_high=float(self.cfg.get("screenshot_max_fps",120))
+        fps_range=max(1.0,fps_high-fps_low)
+        fps_factor=min(1.0,max(0.0,(fps_avg-fps_low)/fps_range))
+        motion_factor=min(1.4,max(0.2,motion_avg/18.0))
+        idle_factor=max(0.5,min(1.8,float(self.cfg.get("idle_timeout",10))/10.0))
+        base_reward=0.05+0.12*metrics.get("win_rate",0.5)+0.06*min(1.2,metrics.get("objective",0.0)/10.0)+0.05*min(1.2,metrics.get("task",0.0)/5.0)
+        base_reward=base_reward*(0.85+0.35*(1.0-gamma))
+        base_reward=base_reward*(0.9+0.2*(1.0-min(1.0,resource_pressure/100.0)))
+        base_reward=base_reward*(0.8+0.3*fps_factor)*(0.85+0.25*idle_factor)
+        inside_factor=min(1.5,max(0.2,inside_avg))
+        button_weights={"left":0.05+0.09*inside_factor,"right":0.04+0.06*(1.0-min(1.0,inside_factor/2.0)),"middle":0.03+0.05*(1.0-min(1.0,inside_factor/2.4))}
+        dur_norm=self.duration_norm if self.duration_norm>0 else max(duration_avg,0.18)
+        span_norm=self.span_norm if self.span_norm>0 else max(span_avg,96.0)
+        combo_norm=self.combo_norm if self.combo_norm>0 else max(combo_avg,0.2)
+        dur_ratio=duration_avg/max(dur_norm,1e-6)
+        span_ratio=span_avg/max(span_norm,1e-6)
+        combo_ratio=combo_avg/max(combo_norm,1e-6)
+        duration_weight=0.12+0.42*min(1.6,dur_ratio*(1.0+(1.0-lam)))
+        span_weight=0.1+0.4*min(1.6,span_ratio*(0.8+0.4*drag_threshold))
+        combo_weight=0.04+0.05*min(1.5,combo_ratio*(0.8+0.4*multi_gate))
+        inside_weight=0.05+0.07*min(1.6,inside_factor)
+        synergy=0.7+0.3*metrics.get("win_rate",0.5)+0.15*(1.0-min(1.0,resource_pressure/100.0))+0.1*motion_factor+0.05*(1.0-mode_bias)
+        span_cap=0.2+0.6*(1.0-min(1.0,resource_pressure/105.0))
+        combo_cap=0.25+0.5*min(1.2,0.5+multi_gate)
+        ai_penalty=0.85+0.1*(1.0-min(1.0,ai_ratio))
+        duration_penalty_ratio=1.2+0.5*ai_ratio-0.2*fps_factor
+        duration_penalty_weight=0.08+0.12*(1.0-min(1.0,resource_pressure/100.0))
+        span_penalty_ratio=0.8+0.4*multi_gate-0.1*fps_factor
+        span_penalty_weight=0.06+0.1*(1.0-min(1.0,resource_pressure/100.0))
+        reward_cap=1.6+0.6*(1.0-gamma)+0.2*multi_gate
+        tap_duration=max(0.03,min(0.18,dur_norm*0.6*(0.7+0.3*(1.0-confidence_floor))))
+        long_duration=max(tap_duration*1.4,dur_norm*(1.2+0.6*multi_gate+0.3*combo_ratio))
+        drag_duration=max(tap_duration*1.1,dur_norm*(0.9+0.5*span_ratio+0.2*motion_factor))
+        drag_extent=max(0.05,min(0.6,(0.12+0.35*span_ratio)*(0.8+0.3*(1.0-min(1.0,resource_pressure/105.0)))))
+        drag_steps=max(4.0,min(96.0,drag_steps*(0.6+0.5*span_ratio)*(0.8+0.3*motion_factor)))
+        multi_base=1.0+max(0.0,combo_ratio*0.8)+max(0.0,span_ratio*0.6)
+        multi_margin=max(0.2,min(0.9,multi_gate*(0.8+0.4*motion_factor)))
+        profile={"base":base_reward,"button_weights":button_weights,"duration_weight":duration_weight,"span_weight":span_weight,"combo_weight":combo_weight,"inside_weight":inside_weight,"synergy":synergy,"span_cap":span_cap,"combo_cap":combo_cap,"ai_penalty":ai_penalty,"duration_penalty_ratio":duration_penalty_ratio,"duration_penalty_weight":duration_penalty_weight,"span_penalty_ratio":span_penalty_ratio,"span_penalty_weight":span_penalty_weight,"reward_cap":reward_cap,"duration_norm":max(dur_norm,1e-3),"span_norm":max(span_norm,1e-3),"tap_duration":tap_duration,"long_duration":long_duration,"drag_duration":drag_duration,"drag_extent":drag_extent,"drag_steps":drag_steps,"multi_base":multi_base,"multi_margin":multi_margin}
+        self.profile_cache=profile
+        self.profile_ts=now
+        return profile
     def evaluate(self,event):
         metrics=self.metrics()
-        base=0.1
         typ=str(event.get("type",""))
-        if typ=="left":
-            base+=0.18
-        elif typ=="right":
-            base+=0.12
-        elif typ=="middle":
-            base+=0.08
         duration=max(0.0,float(event.get("duration",0.0) or 0.0))
         inside=float(event.get("ins_press",0))+float(event.get("ins_release",0))
-        inside=max(0.0,min(2.0,inside))
         moves=event.get("moves") or []
-        span=0.0
+        span_diag=0.0
         if moves:
-            xs=[m[1] for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
-            ys=[m[2] for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
+            xs=[float(m[1]) for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
+            ys=[float(m[2]) for m in moves if isinstance(m,(list,tuple)) and len(m)>=3]
             if xs and ys:
-                span=(max(xs)-min(xs)+max(ys)-min(ys))/4096.0
+                span_diag=math.hypot(max(xs)-min(xs),max(ys)-min(ys))
+        if span_diag==0.0:
+            try:
+                px=float(event.get("press_lx",event.get("press_x",event.get("start_x",0))))
+                py=float(event.get("press_ly",event.get("press_y",event.get("start_y",0))))
+                rx=float(event.get("release_lx",event.get("release_x",px)))
+                ry=float(event.get("release_ly",event.get("release_y",py)))
+                span_diag=math.hypot(rx-px,ry-py)
+            except:
+                span_diag=0.0
         combo=len(event.get("clip_ids") or [])
-        synergy=0.6*metrics.get("win_rate",0.5)+0.25*min(1.5,metrics.get("objective",0.0)/10.0)+0.15*min(1.5,metrics.get("task",0.0)/5.0)
-        reward=base*(0.7+synergy)
-        reward+=min(0.5,span)
-        reward+=min(0.45,combo*0.06*(1.0+metrics.get("win_rate",0.5)))
-        reward+=min(0.4,duration*0.5)
-        reward+=min(0.3,inside*0.1)
+        self.record_event(duration,span_diag,inside,combo,event.get("source")=="ai")
+        profile=self._profile()
+        base=profile["base"]+profile["button_weights"].get(typ,0.0)
+        reward=base*profile["synergy"]
+        dur_ratio=duration/max(profile["duration_norm"],1e-6)
+        span_ratio=span_diag/max(profile["span_norm"],1e-6)
+        reward+=max(0.0,dur_ratio)*profile["duration_weight"]
+        reward+=max(0.0,span_ratio)*profile["span_weight"]
+        reward+=max(0.0,float(inside))*profile["inside_weight"]
+        reward+=max(0.0,combo)*profile["combo_weight"]
         if event.get("source")=="ai":
-            reward*=0.95
+            reward*=profile["ai_penalty"]
         penalty=0.0
-        if duration>1.5:
-            penalty+=0.1
-        if span>0.8:
-            penalty+=0.08
+        if dur_ratio>profile["duration_penalty_ratio"]:
+            penalty+=profile["duration_penalty_weight"]*(dur_ratio-profile["duration_penalty_ratio"])
+        if span_ratio>profile["span_penalty_ratio"]:
+            penalty+=profile["span_penalty_weight"]*(span_ratio-profile["span_penalty_ratio"])
         reward=max(0.0,reward-penalty)
-        return max(0.0,min(2.2,reward))
+        return max(0.0,min(profile["reward_cap"],reward))
 class ModelManifest:
     def __init__(self,cfg):
         base=dict(cfg_defaults)
@@ -1196,6 +1323,10 @@ class StrategyEngine:
         self.pref_default="higher"
         self.policy_size=(320,200)
         self.scene_side=256
+        self.reward_adapter=None
+        self.dynamic_multi_base=1.0
+        self.dynamic_multi_margin=0.5
+        self.dynamic_drag_steps=28.0
     def ensure_loaded(self,progress_cb=None):
         path=self.manifest.ensure(progress_cb)
         ModelIO.load(self.model,path)
@@ -1213,6 +1344,8 @@ class StrategyEngine:
                 raise RuntimeError("模型参数包含无效值")
     def attach_hparams(self,hparams):
         self.hparams=hparams
+    def bind_reward(self,adapter):
+        self.reward_adapter=adapter
     def set_resolution(self,policy_size,scene_size=None):
         try:
             w=int(policy_size[0])
@@ -1421,6 +1554,30 @@ class StrategyEngine:
         inp=cv2.resize(img,self.policy_size)
         ten=torch.from_numpy(inp).to(self.device).float().permute(2,0,1).unsqueeze(0)/255.0
         hp_vals=self.hparams.values if self.hparams else {"confidence_floor":0.18,"primary_threshold":0.55,"long_press_threshold":0.78,"drag_threshold":0.58,"multi_gate":0.5,"confidence_margin":0.1,"drag_steps":28,"parallel_streams":1}
+        conf_floor=float(hp_vals.get("confidence_floor",0.18))
+        drag_threshold=float(hp_vals.get("drag_threshold",0.58))
+        base_steps=float(hp_vals.get("drag_steps",28))
+        multi_gate=float(hp_vals.get("multi_gate",0.5))
+        profile=self.reward_adapter.profile() if getattr(self,"reward_adapter",None) else None
+        if profile:
+            tap_base=float(profile.get("tap_duration",0.08))
+            long_base=float(profile.get("long_duration",max(tap_base*1.5,0.1)))
+            drag_base=float(profile.get("drag_duration",max(tap_base*1.2,0.1)))
+            drag_extent_ratio=float(profile.get("drag_extent",0.2))
+            dynamic_steps=float(profile.get("drag_steps",base_steps))
+            multi_base_val=float(profile.get("multi_base",1.0+drag_threshold))
+            multi_margin=float(profile.get("multi_margin",multi_gate))
+        else:
+            tap_base=max(0.03,min(0.18,0.04+0.12*(1.0-conf_floor)))
+            long_base=max(tap_base*1.4,tap_base*(1.6+0.4*multi_gate))
+            drag_base=max(tap_base*1.1,tap_base*(1.1+0.4*drag_threshold))
+            drag_extent_ratio=max(0.05,min(0.5,0.08+0.42*drag_threshold))
+            dynamic_steps=max(6.0,base_steps*(0.8+0.4*drag_threshold))
+            multi_base_val=1.0+drag_threshold*0.6
+            multi_margin=multi_gate
+        self.dynamic_multi_base=multi_base_val
+        self.dynamic_multi_margin=multi_margin
+        self.dynamic_drag_steps=dynamic_steps
         ctx=self.set_context(events or [])
         hist=self._history_tensor()
         traj_in,mask_in=self._trajectory_from_events(events or [])
@@ -1500,11 +1657,13 @@ class StrategyEngine:
         vx/=norm
         vy/=norm
         def make_tap(ix,iy,button,conf_level):
-            return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":(0.06+0.04*gate)*(0.6+0.5*tempo_score),"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy)),"quality":drag_quality,"tempo":tempo_score}
+            dur=tap_base*(0.7+0.6*gate)*(0.6+0.5*tempo_score)
+            return {"kind":"tap","coord":(int(ix),int(iy)),"button":button,"duration":dur,"grid":grid,"confidence":float(conf_level),"path":[(int(ix),int(iy))],"release":(int(ix),int(iy)),"quality":drag_quality,"tempo":tempo_score}
         if conf>hp_vals.get("long_press_threshold",0.78):
-            act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":(0.35+0.45*gate)*(0.6+0.6*tempo_score),"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y)),"quality":drag_quality,"tempo":tempo_score}
+            long_dur=long_base*(0.7+0.6*gate)*(0.6+0.6*tempo_score)
+            act={"kind":"long_press","coord":(int(x),int(y)),"button":btn,"duration":long_dur,"grid":grid,"confidence":conf,"path":[(int(x),int(y))],"release":(int(x),int(y)),"quality":drag_quality,"tempo":tempo_score}
         elif conf>hp_vals.get("drag_threshold",0.58) and (drag_quality>0.35 or risk_factor>0.35):
-            extent=max(score.shape[1],score.shape[0])*0.18*(0.6+conf)*(0.6+0.8*drag_quality)
+            extent=max(score.shape[1],score.shape[0])*drag_extent_ratio*(0.6+conf)*(0.6+0.8*drag_quality)
             dx=vx*extent
             dy=vy*extent
             ex=int(max(0,min(score.shape[1]-1,round(x+dx))))
@@ -1512,25 +1671,28 @@ class StrategyEngine:
             if ex==x and ey==y:
                 ex=int(max(0,min(score.shape[1]-1,round(x+(random.random()-0.5)*extent))))
                 ey=int(max(0,min(score.shape[0]-1,round(y+(random.random()-0.5)*extent))))
-            steps=max(8,int(hp_vals.get("drag_steps",28)*(0.7+0.6*tempo_score)))
+            steps=max(4,int(self.dynamic_drag_steps*(0.7+0.6*tempo_score)))
             drag_path=[]
             for i in range(steps):
                 u=i/max(steps-1,1)
                 ix=int(round(x+(ex-x)*u))
                 iy=int(round(y+(ey-y)*u))
                 drag_path.append((ix,iy))
-            act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":(0.18+0.22*gate)*(0.65+0.55*tempo_score),"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey)),"quality":drag_quality,"tempo":tempo_score}
+            drag_dur=drag_base*(0.7+0.5*gate)*(0.65+0.55*tempo_score)
+            act={"kind":"drag","coord":(int(x),int(y)),"button":btn,"duration":drag_dur,"grid":grid,"confidence":conf,"path":drag_path,"release":(int(ex),int(ey)),"quality":drag_quality,"tempo":tempo_score}
         else:
             act=make_tap(x,y,btn,conf)
         peaks=self.local_maxima(score,top=8,dist=36)
         extra=[]
-        budget=1+int(multi_factor>hp_vals.get("multi_gate",0.5))+int(multi_factor>0.62)
+        extra_margin=max(0.05,min(0.95,self.dynamic_multi_margin if hasattr(self,"dynamic_multi_margin") else hp_vals.get("multi_gate",0.5)))
+        base_extra=int(max(1,round(self.dynamic_multi_base)))
+        budget=base_extra+int(multi_factor>extra_margin)+int(risk_factor>0.55)
         for (px,py,pv) in peaks:
             if len(extra)>=budget:
                 break
             if px==x and py==y:
                 continue
-            if pv<hp_vals.get("multi_gate",0.5)+hp_vals.get("confidence_margin",0.1)*multi_factor:
+            if pv<extra_margin+hp_vals.get("confidence_margin",0.1)*multi_factor:
                 continue
             choice="left" if pv>hp_vals.get("primary_threshold",0.55) or risk_factor>0.55 else "right"
             extra.append(make_tap(px,py,choice,pv))
@@ -1597,7 +1759,18 @@ class StrategyEngine:
             coords.append((int(x),int(y),float(score[y,x])))
         coords.sort(key=lambda t:t[2],reverse=True)
         plan=[]
-        budget=1+int(multi_factor>0.3)+int(risk_factor>0.45)+int(self.last_value>0.62)+int(self.last_drag_quality>0.55)
+        hp_vals=self.hparams.values if self.hparams else {"multi_gate":0.5,"confidence_margin":0.1}
+        margin=float(hp_vals.get("multi_gate",0.5))
+        base_budget=1+int(multi_factor>margin)+int(risk_factor>0.45)+int(self.last_value>0.62)+int(self.last_drag_quality>0.55)
+        profile=self.reward_adapter.profile() if getattr(self,"reward_adapter",None) else None
+        if profile:
+            base_budget=max(1,int(round(profile.get("multi_base",base_budget))))
+            margin=float(profile.get("multi_margin",margin))
+        elif hasattr(self,"dynamic_multi_base") and hasattr(self,"dynamic_multi_margin"):
+            base_budget=max(1,int(round(self.dynamic_multi_base)))
+            margin=float(self.dynamic_multi_margin)
+        margin=max(0.05,min(0.95,margin))
+        budget=int(max(1,round(base_budget)))
         used=set()
         for x,y,val in coords:
             if len(plan)>=budget:
@@ -2089,7 +2262,9 @@ class State(QObject):
         self.policy_base=(320,200)
         self.policy_resolution,self.scene_resolution,self.resolution_scale=self._compute_policy_resolution()
         self.strategy.set_resolution(self.policy_resolution,self.scene_resolution)
-        self.reward_engine=RewardComposer()
+        self.reward_engine=RewardComposer(self.hyper,self.cfg)
+        self.reward_engine.bind_hparams(self.hyper)
+        self.strategy.bind_reward(self.reward_engine)
         self.stop_event=threading.Event()
         self.events_path=None
         self.frames_path=None
@@ -2993,6 +3168,9 @@ class State(QObject):
                 self.hyper.observe_metrics(self.fps,motion_score,resource_pressure,self.mode)
                 self.hyper.observe_resource(avg_cpu,avg_mem,avg_gpu,avg_vram)
                 self.hyper.adjust()
+            if hasattr(self,"reward_engine"):
+                self.reward_engine.observe_metrics(self.fps,motion_score,resource_pressure,self.mode)
+                self.reward_engine.observe_resource(avg_cpu,avg_mem,avg_gpu,avg_vram)
         except:
             pass
     def _window_weight(self):
@@ -3836,7 +4014,13 @@ class OptimizerThread(threading.Thread):
         self.batch_size=hp.values.get("batch_size",6) if hp else 6
         self.trace=0.0
         self.baseline=0.0
-        self.reward_engine=getattr(self.st,"reward_engine",RewardComposer())
+        base_reward=getattr(self.st,"reward_engine",None)
+        if base_reward is None:
+            cfg=getattr(self.st,"cfg",{}) if hasattr(self.st,"cfg") else {}
+            base_reward=RewardComposer(hp,cfg if isinstance(cfg,dict) else {})
+            if hp:
+                base_reward.bind_hparams(hp)
+        self.reward_engine=base_reward
     def run(self):
         self.st.optimizing=True
         try:
@@ -4151,14 +4335,28 @@ class OptimizerThread(threading.Thread):
         except:
             reward=0.0
         quality=self._event_quality(e)
+        profile=None
+        if hasattr(self.reward_engine,"profile"):
+            try:
+                profile=self.reward_engine.profile()
+            except:
+                profile=None
         if reward<=0.0:
             dur=max(0.0,float(e.get("duration",0.0) or 0.0))
-            base=0.08+min(0.36,dur*0.4)
-            if e.get("type")=="left":
-                base+=0.12
-            elif e.get("type")=="right":
-                base+=0.08
-            reward=base
+            inside=float(e.get("ins_press",0))+float(e.get("ins_release",0))
+            if profile:
+                base=profile["base"]+profile["button_weights"].get(str(e.get("type","")),0.0)
+                base=base*profile["synergy"]
+                dur_ratio=dur/max(profile.get("duration_norm",1e-6),1e-6)
+                reward=max(0.0,base+dur_ratio*profile["duration_weight"]+max(0.0,inside)*profile["inside_weight"])
+                reward=min(profile["reward_cap"],reward)
+            else:
+                base=0.08+min(0.36,dur*0.4)
+                if e.get("type")=="left":
+                    base+=0.12
+                elif e.get("type")=="right":
+                    base+=0.08
+                reward=base
         reward=reward*(0.65+0.25*quality)+quality*0.35
         return max(0.0,min(2.4,reward))
     def _rl_signal(self,reward,quality=None,timing=None):
