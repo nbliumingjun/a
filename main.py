@@ -949,9 +949,17 @@ class ModelIO:
     def load(model,path):
         current=model.state_dict()
         with np.load(path,allow_pickle=False) as d:
-            for k in current.keys():
-                if k in d.files:
-                    current[k]=torch.from_numpy(d[k])
+            for k,v in current.items():
+                if k not in d.files:
+                    continue
+                arr=torch.from_numpy(d[k])
+                if tuple(arr.shape)!=tuple(v.shape):
+                    try:
+                        log(f"model_load_shape_mismatch:{k}:{tuple(arr.shape)}->{tuple(v.shape)}")
+                    except:
+                        pass
+                    continue
+                current[k]=arr.to(v.dtype)
         model.load_state_dict(current,strict=False)
 def ensure_initial_model_file():
     try:
@@ -4866,15 +4874,19 @@ class AutoValidator(threading.Thread):
         except Exception as e:
             log(f"strategy_validation_error:{e}")
 class UIReasoner(nn.Module):
-    def __init__(self,feature_dim=5):
+    def __init__(self,feature_dim=5,interaction_dim=36,layout_dim=12):
         super().__init__()
         fd=max(5,int(feature_dim))
+        inter=max(8,int(interaction_dim))
+        layout=max(4,int(layout_dim))
         self.visual=nn.Sequential(nn.Conv2d(3,32,3,2,1),nn.BatchNorm2d(32),nn.GELU(),nn.Conv2d(32,64,3,2,1),nn.BatchNorm2d(64),nn.GELU(),nn.Conv2d(64,128,3,2,1),nn.BatchNorm2d(128),nn.GELU(),nn.Conv2d(128,192,3,2,1),nn.BatchNorm2d(192),nn.GELU(),nn.AdaptiveAvgPool2d((1,1)))
-        self.layout_proj=nn.Sequential(nn.Linear(12,128),nn.GELU(),nn.Linear(128,128))
-        self.interaction_proj=nn.Sequential(nn.Linear(35,128),nn.GELU(),nn.Linear(128,128))
+        self.layout_proj=nn.Sequential(nn.Linear(layout,128),nn.GELU(),nn.Linear(128,128))
+        self.interaction_proj=nn.Sequential(nn.Linear(inter,128),nn.GELU(),nn.Linear(128,128))
         self.fusion=nn.Sequential(nn.LayerNorm(448),nn.Linear(448,256),nn.GELU(),nn.Linear(256,128),nn.GELU())
         self.head=nn.Linear(128,fd)
         self.feature_dim=fd
+        self.interaction_dim=inter
+        self.layout_dim=layout
     def forward(self,visual,layout,interaction):
         feat=self.visual(visual).view(visual.shape[0],-1)
         lay=self.layout_proj(layout)
@@ -4891,11 +4903,18 @@ class UIModelRegistry:
         self.meta=self._load()
         schema=self.meta.get("_schema",{}) if isinstance(self.meta,dict) else {}
         self.feature_dim=max(5,int(schema.get("feature_dim",5)))
+        self.interaction_dim=max(8,int(schema.get("interaction_dim",36)))
         self.cache={}
         self.mapping_cache=None
         stored=self.meta.setdefault("_schema",{})
+        changed=False
         if stored.get("feature_dim")!=self.feature_dim:
             stored["feature_dim"]=self.feature_dim
+            changed=True
+        if stored.get("interaction_dim")!=self.interaction_dim:
+            stored["interaction_dim"]=self.interaction_dim
+            changed=True
+        if changed:
             self._save()
     def _load(self):
         try:
@@ -4903,13 +4922,19 @@ class UIModelRegistry:
                 data=json.load(f)
                 if isinstance(data,dict):
                     if "_schema" not in data or not isinstance(data.get("_schema"),dict):
-                        data["_schema"]={"feature_dim":5}
+                        data["_schema"]={"feature_dim":5,"interaction_dim":36}
+                    else:
+                        schema=data["_schema"]
+                        if "feature_dim" not in schema:
+                            schema["feature_dim"]=5
+                        if "interaction_dim" not in schema:
+                            schema["interaction_dim"]=36
                     if "items" not in data or not isinstance(data.get("items"),dict):
                         data["items"]={}
                     return data
         except:
             pass
-        return {"_schema":{"feature_dim":5},"items":{}}
+        return {"_schema":{"feature_dim":5,"interaction_dim":36},"items":{}}
     def _save(self):
         with open(ui_model_meta_path,"w",encoding="utf-8") as f:
             json.dump(self.meta,f,ensure_ascii=False,indent=2)
@@ -4935,7 +4960,7 @@ class UIModelRegistry:
         cls=globals().get("UIReasoner")
         if cls is None:
             raise RuntimeError("UIReasoner未定义")
-        model=cls(self.feature_dim)
+        model=cls(self.feature_dim,self.interaction_dim)
         ModelIO.save(model,path)
     def _load_model(self,uid,path,device):
         with self.lock:
@@ -4947,7 +4972,7 @@ class UIModelRegistry:
         cls=globals().get("UIReasoner")
         if cls is None:
             raise RuntimeError("UIReasoner未定义")
-        model=cls(self.feature_dim)
+        model=cls(self.feature_dim,self.interaction_dim)
         try:
             if os.path.exists(path):
                 ModelIO.load(model,path)
@@ -4969,12 +4994,13 @@ class UIModelRegistry:
             path=os.path.join(models_dir,fname)
             info=items.get(uid)
             if info is None:
-                info={"file":fname,"features":self.feature_dim,"created":time.time(),"updated":time.time()}
+                info={"file":fname,"features":self.feature_dim,"interaction_dim":self.interaction_dim,"created":time.time(),"updated":time.time()}
             else:
                 info["file"]=fname
                 if "classes" in info:
                     info.pop("classes",None)
                 info["features"]=self.feature_dim
+                info["interaction_dim"]=self.interaction_dim
                 info["updated"]=time.time()
             items[uid]=info
             self._save()
@@ -4986,6 +5012,21 @@ class UIModelRegistry:
                 log(f"ui_model_init_fail:{uid}:{e}")
         self._compat_mapping(mapping)
         return self._load_model(uid,path,device)
+    def ensure_interaction_dim(self,count):
+        count=max(8,int(count))
+        with self.lock:
+            if count==self.interaction_dim:
+                return
+            self.interaction_dim=count
+            schema=self.meta.setdefault("_schema",{})
+            schema["interaction_dim"]=self.interaction_dim
+            for info in self.meta.get("items",{}).values():
+                if isinstance(info,dict):
+                    info["interaction_dim"]=self.interaction_dim
+            self.cache.clear()
+        self._save()
+        mapping={k:v.get("file") for k,v in self.meta.get("items",{}).items()}
+        self._compat_mapping(mapping)
     def model_path(self,uid):
         if not uid:
             return None
@@ -4994,9 +5035,11 @@ class UIModelRegistry:
             info=items.get(uid)
             if info is None:
                 fname=self._fname(uid)
-                info={"file":fname,"features":self.feature_dim,"created":time.time(),"updated":time.time()}
+                info={"file":fname,"features":self.feature_dim,"interaction_dim":self.interaction_dim,"created":time.time(),"updated":time.time()}
                 items[uid]=info
                 self._save()
+            else:
+                info["interaction_dim"]=self.interaction_dim
             fname=info.get("file") or self._fname(uid)
             if "classes" in info:
                 info.pop("classes",None)
@@ -5131,7 +5174,7 @@ class UIModelTrainer:
         path=self.registry.model_path(uid)
         if not path:
             return
-        model=UIReasoner(self.registry.feature_dim)
+        model=UIReasoner(self.registry.feature_dim,self.registry.interaction_dim)
         try:
             if os.path.exists(path):
                 ModelIO.load(model,path)
@@ -5177,7 +5220,7 @@ class UIModelTrainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(model.parameters(),1.0)
                 opt.step()
-        model_cpu=UIReasoner(self.registry.feature_dim)
+        model_cpu=UIReasoner(self.registry.feature_dim,self.registry.interaction_dim)
         model_cpu.load_state_dict(model.state_dict())
         model_cpu.eval()
         ModelIO.save(model_cpu,path)
@@ -5300,6 +5343,7 @@ class UIInspector:
         self.digit_ensemble=DigitEnsemble(self.digit_clf)
         self.window_hwnd=0
         self.feature_dim=self.registry.feature_dim
+        self.interaction_dim=self.registry.interaction_dim
         self._refresh_schema(True)
         self.trainer=UIModelTrainer(self)
     def analyze(self,img,events):
@@ -5321,6 +5365,10 @@ class UIInspector:
                 visual=torch.from_numpy(visual_arr).unsqueeze(0).to(self.device)
                 layout_tensor=self._layout_vec(base.shape,x1,y1,x2,y2).to(self.device)
                 inter_tensor=self._interaction_vec(events,x1,y1,x2,y2,base.shape).to(self.device)
+                dim=int(inter_tensor.shape[1]) if inter_tensor.ndim==2 else int(inter_tensor.numel())
+                if dim and dim!=self.registry.interaction_dim:
+                    self.registry.ensure_interaction_dim(dim)
+                    self.interaction_dim=self.registry.interaction_dim
                 layout_vals=layout_tensor.squeeze(0).detach().cpu().numpy().tolist()
                 inter_vec=inter_tensor.squeeze(0).detach().cpu().numpy()
                 inter_list=inter_vec.tolist() if hasattr(inter_vec,"tolist") else list(inter_vec)
@@ -5386,6 +5434,7 @@ class UIInspector:
         self.max_items=limit
         schema_changed=force or changed
         self.feature_dim=self.registry.feature_dim
+        self.interaction_dim=self.registry.interaction_dim
         if schema_changed:
             self.model=None
             self.prototype={}
@@ -5518,6 +5567,13 @@ class UIInspector:
         mx=lambda arr:float(max(arr)) if arr else 0.0
         std=lambda arr:float(np.std(arr)) if arr else 0.0
         vec.extend([mean(path_lengths),mx(path_lengths),mean(curvature_vals),std(curvature_vals),mean(straight_scores),std(straight_scores),mean(direction_rates),mean(bbox_ratios),mean(density_vals),mean(dx_vals),mean(dy_vals),mean(speed_vals),mx(speed_vals),mean(step_means),mx(step_maxs),mean(var_x),mean(var_y),mean(curvature_totals)])
+        length=len(vec)
+        try:
+            if length and self.registry and length!=self.registry.interaction_dim:
+                self.registry.ensure_interaction_dim(length)
+                self.interaction_dim=self.registry.interaction_dim
+        except Exception as e:
+            log(f"interaction_dim_update_fail:{e}")
         return torch.tensor([vec],dtype=torch.float32)
     def _safe_time(self,e):
         try:
