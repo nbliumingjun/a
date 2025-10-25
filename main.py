@@ -1,4 +1,4 @@
-import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,re,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,urllib.error,urllib.parse,ssl,io,base64,subprocess
+import os,sys,ctypes,ctypes.wintypes,threading,time,uuid,json,random,collections,re,hashlib,importlib,importlib.util,glob,shutil,math,zlib,urllib.request,urllib.error,urllib.parse,ssl,io,base64,subprocess,itertools
 from pathlib import Path
 os.environ["QT_ENABLE_HIGHDPI_SCALING"]="1"
 os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"]="1"
@@ -2354,6 +2354,8 @@ class State(QObject):
         self._data_id_map={}
         self._data_alias_map={}
         self._color_index=0
+        self._cached_ui_snapshot=[]
+        self._cached_data_snapshot=[]
         self.visibility_state=None
         self.visibility_reason=""
         self._last_clarity_boost=0.0
@@ -2371,6 +2373,7 @@ class State(QObject):
         self._deps_refresh_lock=threading.Lock()
         self._deps_refreshing=False
         self._model_thread_started=False
+        self._load_cached_results()
         self._init_day_files()
         self._start_model_thread()
         self.signal_window_stats.emit([])
@@ -2450,6 +2453,79 @@ class State(QObject):
             json.dump(self.cfg,f,ensure_ascii=False,indent=2)
             f.flush()
             os.fsync(f.fileno())
+    def _sanitize_ui_cache(self,items):
+        sanitized=[]
+        if not isinstance(items,list):
+            return sanitized
+        for idx,it in enumerate(items):
+            if not isinstance(it,dict):
+                continue
+            bounds=it.get("bounds") or it.get("abs_bounds") or []
+            if not isinstance(bounds,(list,tuple)) or len(bounds)!=4:
+                continue
+            try:
+                x1=int(bounds[0])
+                y1=int(bounds[1])
+                x2=int(bounds[2])
+                y2=int(bounds[3])
+            except:
+                continue
+            if x2<=x1 or y2<=y1:
+                continue
+            pref_key=str(it.get("pref_key") or it.get("id") or f"ui_{idx}")
+            identifier=str(it.get("id") or pref_key)
+            conf=float(it.get("confidence",0.0))
+            conf=max(0.0,min(1.0,conf))
+            interaction=float(it.get("interaction",0.0))
+            pref=str(it.get("preference") or self.preference_for_identifier(pref_key))
+            if pref not in ["higher","lower","ignore"]:
+                pref=self.preference_for_identifier(pref_key)
+            entry={"id":identifier,"pref_key":pref_key,"bounds":[x1,y1,x2,y2],"confidence":conf,"interaction":interaction,"preference":pref}
+            if isinstance(it.get("signature"),str):
+                entry["signature"]=it.get("signature")
+            layout=it.get("layout")
+            if isinstance(layout,list):
+                entry["layout"]=layout
+            dynamics=it.get("dynamics")
+            if isinstance(dynamics,list):
+                entry["dynamics"]=dynamics
+            geometry=it.get("geometry")
+            if isinstance(geometry,list):
+                entry["geometry"]=geometry
+            sanitized.append(entry)
+        return sanitized
+    def _load_cached_results(self):
+        ui_items=[]
+        data_items=[]
+        try:
+            with open(ui_cache_path,"r",encoding="utf-8") as f:
+                raw=json.load(f)
+                if isinstance(raw,list):
+                    ui_items=raw
+        except:
+            ui_items=[]
+        sanitized_ui=self._sanitize_ui_cache(ui_items)
+        self.ui_elements=[dict(item) for item in sanitized_ui]
+        try:
+            with open(data_cache_path,"r",encoding="utf-8") as f:
+                raw=json.load(f)
+                if isinstance(raw,list):
+                    data_items=raw
+        except:
+            data_items=[]
+        try:
+            cw=max(0,int(self.client_rect[2]-self.client_rect[0]))
+            ch=max(0,int(self.client_rect[3]-self.client_rect[1]))
+        except:
+            cw=0
+            ch=0
+        sanitized_data=self._sanitize_data_points(data_items,cw,ch)
+        with self.rect_lock:
+            self.data_points=[dict(p) for p in sanitized_data]
+        if getattr(self,"data_registry",None):
+            self.data_registry.sync(sanitized_data)
+        self._cached_ui_snapshot=[dict(item) for item in self.ui_elements]
+        self._cached_data_snapshot=[dict(item) for item in sanitized_data]
     def _sanitize_data_points(self,items,cw,ch):
         sanitized=[]
         idx=0
@@ -2534,10 +2610,13 @@ class State(QObject):
             display_txt=str(txt_src) if isinstance(txt_src,str) and txt_src.strip() else str(val_int)
             stable_key=self.resolve_data_key(raw_key if raw_key is not None else f"dp_{idx}",[nx1,ny1,nx2,ny2],display_txt or name)
             if not isinstance(color,(list,tuple)) or len(color)!=3:
-                color=self.ensure_data_color(stable_key)
+                color_tuple=self.ensure_data_color(stable_key)
             else:
-                color=tuple(int(c) for c in color)
-            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":display_txt,"color":[int(color[0]),int(color[1]),int(color[2])],"key":stable_key,"norm_bounds":[nx1,ny1,nx2,ny2]}
+                color_tuple=tuple(int(c) for c in color)
+                with self._data_id_lock:
+                    self.data_color_map[stable_key]=color_tuple
+            color_tuple=tuple(int(c) for c in color_tuple)
+            entry={"name":name,"bounds":bounds_val,"abs_bounds":[ax1,ay1,ax2,ay2],"window_size":[dw,dh],"value":val_int,"trend":trend_val,"confidence":conf,"preference":pref,"text":display_txt,"color":[int(color_tuple[0]),int(color_tuple[1]),int(color_tuple[2])],"key":stable_key,"norm_bounds":[nx1,ny1,nx2,ny2]}
             sanitized.append(entry)
             idx+=1
         return sanitized
@@ -2605,6 +2684,8 @@ class State(QObject):
     def current_data_snapshot(self):
         with self.rect_lock:
             return [dict(p) for p in self.data_points] if isinstance(self.data_points,list) else []
+    def ui_elements_snapshot(self):
+        return [dict(p) for p in self.ui_elements] if isinstance(self.ui_elements,list) else []
     def _rescale_data_points(self,cr):
         try:
             cw=max(0,int(cr[2]-cr[0]))
@@ -5014,6 +5095,116 @@ class DigitClassifier:
         else:
             prob=0.75
         return pred,prob
+class SimpleDigitRecognizer:
+    def __init__(self):
+        self.templates=[]
+        self._build()
+    def _build(self):
+        fonts=[cv2.FONT_HERSHEY_SIMPLEX,cv2.FONT_HERSHEY_DUPLEX,cv2.FONT_HERSHEY_COMPLEX]
+        scales=[0.75,0.95,1.15]
+        weights=[2,3]
+        for digit in range(10):
+            for font,scale,thick in itertools.product(fonts,scales,weights):
+                canvas=np.zeros((96,64),dtype=np.uint8)
+                cv2.putText(canvas,str(digit),(6,76),font,scale*1.2,255,thick,cv2.LINE_AA)
+                binary=self._prepare(canvas)
+                feat=self._features(binary)
+                if feat is None:
+                    continue
+                self.templates.append((digit,feat))
+        if not self.templates:
+            raise RuntimeError("simple_digit_templates_empty")
+    def _prepare(self,img):
+        if img.dtype!=np.uint8:
+            img=cv2.normalize(img,None,0,255,cv2.NORM_MINMAX).astype(np.uint8)
+        _,thr=cv2.threshold(img,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        white=np.count_nonzero(thr)
+        if white<np.count_nonzero(255-thr):
+            thr=cv2.bitwise_not(thr)
+        return thr
+    def _features(self,img):
+        if img is None or img.size==0:
+            return None
+        if np.count_nonzero(img)==0:
+            return None
+        resized=cv2.resize(img,(48,72),interpolation=cv2.INTER_AREA)
+        _,binary=cv2.threshold(resized,127,255,cv2.THRESH_BINARY)
+        if np.count_nonzero(binary)==0:
+            return None
+        moments=cv2.moments(binary)
+        hu=cv2.HuMoments(moments).flatten()
+        hu=np.sign(hu)*np.log1p(np.abs(hu))
+        area=float(np.count_nonzero(binary))/binary.size
+        ys,xs=np.where(binary>0)
+        if len(xs)==0 or len(ys)==0:
+            return None
+        width=float(xs.max()-xs.min()+1)/binary.shape[1]
+        height=float(ys.max()-ys.min()+1)/binary.shape[0]
+        aspect=height/max(width,1e-3)
+        hull=cv2.convexHull(np.column_stack((xs,ys))) if len(xs)>=3 else None
+        if hull is not None and len(hull)>=3:
+            hull_area=float(cv2.contourArea(hull))
+            solidity=area/max(hull_area/binary.size,1e-6)
+        else:
+            solidity=1.0
+        dist=cv2.distanceTransform(cv2.bitwise_not(binary),cv2.DIST_L2,3)
+        stroke=float(dist[binary>0].mean())/max(binary.shape)
+        return np.concatenate([hu,[area,width,height,aspect,solidity,stroke]])
+    def recognize(self,img):
+        if img is None or img.size==0:
+            return "",0.0
+        if img.ndim==3:
+            gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
+        else:
+            gray=img.copy()
+        binary=self._prepare(gray)
+        contours,_=cv2.findContours(binary,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        regions=[]
+        for c in contours:
+            x,y,w,h=cv2.boundingRect(c)
+            if w*h<20:
+                continue
+            if h<8 or w<4:
+                continue
+            if h>binary.shape[0]*0.95 or w>binary.shape[1]*0.95:
+                continue
+            regions.append((x,y,w,h))
+        if not regions:
+            regions=[(0,0,binary.shape[1],binary.shape[0])]
+        regions.sort(key=lambda item:item[0])
+        digits=[]
+        confidences=[]
+        for x,y,w,h in regions:
+            pad=max(1,int(min(w,h)*0.25))
+            y1=max(0,y-pad)
+            y2=min(binary.shape[0],y+h+pad)
+            x1=max(0,x-pad)
+            x2=min(binary.shape[1],x+w+pad)
+            crop=binary[y1:y2,x1:x2]
+            feat=self._features(crop)
+            if feat is None:
+                continue
+            best=None
+            best_digit=""
+            for digit,tmpl in self.templates:
+                dist=float(np.linalg.norm(feat-tmpl))
+                if best is None or dist<best:
+                    best=dist
+                    best_digit=str(digit)
+            if best is None:
+                continue
+            score=float(np.exp(-best*2.4))
+            digits.append(best_digit)
+            confidences.append(score)
+        if not digits:
+            return "",0.0
+        text="".join(digits)
+        try:
+            int(text)
+        except:
+            return "",0.0
+        conf=sum(confidences)/len(confidences) if confidences else 0.0
+        return text,max(0.0,min(1.0,conf))
 class DigitEnsemble:
     def __init__(self,clf):
         self.clf=clf
@@ -6526,25 +6717,18 @@ class UIInspector:
         component=min(1.0,max(0.0,valid/8.0))
         detail=min(1.0,edge_ratio*4.5)
         return float(max(0.0,min(1.0,0.4*density+0.35*component+0.25*detail)))
+    def _ensure_simple_digit(self):
+        if hasattr(self,"_simple_digit_flag"):
+            return getattr(self,"_simple_digit",None)
+        self._simple_digit_flag=True
+        try:
+            self._simple_digit=SimpleDigitRecognizer()
+        except Exception as e:
+            self._simple_digit=None
+            log(f"simple_digit_init_fail:{e}")
+        return getattr(self,"_simple_digit",None)
     def _ocr_digits(self,img):
         if img is None or img.size==0:
-            return "",0.0
-        global _warned_pytesseract
-        if pytesseract is None:
-            if not _warned_pytesseract:
-                log("pytesseract_missing")
-                _warned_pytesseract=True
-            return "",0.0
-        if not hasattr(self,"_tesseract_ready"):
-            try:
-                pytesseract.get_tesseract_version()
-                self._tesseract_ready=True
-            except Exception as e:
-                self._tesseract_ready=False
-                if not hasattr(self,"_tesseract_log"):
-                    self._tesseract_log=True
-                    log(f"tesseract_unavailable:{e}")
-        if not getattr(self,"_tesseract_ready",False):
             return "",0.0
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY) if img.ndim==3 else img
         norm=cv2.normalize(gray,None,0,255,cv2.NORM_MINMAX)
@@ -6568,11 +6752,37 @@ class UIInspector:
         detail=float(np.count_nonzero(detail_src))/max(1,detail_src.size)
         if detail<0.015:
             return "",0.0
+        global _warned_pytesseract
+        if pytesseract is None:
+            if not _warned_pytesseract:
+                log("pytesseract_missing")
+                _warned_pytesseract=True
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
+            return "",0.0
+        if not hasattr(self,"_tesseract_ready"):
+            try:
+                pytesseract.get_tesseract_version()
+                self._tesseract_ready=True
+            except Exception as e:
+                self._tesseract_ready=False
+                if not hasattr(self,"_tesseract_log"):
+                    self._tesseract_log=True
+                    log(f"tesseract_unavailable:{e}")
+        if not getattr(self,"_tesseract_ready",False):
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
+            return "",0.0
         try:
             output_type=pytesseract.Output.DICT if hasattr(pytesseract,"Output") else (_PTOutput.DICT if _PTOutput else None)
         except:
             output_type=_PTOutput.DICT if _PTOutput else None
         if output_type is None:
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
             return "",0.0
         try:
             data=pytesseract.image_to_data(proc,config="--psm 6 --oem 3 -c tessedit_char_whitelist=0123456789",output_type=output_type)
@@ -6580,6 +6790,9 @@ class UIInspector:
             if not getattr(self,"_ocr_error_logged",False):
                 self._ocr_error_logged=True
                 log(f"ocr_engine_error:{e}")
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
             return "",0.0
         texts=data.get("text",[])
         confs_raw=data.get("conf",[])
@@ -6620,10 +6833,16 @@ class UIInspector:
             conf_norm=float(max(0.0,min(1.0,conf_val/100.0)))
             entries.append((left,clean,conf_norm))
         if not entries:
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
             return "",0.0
         entries.sort(key=lambda item:item[0])
         strong=sum(1 for _,_,c in entries if c>=0.6)
         if strong==0:
+            fallback=self._ensure_simple_digit()
+            if fallback:
+                return fallback.recognize(proc)
             return "",0.0
         text=" ".join(seg for _,seg,_ in entries)
         conf=float(sum(c for _,_,c in entries)/len(entries))
@@ -6948,6 +7167,7 @@ class Main(QMainWindow):
         self.usage_timer.start(1000)
         self.deps_retry_timer=QTimer(self)
         self.deps_retry_timer.timeout.connect(self.on_auto_retry_deps)
+        QTimer.singleShot(0,self._init_from_cache)
         self.learning_thread=None
         self.training_thread=None
         self._optim_flag=threading.Event()
@@ -7348,6 +7568,23 @@ class Main(QMainWindow):
         if gu is not None:
             info+=f" GPU:{int(gu)}% VRAM:{int(gm)}%"
         self.statusBar().showMessage(info)
+    def _init_from_cache(self):
+        try:
+            cached_ui=self.state.ui_elements_snapshot()
+        except Exception as e:
+            log(f"init_cache_ui_fail:{e}")
+            cached_ui=[]
+        try:
+            cached_data=self.state.current_data_snapshot()
+        except Exception as e:
+            log(f"init_cache_data_fail:{e}")
+            cached_data=[]
+        if cached_ui:
+            self.on_ui_ready(cached_ui)
+        if cached_data:
+            self.on_data_ready(cached_data)
+        if cached_data:
+            self._refresh_preview_overlay()
     def on_opt(self):
         if self.state.optimizing:
             return
