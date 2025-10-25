@@ -1,15 +1,20 @@
 import json
 import time
 from pathlib import Path
-from threading import Event,Thread,Lock
+from threading import Event,Lock
 from collections import deque,defaultdict
 from pynput import mouse,keyboard
 import pyautogui
 class 配置:
-    def __init__(self,根):
+    def __init__(self,根,默认):
         self.根=根
         self.路径=根/"config.json"
-        self.数据=json.loads(self.路径.read_text(encoding="utf-8"))
+        if self.路径.exists():
+            数据=json.loads(self.路径.read_text(encoding="utf-8"))
+            self.数据={**默认,**数据}
+        else:
+            self.数据=默认
+            self.路径.write_text(json.dumps(self.数据,ensure_ascii=False),encoding="utf-8")
     def 获取(self,键):
         return self.数据[键]
 class 数据库:
@@ -42,6 +47,11 @@ class 键工具:
         if isinstance(键,keyboard.KeyCode):
             return 键.char if 键.char is not None else str(键)
         return str(键)
+    @staticmethod
+    def 自动化值(键):
+        if 键.startswith("Key."):
+            return 键.split(".",1)[1]
+        return 键
 class 事件记录器:
     def __init__(self,配置,数据库):
         self.配置=配置
@@ -54,6 +64,24 @@ class 事件记录器:
         self.开始时间=0
         self.最后时间=0
         self.倒计时间隔=self.配置.获取("倒计时间隔秒")
+    def 标准化(self,事件列表,尺寸):
+        宽,高=尺寸.width,尺寸.height
+        转换=[]
+        for 项 in 事件列表:
+            新={"类型":项["类型"],"延迟":项.get("延迟",0)}
+            值=项["值"]
+            if 项["类型"]=="鼠标移动":
+                新["值"]=self.坐标比率(值,宽,高)
+            elif 项["类型"]=="鼠标点击":
+                新["值"]={"位置":self.坐标比率(值["位置"],宽,高),"按钮":值["按钮"],"按下":值["按下"]}
+            elif 项["类型"]=="鼠标滚轮":
+                新["值"]={"位置":self.坐标比率(值["位置"],宽,高),"水平":值["水平"],"垂直":值["垂直"]}
+            else:
+                新["值"]=值
+            转换.append(新)
+        return 转换
+    def 坐标比率(self,点,宽,高):
+        return [round(max(0,min(点[0]/宽,1)),6),round(max(0,min(点[1]/高,1)),6)]
     def 键按下(self,键):
         if 键==self.停止键:
             self.停止.set()
@@ -103,10 +131,11 @@ class 事件记录器:
         鼠标监听.stop()
         键监听.join()
         鼠标监听.join()
-        数据={"时间":time.time(),"事件":self.事件}
+        尺寸=pyautogui.size()
+        数据={"时间":time.time(),"事件":self.标准化(self.事件,尺寸),"尺寸":[尺寸.width,尺寸.height]}
         self.数据库.添加(数据)
         print("键鼠记录已完成，开始训练自动化模型。")
-        return self.事件
+        return 数据["事件"]
 class 序列模型:
     def __init__(self,序列长度,最小重复次数):
         self.序列长度=序列长度
@@ -122,7 +151,7 @@ class 序列模型:
             return tuple(self._值标识(v) for v in 值)
         return 值
     def 训练(self,样本):
-        for 记录 in样本:
+        for 记录 in 样本:
             事件序列=记录.get("事件",[])
             if not 事件序列:
                 continue
@@ -168,23 +197,30 @@ class 自动玩家:
                 return False
         self.监听=keyboard.Listener(on_press=监控)
         self.监听.start()
+    def 位置(self,比率):
+        尺寸=pyautogui.size()
+        return [min(max(int(round(比率[0]*尺寸.width)),0),尺寸.width-1),min(max(int(round(比率[1]*尺寸.height)),0),尺寸.height-1)]
     def 执行动作(self,事件):
         time.sleep(max(事件.get("延迟",0),0))
         类型=事件["类型"]
         值=事件["值"]
         if 类型=="键盘按下":
-            pyautogui.keyDown(值)
+            pyautogui.keyDown(键工具.自动化值(值))
         elif 类型=="键盘抬起":
-            pyautogui.keyUp(值)
+            pyautogui.keyUp(键工具.自动化值(值))
         elif 类型=="鼠标移动":
-            pyautogui.moveTo(值[0],值[1],duration=self.鼠标持续)
+            坐标=self.位置(值)
+            pyautogui.moveTo(坐标[0],坐标[1],duration=self.鼠标持续)
         elif 类型=="鼠标点击":
+            坐标=self.位置(值["位置"])
             按钮=值["按钮"].split(".")[-1]
             if 值["按下"]:
-                pyautogui.mouseDown(x=值["位置"][0],y=值["位置"][1],button=按钮)
+                pyautogui.mouseDown(x=坐标[0],y=坐标[1],button=按钮)
             else:
-                pyautogui.mouseUp(x=值["位置"][0],y=值["位置"][1],button=按钮)
+                pyautogui.mouseUp(x=坐标[0],y=坐标[1],button=按钮)
         elif 类型=="鼠标滚轮":
+            坐标=self.位置(值["位置"])
+            pyautogui.moveTo(坐标[0],坐标[1])
             if 值["垂直"]:
                 pyautogui.scroll(int(值["垂直"]))
             if 值["水平"]:
@@ -223,8 +259,11 @@ class 自动玩家:
         print("自动化播放已结束。")
 class 控制器:
     def __init__(self):
-        self.根=Path(__file__).resolve().parent
-        self.配置=配置(self.根)
+        桌面=Path.home()/"Desktop"
+        self.根=(桌面/"GameAI").resolve()
+        self.根.mkdir(parents=True,exist_ok=True)
+        默认={"轮询毫秒":10,"停止键":"Key.f12","倒计时间隔秒":1,"等待启动秒":5,"记录时长秒":60,"数据文件":"records.json","序列长度":5,"最小重复次数":1,"播放循环":True,"实时同步毫秒":50,"鼠标移动持续毫秒":30}
+        self.配置=配置(self.根,默认)
         self.数据库=数据库(self.根,self.配置.获取("数据文件"))
         self.记录器=事件记录器(self.配置,self.数据库)
     def 运行(self):
