@@ -1,0 +1,239 @@
+import json
+import time
+from pathlib import Path
+from threading import Event,Thread,Lock
+from collections import deque,defaultdict
+from pynput import mouse,keyboard
+import pyautogui
+class 配置:
+    def __init__(self,根):
+        self.根=根
+        self.路径=根/"config.json"
+        self.数据=json.loads(self.路径.read_text(encoding="utf-8"))
+    def 获取(self,键):
+        return self.数据[键]
+class 数据库:
+    def __init__(self,根,文件):
+        self.根=根
+        self.文件=文件
+        self.路径=根/文件
+        if self.路径.exists():
+            self.内容=json.loads(self.路径.read_text(encoding="utf-8"))
+        else:
+            self.内容=[]
+    def 添加(self,记录):
+        self.内容.append(记录)
+        self.保存()
+    def 保存(self):
+        self.路径.write_text(json.dumps(self.内容,ensure_ascii=False),encoding="utf-8")
+    def 全部(self):
+        return list(self.内容)
+class 键工具:
+    @staticmethod
+    def 解析(文本):
+        if 文本.startswith("Key."):
+            名称=文本.split(".",1)[1]
+            return getattr(keyboard.Key,名称)
+        if len(文本)==1:
+            return keyboard.KeyCode.from_char(文本)
+        raise ValueError("无法解析停止键")
+    @staticmethod
+    def 标识(键):
+        if isinstance(键,keyboard.KeyCode):
+            return 键.char if 键.char is not None else str(键)
+        return str(键)
+class 事件记录器:
+    def __init__(self,配置,数据库):
+        self.配置=配置
+        self.数据库=数据库
+        self.停止=Event()
+        self.锁=Lock()
+        self.事件=[]
+        self.轮询秒=self.配置.获取("轮询毫秒")/1000
+        self.停止键=键工具.解析(self.配置.获取("停止键"))
+        self.开始时间=0
+        self.最后时间=0
+        self.倒计时间隔=self.配置.获取("倒计时间隔秒")
+    def 键按下(self,键):
+        if 键==self.停止键:
+            self.停止.set()
+            return False
+        return self.记录({"类型":"键盘按下","值":键工具.标识(键)})
+    def 键抬起(self,键):
+        return self.记录({"类型":"键盘抬起","值":键工具.标识(键)})
+    def 鼠标移动(self,x,y):
+        return self.记录({"类型":"鼠标移动","值":[x,y]})
+    def 鼠标点击(self,x,y,按钮,按下):
+        return self.记录({"类型":"鼠标点击","值":{"位置":[x,y],"按钮":str(按钮),"按下":按下}})
+    def 鼠标滚轮(self,x,y,dx,dy):
+        return self.记录({"类型":"鼠标滚轮","值":{"位置":[x,y],"水平":dx,"垂直":dy}})
+    def 记录(self,信息):
+        if self.停止.is_set():
+            return False
+        此时=time.perf_counter()
+        if not self.开始时间:
+            self.开始时间=此时
+            self.最后时间=此时
+        延迟=此时-self.最后时间
+        self.最后时间=此时
+        with self.锁:
+            self.事件.append({"类型":信息["类型"],"值":信息["值"],"延迟":延迟})
+        return True
+    def 采集(self):
+        倒计时=self.配置.获取("等待启动秒")
+        for 剩余 in range(倒计时,0,-1):
+            print(f"将在{剩余}秒后开始记录，请开始准备游戏。")
+            time.sleep(self.倒计时间隔)
+        目标时长=self.配置.获取("记录时长秒")
+        self.开始时间=0
+        self.最后时间=0
+        self.停止.clear()
+        self.事件=[]
+        键监听=keyboard.Listener(on_press=self.键按下,on_release=self.键抬起)
+        鼠标监听=mouse.Listener(on_move=self.鼠标移动,on_click=self.鼠标点击,on_scroll=self.鼠标滚轮)
+        键监听.start()
+        鼠标监听.start()
+        开始=time.perf_counter()
+        while not self.停止.is_set():
+            if time.perf_counter()-开始>=目标时长:
+                self.停止.set()
+                break
+            time.sleep(self.轮询秒)
+        键监听.stop()
+        鼠标监听.stop()
+        键监听.join()
+        鼠标监听.join()
+        数据={"时间":time.time(),"事件":self.事件}
+        self.数据库.添加(数据)
+        print("键鼠记录已完成，开始训练自动化模型。")
+        return self.事件
+class 序列模型:
+    def __init__(self,序列长度,最小重复次数):
+        self.序列长度=序列长度
+        self.最小重复次数=最小重复次数
+        self.映射=defaultdict(dict)
+        self.起始=[]
+    def 简化(self,事件):
+        return (事件["类型"],self._值标识(事件["值"]))
+    def _值标识(self,值):
+        if isinstance(值,dict):
+            return tuple(sorted((k,self._值标识(v)) for k,v in 值.items()))
+        if isinstance(值,list):
+            return tuple(self._值标识(v) for v in 值)
+        return 值
+    def 训练(self,样本):
+        for 记录 in样本:
+            事件序列=记录.get("事件",[])
+            if not 事件序列:
+                continue
+            self.起始.append(事件序列[:self.序列长度])
+            队列=deque(maxlen=self.序列长度)
+            for 索引,事件 in enumerate(事件序列):
+                if len(队列)==self.序列长度:
+                    上下文=tuple(self.简化(e) for e in 队列)
+                    目标=self.简化(事件)
+                    if 目标 not in self.映射[上下文]:
+                        self.映射[上下文][目标]={"事件":事件,"计数":0}
+                    self.映射[上下文][目标]["计数"]+=1
+                队列.append(事件)
+        可用={}
+        for 上下文,结果 in self.映射.items():
+            合格=[(k,v) for k,v in 结果.items() if v["计数"]>=self.最小重复次数]
+            if 合格:
+                可用[上下文]={k:v for k,v in 合格}
+        self.映射=defaultdict(dict,可用)
+    def 预测(self,上下文):
+        结果=self.映射.get(上下文)
+        if not 结果:
+            return None
+        按频次=sorted(结果.values(),key=lambda x:x["计数"],reverse=True)
+        return 按频次[0]["事件"]
+    def 获取起始(self):
+        if not self.起始:
+            return []
+        return max(self.起始,key=len)
+class 自动玩家:
+    def __init__(self,模型,循环,同步毫秒,停止键,鼠标移动持续毫秒):
+        self.模型=模型
+        self.循环=循环
+        self.同步=同步毫秒/1000
+        self.停止键=停止键
+        self.鼠标持续=鼠标移动持续毫秒/1000
+        self.停止=Event()
+        self.监听=None
+    def 启动监听(self):
+        def 监控(键):
+            if 键==self.停止键:
+                self.停止.set()
+                return False
+        self.监听=keyboard.Listener(on_press=监控)
+        self.监听.start()
+    def 执行动作(self,事件):
+        time.sleep(max(事件.get("延迟",0),0))
+        类型=事件["类型"]
+        值=事件["值"]
+        if 类型=="键盘按下":
+            pyautogui.keyDown(值)
+        elif 类型=="键盘抬起":
+            pyautogui.keyUp(值)
+        elif 类型=="鼠标移动":
+            pyautogui.moveTo(值[0],值[1],duration=self.鼠标持续)
+        elif 类型=="鼠标点击":
+            按钮=值["按钮"].split(".")[-1]
+            if 值["按下"]:
+                pyautogui.mouseDown(x=值["位置"][0],y=值["位置"][1],button=按钮)
+            else:
+                pyautogui.mouseUp(x=值["位置"][0],y=值["位置"][1],button=按钮)
+        elif 类型=="鼠标滚轮":
+            if 值["垂直"]:
+                pyautogui.scroll(int(值["垂直"]))
+            if 值["水平"]:
+                pyautogui.hscroll(int(值["水平"]))
+    def 播放(self):
+        缓冲=deque(maxlen=self.模型.序列长度)
+        初始=self.模型.获取起始()
+        if not 初始:
+            print("缺少训练数据，无法进行自动化播放。")
+            return
+        print("开始根据学习到的行为自动执行。按停止键结束自动化。")
+        self.启动监听()
+        while not self.停止.is_set():
+            for 事件 in 初始:
+                if self.停止.is_set():
+                    break
+                self.执行动作(事件)
+                缓冲.append(事件)
+            if self.停止.is_set():
+                break
+            while not self.停止.is_set():
+                if len(缓冲)<self.模型.序列长度:
+                    break
+                上下文=tuple(self.模型.简化(e) for e in 缓冲)
+                预测事件=self.模型.预测(上下文)
+                if not 预测事件:
+                    break
+                self.执行动作(预测事件)
+                缓冲.append(预测事件)
+                time.sleep(self.同步)
+            if not self.循环 or self.停止.is_set():
+                break
+        self.停止.set()
+        if self.监听:
+            self.监听.stop()
+        print("自动化播放已结束。")
+class 控制器:
+    def __init__(self):
+        self.根=Path(__file__).resolve().parent
+        self.配置=配置(self.根)
+        self.数据库=数据库(self.根,self.配置.获取("数据文件"))
+        self.记录器=事件记录器(self.配置,self.数据库)
+    def 运行(self):
+        print("欢迎使用智能游戏助手。程序将自动记录您的操作并进行学习。按停止键可随时结束记录或自动化。")
+        事件=self.记录器.采集()
+        模型=序列模型(self.配置.获取("序列长度"),self.配置.获取("最小重复次数"))
+        模型.训练(self.数据库.全部())
+        玩家=自动玩家(模型,self.配置.获取("播放循环"),self.配置.获取("实时同步毫秒"),self.记录器.停止键,self.配置.获取("鼠标移动持续毫秒"))
+        玩家.播放()
+        print("感谢使用，您可以关闭程序或重新启动以再次训练。")
+if __name__=="__main__":
+    控制器().运行()
