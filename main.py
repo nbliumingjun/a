@@ -1089,24 +1089,28 @@ class ModelIO:
                 current[k]=arr.to(v.dtype)
         model.load_state_dict(current,strict=False)
 def ensure_initial_model_file():
+    existing=[]
     try:
         existing=[f for f in os.listdir(models_dir) if f.lower().endswith('.npz')]
     except:
         existing=[]
-    if existing:
-        return
+    for name in existing:
+        path=os.path.join(models_dir,name)
+        if os.path.isfile(path):
+            return path
     target=os.path.join(models_dir,cfg_defaults['model_file'])
     try:
         data=ModelInitializer.default_bytes()
     except:
         data=None
     if not data:
-        return
+        return os.path.join(models_dir,existing[0]) if existing else None
     try:
         with open(target,'wb') as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        return target
     except:
         try:
             fallback=os.path.join(models_dir,'default_policy.npz')
@@ -1116,9 +1120,69 @@ def ensure_initial_model_file():
                 os.fsync(f.fileno())
             if os.path.abspath(fallback)!=os.path.abspath(target):
                 shutil.copy2(fallback,target)
+            return target if os.path.exists(target) else fallback
+        except:
+            return os.path.join(models_dir,existing[0]) if existing else None
+def ensure_model_meta(model_path):
+    record=None
+    if model_path and os.path.exists(model_path):
+        try:
+            h=hashlib.sha256()
+            with open(model_path,'rb') as f:
+                for chunk in iter(lambda:f.read(1048576),b''):
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            record={"file":os.path.basename(model_path),"sha256":h.hexdigest(),"size":os.path.getsize(model_path)}
+        except:
+            record=None
+    data=None
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path,'r',encoding='utf-8') as f:
+                data=json.load(f)
+        except:
+            data=None
+    if not isinstance(data,dict):
+        data={}
+    changed=False
+    if not isinstance(data.get('history'),list):
+        data['history']=[]
+        changed=True
+    if 'version' not in data:
+        data['version']=0
+        changed=True
+    now=time.strftime('%Y-%m-%d %H:%M:%S')
+    if 'updated_at' not in data:
+        data['updated_at']=now
+        changed=True
+    if record:
+        found=False
+        for item in data['history']:
+            if not isinstance(item,dict):
+                continue
+            files=item.get('files') if isinstance(item.get('files'),list) else []
+            for ent in files:
+                if isinstance(ent,dict) and ent.get('file')==record['file'] and ent.get('sha256')==record['sha256']:
+                    found=True
+                    break
+            if found:
+                break
+        if not found:
+            entry={"version":data.get('version',0),"time":now,"files":[record],"range":"bootstrap","hash":record['sha256']}
+            data['history'].append(entry)
+            data['updated_at']=now
+            changed=True
+    if changed:
+        try:
+            with open(meta_path,'w',encoding='utf-8') as f:
+                json.dump(data,f,ensure_ascii=False,indent=2)
+                f.flush()
+                os.fsync(f.fileno())
         except:
             pass
-ensure_initial_model_file()
+model_entry=ensure_initial_model_file()
+ensure_model_meta(model_entry)
 class TemporalPlanner(nn.Module):
     def __init__(self,dim=192):
         super().__init__()
