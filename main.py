@@ -1,10 +1,65 @@
 import json
 import time
+import os
+import platform
+import subprocess
+import ctypes
 from pathlib import Path
 from threading import Event,Lock
 from collections import deque,defaultdict
 from pynput import mouse,keyboard
 import pyautogui
+class 硬件环境:
+    def __init__(self):
+        self.尺寸=pyautogui.size()
+        self.核心=os.cpu_count() or 1
+        self.内存=self.获取内存()
+        self.显存=self.获取显存()
+    def 获取内存(self):
+        if platform.system()!="Windows":
+            return 0
+        try:
+            class 状态(ctypes.Structure):
+                _fields_=[("dwLength",ctypes.c_ulong),("dwMemoryLoad",ctypes.c_ulong),("ullTotalPhys",ctypes.c_ulonglong),("ullAvailPhys",ctypes.c_ulonglong),("ullTotalPageFile",ctypes.c_ulonglong),("ullAvailPageFile",ctypes.c_ulonglong),("ullTotalVirtual",ctypes.c_ulonglong),("ullAvailVirtual",ctypes.c_ulonglong),("ullAvailExtendedVirtual",ctypes.c_ulonglong)]
+            信息=状态()
+            信息.dwLength=ctypes.sizeof(状态)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(信息)):
+                return 信息.ullTotalPhys
+        except Exception:
+            return 0
+        return 0
+    def 获取显存(self):
+        if platform.system()!="Windows":
+            return 0
+        命令=["powershell","-NoProfile","-Command","Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty AdapterRAM"]
+        try:
+            输出=subprocess.run(命令,check=False,capture_output=True,text=True,timeout=5).stdout.strip().splitlines()
+            数值=[int(行) for 行 in 输出 if 行.isdigit()]
+            if 数值:
+                return max(数值)
+        except Exception:
+            return 0
+        return 0
+    def 描述(self):
+        内存值=self.内存//(1024**3) if self.内存 else 0
+        显存值=self.显存//(1024**3) if self.显存 else 0
+        return f"屏幕{self.尺寸.width}x{self.尺寸.height} 核心{self.核心} 内存{内存值}GB 显存{显存值}GB"
+    def 默认配置(self):
+        像素=max(self.尺寸.width*self.尺寸.height,1)
+        核心=max(self.核心,1)
+        内存值=self.内存 or 像素*4
+        显存值=self.显存 or 像素*2
+        基准像素=max(像素,10**6)
+        轮询=max(2,min(30,int(1000/max(1,核心*4))))
+        等待=max(3,min(15,int((内存值+显存值)//基准像素)))
+        记录=max(30,min(600,int((内存值+显存值)//(10**8))))
+        同步=max(轮询,min(200,int(1000/max(1,核心*2))))
+        鼠标=max(10,min(200,int(1000/max(1,核心*8))))
+        序列=max(3,min(12,int(内存值//(10**9))+3))
+        重复=max(1,min(5,int(max(1,核心//2))))
+        样本=max(50,min(1000,int((内存值+显存值)//(10**8))))
+        指纹=f"{self.尺寸.width}x{self.尺寸.height}_{核心}_{内存值}_{显存值}"
+        return {"轮询毫秒":轮询,"停止键":"Key.f12","倒计时间隔秒":max(1,min(3,max(1,等待//3))),"等待启动秒":等待,"记录时长秒":记录,"数据文件":f"records_{指纹}.json","序列长度":序列,"最小重复次数":重复,"播放循环":True,"实时同步毫秒":同步,"鼠标移动持续毫秒":鼠标,"最大样本":样本,"硬件指纹":指纹}
 class 配置:
     def __init__(self,根,默认):
         self.根=根
