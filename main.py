@@ -66,23 +66,32 @@ class 配置:
         self.路径=根/"config.json"
         if self.路径.exists():
             数据=json.loads(self.路径.read_text(encoding="utf-8"))
-            self.数据={**默认,**数据}
+            if 数据.get("硬件指纹")!=默认["硬件指纹"]:
+                self.数据=默认
+            else:
+                self.数据={**默认,**数据}
         else:
             self.数据=默认
-            self.路径.write_text(json.dumps(self.数据,ensure_ascii=False),encoding="utf-8")
+        self.路径.write_text(json.dumps(self.数据,ensure_ascii=False),encoding="utf-8")
     def 获取(self,键):
         return self.数据[键]
 class 数据库:
-    def __init__(self,根,文件):
+    def __init__(self,根,文件,最大):
         self.根=根
         self.文件=文件
         self.路径=根/文件
+        self.最大=最大
         if self.路径.exists():
             self.内容=json.loads(self.路径.read_text(encoding="utf-8"))
+            if self.最大 and len(self.内容)>self.最大:
+                self.内容=self.内容[-self.最大:]
+                self.保存()
         else:
             self.内容=[]
     def 添加(self,记录):
         self.内容.append(记录)
+        if self.最大 and len(self.内容)>self.最大:
+            self.内容=self.内容[-self.最大:]
         self.保存()
     def 保存(self):
         self.路径.write_text(json.dumps(self.内容,ensure_ascii=False),encoding="utf-8")
@@ -187,7 +196,7 @@ class 事件记录器:
         键监听.join()
         鼠标监听.join()
         尺寸=pyautogui.size()
-        数据={"时间":time.time(),"事件":self.标准化(self.事件,尺寸),"尺寸":[尺寸.width,尺寸.height]}
+        数据={"时间":time.time(),"事件":self.标准化(self.事件,尺寸),"尺寸":[尺寸.width,尺寸.height],"硬件指纹":self.配置.获取("硬件指纹")}
         self.数据库.添加(数据)
         print("键鼠记录已完成，开始训练自动化模型。")
         return 数据["事件"]
@@ -195,7 +204,7 @@ class 序列模型:
     def __init__(self,序列长度,最小重复次数):
         self.序列长度=序列长度
         self.最小重复次数=最小重复次数
-        self.映射=defaultdict(dict)
+        self.映射=defaultdict(list)
         self.起始=[]
     def 简化(self,事件):
         return (事件["类型"],self._值标识(事件["值"]))
@@ -206,32 +215,35 @@ class 序列模型:
             return tuple(self._值标识(v) for v in 值)
         return 值
     def 训练(self,样本):
+        汇总=defaultdict(lambda:defaultdict(int))
+        原始=defaultdict(dict)
+        self.起始=[]
         for 记录 in 样本:
             事件序列=记录.get("事件",[])
             if not 事件序列:
                 continue
             self.起始.append(事件序列[:self.序列长度])
             队列=deque(maxlen=self.序列长度)
-            for 索引,事件 in enumerate(事件序列):
+            for 事件 in 事件序列:
                 if len(队列)==self.序列长度:
                     上下文=tuple(self.简化(e) for e in 队列)
-                    目标=self.简化(事件)
-                    if 目标 not in self.映射[上下文]:
-                        self.映射[上下文][目标]={"事件":事件,"计数":0}
-                    self.映射[上下文][目标]["计数"]+=1
+                    键=self.简化(事件)
+                    if 键 not in 原始[上下文]:
+                        原始[上下文][键]=事件
+                    汇总[上下文][键]+=1
                 队列.append(事件)
-        可用={}
-        for 上下文,结果 in self.映射.items():
-            合格=[(k,v) for k,v in 结果.items() if v["计数"]>=self.最小重复次数]
+        映射={}
+        for 上下文,计数 in 汇总.items():
+            合格=[(原始[上下文][键],数量) for 键,数量 in 计数.items() if 数量>=self.最小重复次数]
             if 合格:
-                可用[上下文]={k:v for k,v in 合格}
-        self.映射=defaultdict(dict,可用)
+                合格.sort(key=lambda x:x[1],reverse=True)
+                映射[上下文]=合格
+        self.映射=defaultdict(list,映射)
     def 预测(self,上下文):
         结果=self.映射.get(上下文)
         if not 结果:
             return None
-        按频次=sorted(结果.values(),key=lambda x:x["计数"],reverse=True)
-        return 按频次[0]["事件"]
+        return 结果[0][0]
     def 获取起始(self):
         if not self.起始:
             return []
@@ -317,15 +329,22 @@ class 控制器:
         桌面=Path.home()/"Desktop"
         self.根=(桌面/"GameAI").resolve()
         self.根.mkdir(parents=True,exist_ok=True)
-        默认={"轮询毫秒":10,"停止键":"Key.f12","倒计时间隔秒":1,"等待启动秒":5,"记录时长秒":60,"数据文件":"records.json","序列长度":5,"最小重复次数":1,"播放循环":True,"实时同步毫秒":50,"鼠标移动持续毫秒":30}
+        self.硬件=硬件环境()
+        默认=self.硬件.默认配置()
         self.配置=配置(self.根,默认)
-        self.数据库=数据库(self.根,self.配置.获取("数据文件"))
+        self.数据库=数据库(self.根,self.配置.获取("数据文件"),self.配置.获取("最大样本"))
         self.记录器=事件记录器(self.配置,self.数据库)
     def 运行(self):
+        print(f"已根据{self.硬件.描述()}自动优化参数。")
         print("欢迎使用智能游戏助手。程序将自动记录您的操作并进行学习。按停止键可随时结束记录或自动化。")
-        事件=self.记录器.采集()
+        self.记录器.采集()
         模型=序列模型(self.配置.获取("序列长度"),self.配置.获取("最小重复次数"))
-        模型.训练(self.数据库.全部())
+        数据集=self.数据库.全部()
+        指纹=self.配置.获取("硬件指纹")
+        样本=[记录 for 记录 in 数据集 if 记录.get("硬件指纹")==指纹]
+        if not 样本:
+            样本=数据集
+        模型.训练(样本)
         玩家=自动玩家(模型,self.配置.获取("播放循环"),self.配置.获取("实时同步毫秒"),self.记录器.停止键,self.配置.获取("鼠标移动持续毫秒"))
         玩家.播放()
         print("感谢使用，您可以关闭程序或重新启动以再次训练。")
