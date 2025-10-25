@@ -1,5 +1,6 @@
 import os,time,threading,random
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime
 import numpy as np
 import cv2
@@ -9,10 +10,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 try:
     import torch.amp as amp
-    AMP_MODE="new"
 except Exception:
-    from torch.cuda import amp
-    AMP_MODE="old"
+    amp=None
 import mss
 from pynput import keyboard,mouse
 try:
@@ -56,6 +55,40 @@ def log(msg:str):
             f.write(line+"\n")
     except Exception:
         pass
+def create_grad_scaler(device_type:str):
+    if device_type!="cuda":
+        return None
+    if amp is None:
+        return None
+    grad_scaler=getattr(amp,"GradScaler",None)
+    if grad_scaler is None:
+        return None
+    try:
+        return grad_scaler(device_type)
+    except TypeError:
+        try:
+            return grad_scaler()
+        except Exception:
+            return None
+    except Exception:
+        return None
+def autocast_context(device_type:str):
+    if device_type!="cuda":
+        return nullcontext()
+    if amp is None:
+        return nullcontext()
+    autocast_fn=getattr(amp,"autocast",None)
+    if autocast_fn is None:
+        return nullcontext()
+    try:
+        return autocast_fn(device_type=device_type)
+    except TypeError:
+        try:
+            return autocast_fn()
+        except Exception:
+            return nullcontext()
+    except Exception:
+        return nullcontext()
 def get_hardware_profile():
     gpu=torch.cuda.is_available()
     vram_bytes=0
@@ -362,14 +395,8 @@ class TrainerThread(threading.Thread):
         self.policy_lock=policy_lock
         self.optimizer=optim.Adam(self.train_model.parameters(),lr=LEARNING_RATE)
         self.train_steps=0
-        self.use_amp=(self.device.type=="cuda")
-        if self.use_amp:
-            if AMP_MODE=="new":
-                self.scaler=amp.GradScaler("cuda")
-            else:
-                self.scaler=amp.GradScaler()
-        else:
-            self.scaler=None
+        self.scaler=create_grad_scaler(self.device.type)
+        self.use_amp=(self.scaler is not None)
         self.ema_decay=EMA_DECAY
     def run(self):
         log("Trainer thread started.")
@@ -388,11 +415,7 @@ class TrainerThread(threading.Thread):
             self.optimizer.zero_grad(set_to_none=True)
             if self.use_amp:
                 try:
-                    if AMP_MODE=="new":
-                        ctx=amp.autocast(device_type="cuda")
-                    else:
-                        ctx=amp.autocast()
-                    with ctx:
+                    with autocast_context("cuda"):
                         pred_mouse_tanh,pred_mousebtn_logits,pred_keys_logits,pred_value=self.train_model.forward_train(states_t)
                         mouse_l2=((pred_mouse_tanh-target_mouse_t)**2).mean(dim=1)
                         btn_bce=F.binary_cross_entropy_with_logits(pred_mousebtn_logits,target_mousebtn_t,reduction="none").mean(dim=1)
@@ -562,14 +585,8 @@ class AutoPlayer:
     def act_from_state(self,policy_model,device,stack_state_np,suppress_ref):
         with torch.no_grad():
             st=torch.from_numpy(stack_state_np).unsqueeze(0).to(device).float()/255.0
-            if device.type=="cuda":
-                if AMP_MODE=="new":
-                    ctx=amp.autocast(device_type="cuda")
-                else:
-                    ctx=amp.autocast()
-                with ctx:
-                    mouse_tanh,mouse_btn_logits,key_logits,val_pred=policy_model.forward_step(st)
-            else:
+            ctx=autocast_context("cuda" if device.type=="cuda" else "cpu")
+            with ctx:
                 mouse_tanh,mouse_btn_logits,key_logits,val_pred=policy_model.forward_step(st)
             mouse_move=mouse_tanh[0].cpu().numpy()
             dx_norm,dy_norm=float(mouse_move[0]),float(mouse_move[1])
