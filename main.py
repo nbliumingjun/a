@@ -4,11 +4,26 @@ import os
 import platform
 import subprocess
 import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from threading import Event,Lock
 from collections import deque,defaultdict
 from pynput import mouse,keyboard
 import pyautogui
+def 桌面路径():
+    if platform.system()=="Windows":
+        try:
+            缓冲=ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            if ctypes.windll.shell32.SHGetFolderPathW(None,0,None,0,缓冲)==0 and 缓冲.value:
+                return Path(缓冲.value).resolve()
+        except Exception:
+            pass
+    主页=Path.home()
+    备选=[主页/"Desktop",主页]
+    for 路径 in 备选:
+        if 路径.exists():
+            return 路径.resolve()
+    return 主页.resolve()
 class 硬件环境:
     def __init__(self):
         self.尺寸=pyautogui.size()
@@ -59,7 +74,7 @@ class 硬件环境:
         重复=max(1,min(5,int(max(1,核心//2))))
         样本=max(50,min(1000,int((内存值+显存值)//(10**8))))
         指纹=f"{self.尺寸.width}x{self.尺寸.height}_{核心}_{内存值}_{显存值}"
-        return {"轮询毫秒":轮询,"停止键":"Key.f12","倒计时间隔秒":max(1,min(3,max(1,等待//3))),"等待启动秒":等待,"记录时长秒":记录,"数据文件":f"records_{指纹}.json","序列长度":序列,"最小重复次数":重复,"播放循环":True,"实时同步毫秒":同步,"鼠标移动持续毫秒":鼠标,"最大样本":样本,"硬件指纹":指纹}
+        return {"轮询毫秒":轮询,"停止键":"Key.esc","倒计时间隔秒":max(1,min(3,max(1,等待//3))),"等待启动秒":等待,"记录时长秒":记录,"数据文件":f"records_{指纹}.json","序列长度":序列,"最小重复次数":重复,"播放循环":True,"实时同步毫秒":同步,"鼠标移动持续毫秒":鼠标,"最大样本":样本,"硬件指纹":指纹}
 class 配置:
     def __init__(self,根,默认):
         self.根=根
@@ -72,6 +87,7 @@ class 配置:
                 self.数据={**默认,**数据}
         else:
             self.数据=默认
+        self.数据["停止键"]=默认["停止键"]
         self.路径.write_text(json.dumps(self.数据,ensure_ascii=False),encoding="utf-8")
     def 获取(self,键):
         return self.数据[键]
@@ -326,8 +342,7 @@ class 自动玩家:
         print("自动化播放已结束。")
 class 控制器:
     def __init__(self):
-        桌面=Path.home()/"Desktop"
-        self.根=(桌面/"GameAI").resolve()
+        self.根=(桌面路径()/"GameAI").resolve()
         self.根.mkdir(parents=True,exist_ok=True)
         self.硬件=硬件环境()
         默认=self.硬件.默认配置()
