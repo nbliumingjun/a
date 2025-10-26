@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tkinter as tk
+import tkinter.ttk as ttk
+from tkinter import messagebox
 try:
     from pynput import mouse,keyboard
 except:
@@ -78,7 +80,7 @@ class RegionScaler:
 def default_config(base_dir):
     base_w=2560
     base_h=1600
-    model_pairs=[("一技能","skill1_model.pt"),("二技能","skill2_model.pt"),("三技能","skill3_model.pt"),("移动轮盘","move_model.pt"),("普攻","attack_model.pt"),("回城","recall_model.pt"),("视觉","vision_model.pt"),("恢复","heal_model.pt"),("闪现","flash_model.pt"),("小地图","minimap_model.pt")]
+    model_pairs=[("一技能","skill1_model.pt"),("二技能","skill2_model.pt"),("三技能","skill3_model.pt"),("移动轮盘","move_model.pt"),("普攻补刀","attack_last_hit_model.pt"),("普攻点塔","attack_tower_model.pt"),("回城","recall_model.pt"),("视觉","vision_model.pt"),("恢复","heal_model.pt"),("闪现","flash_model.pt"),("小地图","minimap_model.pt"),("主动装备","active_item_model.pt")]
     model_names={k:v for k,v in model_pairs}
     circle_items=[("移动轮盘",166,915,536),("回城",1083,1263,162),("恢复",1271,1263,162),("闪现",1467,1263,162),("一技能",1672,1220,195),("二技能",1825,956,195),("三技能",2088,803,195),("取消施法",2165,252,250),("普攻补刀",1915,1296,123),("普攻点塔",2241,1014,123),("主动装备",2092,544,161)]
     rect_items=[("A",1904,122,56,56),("B",1996,122,56,56),("C",2087,122,56,56),("小地图",0,72,453,453)]
@@ -225,6 +227,10 @@ class SharedState:
         self.config_manager=None
         self.mode="学习"
         self.terminate=False
+        self.optimizing=False
+        self.optimize_progress=0.0
+        self.optimize_iterations=0
+        self.optimize_text="待命"
 class ModelManager:
     def __init__(self,config,device,dtype):
         self.config=config
@@ -427,6 +433,21 @@ class DeepRLAgent:
                 self.target_net.load_state_dict(self.policy_net.state_dict())
         except:
             pass
+    def offline_optimize(self,progress_callback=None):
+        total=len(self.replay_buffer)
+        if total<self.batch_size:
+            if progress_callback:
+                progress_callback(1.0)
+            return 0
+        cycles=max(1,total//self.batch_size)
+        steps=max(10,cycles*5)
+        for i in range(steps):
+            self.train_step()
+            if progress_callback:
+                progress_callback((i+1)/steps)
+        if progress_callback:
+            progress_callback(1.0)
+        return steps
 class VisionModule:
     def __init__(self,config):
         self.config=config
@@ -481,7 +502,12 @@ class ExperienceRecorder:
         self.frame_paths=deque()
         learn_conf=config.get("学习",{})
         self.max_frames=max(200,int(learn_conf.get("缓冲大小",20000)//10))
+        self.paused=False
+    def set_paused(self,value):
+        self.paused=bool(value)
     def record_input(self,mode,event_type,data):
+        if self.paused:
+            return
         payload={"t":time.time(),"mode":mode,"type":event_type,"data":data}
         try:
             with self.lock:
@@ -490,6 +516,8 @@ class ExperienceRecorder:
         except:
             pass
     def record_metrics(self,mode,metrics):
+        if self.paused:
+            return
         payload={"t":time.time(),"mode":mode,"metrics":metrics}
         try:
             with self.lock:
@@ -499,6 +527,8 @@ class ExperienceRecorder:
             pass
     def record_frame(self,mode,image):
         if image is None:
+            return
+        if self.paused:
             return
         ts="{:.3f}".format(time.time()).replace(".","_")
         name=f"{mode}_{ts}_{len(self.frame_paths)}.png"
@@ -574,6 +604,8 @@ class ModeManager:
         self.running=False
         self.thread=None
         self.controller.set_recorder(recorder)
+        self.optimizing=False
+        self.optimize_wait=False
     def start(self):
         if self.running:
             return
@@ -594,11 +626,14 @@ class ModeManager:
         if event_type=="键盘" and payload.get("key") in ("Key.esc","esc","<esc>","\u001b"):
             self.shared.terminate=True
             self.controller.stop()
+            self.recorder.set_paused(False)
             with self.shared.lock:
                 self.shared.mode="学习"
                 self.shared.running=False
+                self.shared.optimizing=False
             self.current_mode="学习"
             self.last_frame=0.0
+            self.optimize_wait=False
             return
         if self.current_mode=="训练":
             self.controller.stop()
@@ -608,7 +643,7 @@ class ModeManager:
             self.current_mode="学习"
             self.last_frame=0.0
     def switch_to_train(self):
-        if self.current_mode=="训练" or self.shared.terminate:
+        if self.current_mode=="训练" or self.shared.terminate or self.optimizing or self.optimize_wait:
             return
         self.controller.start()
         with self.shared.lock:
@@ -617,15 +652,51 @@ class ModeManager:
         self.last_frame=0.0
     def force_learning(self):
         self.controller.stop()
+        self.recorder.set_paused(False)
         with self.shared.lock:
             self.shared.mode="学习"
             self.shared.running=False
+            self.shared.optimizing=False
         self.current_mode="学习"
         self.last_frame=0.0
         self.last_input=time.time()
+        self.optimize_wait=False
+    def enter_optimization(self):
+        if self.optimizing:
+            return
+        self.controller.stop()
+        self.recorder.set_paused(True)
+        with self.shared.lock:
+            self.shared.mode="优化"
+            self.shared.running=False
+            self.shared.optimizing=True
+        self.current_mode="优化"
+        self.optimizing=True
+        self.optimize_wait=False
+    def exit_optimization(self):
+        self.optimizing=False
+        self.optimize_wait=True
+        with self.shared.lock:
+            self.shared.mode="优化完成"
+            self.shared.running=False
+            self.shared.optimizing=False
+        self.last_frame=0.0
+    def finalize_optimization(self):
+        self.recorder.set_paused(False)
+        with self.shared.lock:
+            self.shared.mode="学习"
+            self.shared.running=False
+            self.shared.optimizing=False
+        self.current_mode="学习"
+        self.last_input=time.time()
+        self.last_frame=0.0
+        self.optimize_wait=False
     def loop(self):
         while self.running and not self.shared.terminate:
             now=time.time()
+            if self.optimizing or self.optimize_wait:
+                time.sleep(0.2)
+                continue
             if self.current_mode=="学习" and now-self.last_input>=self.idle_threshold:
                 self.switch_to_train()
             interval=self.learn_interval if self.current_mode=="学习" else self.train_interval
@@ -1057,29 +1128,75 @@ class BotController:
                 self.shared.cd_item=metrics_curr["cd_item"]
                 self.shared.cd_heal=metrics_curr["cd_heal"]
                 self.shared.cd_flash=metrics_curr["cd_flash"]
-                self.shared.cd_recall=metrics_curr["cd_recall"]
-                self.shared.epsilon=eps
-                self.shared.running=True
-            metrics_prev=metrics_curr
-            obs_prev=obs_curr
+            self.shared.cd_recall=metrics_curr["cd_recall"]
+            self.shared.epsilon=eps
+            self.shared.running=True
+        metrics_prev=metrics_curr
+        obs_prev=obs_curr
+class OptimizationManager:
+    def __init__(self,shared,agent,recorder,mode_manager):
+        self.shared=shared
+        self.agent=agent
+        self.recorder=recorder
+        self.mode_manager=mode_manager
+        self.lock=threading.Lock()
+        self.active=False
+        self.thread=None
+    def progress_update(self,value):
+        val=max(0.0,min(1.0,float(value)))
+        with self.shared.lock:
+            self.shared.optimize_progress=val
+            self.shared.optimize_text="优化中{:.1f}%".format(val*100.0)
+    def start(self,callback=None):
+        if self.mode_manager.optimize_wait:
+            return False
+        with self.lock:
+            if self.active:
+                return False
+            self.active=True
+        self.mode_manager.enter_optimization()
+        with self.shared.lock:
+            self.shared.optimize_progress=0.0
+            self.shared.optimize_iterations=0
+            self.shared.optimize_text="优化准备中"
+        def runner():
+            steps=0
+            try:
+                steps=self.agent.offline_optimize(self.progress_update)
+            finally:
+                self.mode_manager.exit_optimization()
+                with self.shared.lock:
+                    self.shared.optimize_iterations=steps
+                    self.shared.optimize_progress=1.0 if self.shared.optimize_progress<1.0 else self.shared.optimize_progress
+                    self.shared.optimize_text="优化完成"
+                with self.lock:
+                    self.active=False
+                if callback:
+                    callback(steps)
+        self.thread=threading.Thread(target=runner,daemon=True)
+        self.thread.start()
+        return True
 class BotUI:
-    def __init__(self,shared,controller,config_manager,mode_manager):
+    def __init__(self,shared,controller,config_manager,mode_manager,optimizer):
         self.shared=shared
         self.controller=controller
         self.config_manager=config_manager
         self.mode_manager=mode_manager
+        self.optimizer=optimizer
         self.root=tk.Tk()
         self.root.title("AI强化学习深度学习控制面板")
-        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall","epsilon","status","device","hw","adb","dn","aaa"]}
+        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall","epsilon","status","device","hw","adb","dn","aaa","opt"]}
         self.vars["adb"].set(self.shared.config["路径"]["ADB"])
         self.vars["dn"].set(self.shared.config["路径"]["模拟器"])
         self.vars["aaa"].set(self.shared.config["路径"]["AAA"])
+        self.vars["opt"].set(self.shared.optimize_text)
+        self.progress_var=tk.DoubleVar(value=0.0)
         self.build_ui()
         self.update_loop()
     def build_ui(self):
         frame_state=tk.Frame(self.root)
         frame_state.pack(side="top",fill="x")
-        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("闪现","cd_flash"),("回城","cd_recall"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw")]
+        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("闪现","cd_flash"),("回城","cd_recall"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw"),("优化","opt")]
         for idx,(text,key) in enumerate(labels):
             tk.Label(frame_state,text=text).grid(row=idx,column=0,sticky="w")
             tk.Label(frame_state,textvariable=self.vars[key]).grid(row=idx,column=1,sticky="w")
@@ -1087,18 +1204,36 @@ class BotUI:
         control_frame.pack(side="top",fill="x")
         tk.Button(control_frame,text="启动AI",command=self.start_bot).grid(row=0,column=0,sticky="we")
         tk.Button(control_frame,text="停止AI",command=self.stop_bot).grid(row=0,column=1,sticky="we")
+        tk.Button(control_frame,text="识别优化",command=self.start_optimize).grid(row=0,column=2,sticky="we")
         tk.Label(control_frame,text="ADB").grid(row=1,column=0,sticky="w")
-        tk.Entry(control_frame,textvariable=self.vars["adb"],width=48).grid(row=1,column=1,sticky="we")
+        tk.Entry(control_frame,textvariable=self.vars["adb"],width=48).grid(row=1,column=1,columnspan=2,sticky="we")
         tk.Label(control_frame,text="模拟器").grid(row=2,column=0,sticky="w")
-        tk.Entry(control_frame,textvariable=self.vars["dn"],width=48).grid(row=2,column=1,sticky="we")
+        tk.Entry(control_frame,textvariable=self.vars["dn"],width=48).grid(row=2,column=1,columnspan=2,sticky="we")
         tk.Label(control_frame,text="AAA").grid(row=3,column=0,sticky="w")
-        tk.Entry(control_frame,textvariable=self.vars["aaa"],width=48).grid(row=3,column=1,sticky="we")
-        tk.Button(control_frame,text="应用路径",command=self.apply_paths).grid(row=4,column=0,columnspan=2,sticky="we")
+        tk.Entry(control_frame,textvariable=self.vars["aaa"],width=48).grid(row=3,column=1,columnspan=2,sticky="we")
+        ttk.Progressbar(control_frame,variable=self.progress_var,maximum=100.0,length=240).grid(row=4,column=0,columnspan=3,sticky="we")
+        tk.Button(control_frame,text="应用路径",command=self.apply_paths).grid(row=5,column=0,columnspan=3,sticky="we")
     def start_bot(self):
         self.apply_paths()
         self.mode_manager.switch_to_train()
     def stop_bot(self):
         self.mode_manager.force_learning()
+    def start_optimize(self):
+        if not self.optimizer:
+            return
+        started=self.optimizer.start(lambda steps:self.root.after(0,lambda:self.on_optimize_complete(steps)))
+        if started:
+            with self.shared.lock:
+                self.shared.optimize_text="优化进行中"
+            self.vars["opt"].set(self.shared.optimize_text)
+    def on_optimize_complete(self,steps):
+        messagebox.showinfo("优化完成",f"基于经验池完成{steps}次迭代")
+        self.mode_manager.finalize_optimization()
+        with self.shared.lock:
+            self.shared.optimize_text="待命"
+            self.shared.optimize_progress=0.0
+        self.vars["opt"].set(self.shared.optimize_text)
+        self.progress_var.set(0.0)
     def apply_paths(self):
         adb_path=self.vars["adb"].get()
         dn_path=self.vars["dn"].get()
@@ -1140,6 +1275,8 @@ class BotUI:
             if "cuda_gpu" in self.shared.hw_profile and self.shared.hw_profile["cuda_gpu"]:
                 hw_desc+=f"GPU:{self.shared.hw_profile['cuda_gpu']}"
             self.vars["hw"].set(hw_desc)
+            self.vars["opt"].set(self.shared.optimize_text)
+            self.progress_var.set(self.shared.optimize_progress*100.0)
         self.root.after(500,self.update_loop)
     def run(self):
         self.root.mainloop()
@@ -1229,10 +1366,11 @@ def main():
     controller=BotController(shared,agent,model_manager,game)
     recorder=ExperienceRecorder(config)
     mode_manager=ModeManager(shared,controller,recorder,config)
+    optimizer=OptimizationManager(shared,agent,recorder,mode_manager)
     input_monitor=InputMonitor(mode_manager)
     mode_manager.start()
     input_monitor.start()
-    ui=BotUI(shared,controller,config_manager,mode_manager)
+    ui=BotUI(shared,controller,config_manager,mode_manager,optimizer)
     try:
         ui.run()
     finally:
