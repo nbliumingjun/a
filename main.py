@@ -133,7 +133,7 @@ class ConfigManager:
             self.save_config(data)
         if "路径" not in data or "AAA" not in data["路径"]:
             data["路径"]=default_config(self.default_aaa)["路径"]
-        aaa_dir=data["路径"].get("AAA",self.default_aaa)
+        aaa_dir=os.path.normpath(os.path.abspath(data["路径"].get("AAA",self.default_aaa)))
         self.ensure_dir(aaa_dir)
         self.config_path=os.path.join(aaa_dir,"配置.json")
         if not os.path.isfile(self.config_path):
@@ -162,9 +162,11 @@ class ConfigManager:
             self.config["路径"]["ADB"]=adb_path
         if dn_path:
             self.config["路径"]["模拟器"]=dn_path
-        if aaa_dir and aaa_dir!=self.config["路径"]["AAA"]:
-            self.ensure_dir(aaa_dir)
-            self.config["路径"]["AAA"]=aaa_dir
+        if aaa_dir:
+            normalized=os.path.normpath(os.path.abspath(aaa_dir))
+            if normalized!=self.config["路径"]["AAA"]:
+                self.ensure_dir(normalized)
+                self.config["路径"]["AAA"]=normalized
         self.config_path=os.path.join(self.config["路径"]["AAA"],"配置.json")
         self.ensure_dir(os.path.join(self.config["路径"]["AAA"],self.config["经验目录"]))
         self.save_config()
