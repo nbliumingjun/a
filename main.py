@@ -31,16 +31,23 @@ class RectRegion:
 def default_config(base_dir):
     base_w=2560
     base_h=1600
-    model_names={"一技能":"skill1_model.pt","二技能":"skill2_model.pt","三技能":"skill3_model.pt","移动轮盘":"move_model.pt","普攻":"attack_model.pt","回城":"recall_model.pt","视觉":"vision_model.pt"}
-    circle_raw={"移动轮盘":(166,915,536),"回城":(1083,1263,162),"恢复":(1271,1263,162),"闪现":(1467,1263,162),"一技能":(1672,1220,195),"二技能":(1825,956,195),"三技能":(2088,803,195),"取消施法":(2165,252,250),"普攻补刀":(1915,1296,123),"普攻点塔":(2241,1014,123),"主动装备":(2092,544,161)}
-    rect_raw={"A":(1904,122,56,56),"B":(1996,122,56,56),"C":(2087,122,56,56),"小地图":(0,72,453,453)}
+    model_pairs=[("一技能","skill1_model.pt"),("二技能","skill2_model.pt"),("三技能","skill3_model.pt"),("移动轮盘","move_model.pt"),("普攻","attack_model.pt"),("回城","recall_model.pt"),("视觉","vision_model.pt")]
+    model_names={k:v for k,v in model_pairs}
+    circle_items=[("移动轮盘",166,915,536),("回城",1083,1263,162),("恢复",1271,1263,162),("闪现",1467,1263,162),("一技能",1672,1220,195),("二技能",1825,956,195),("三技能",2088,803,195),("取消施法",2165,252,250),("普攻补刀",1915,1296,123),("普攻点塔",2241,1014,123),("主动装备",2092,544,161)]
+    rect_items=[("A",1904,122,56,56),("B",1996,122,56,56),("C",2087,122,56,56),("小地图",0,72,453,453)]
+    circle_raw={name:(x,y,d) for name,x,y,d in circle_items}
+    rect_raw={name:(x,y,w,h) for name,x,y,w,h in rect_items}
     circle_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"直径":float(d),"直径比例":float(d)/base_w} for k,(x,y,d) in circle_raw.items()}
     rect_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"尺寸":[float(w),float(h)],"尺寸比例":[float(w)/base_w,float(h)/base_h]} for k,(x,y,w,h) in rect_raw.items()}
     flash_offset=[150.0,0.0]
     flash_ratio=[flash_offset[0]/base_w,flash_offset[1]/base_h]
     obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]
     action_names=["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]
-    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":0.0003,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
+    lr=0.0003
+    reward_window=max(12,len(action_names)*6)
+    reward_gain=0.3+len(action_names)/100.0
+    value_reg=0.25/max(8,len(obs_keys))
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -171,40 +178,54 @@ class ModelManager:
         self.models={}
         self.ensure_models()
         self.load_models()
+    def model_dims(self):
+        learn_conf=self.config.get("学习",{})
+        obs_dim=len(self.config.get("观测键",[])) or 32
+        act_dim=len(self.config.get("动作名称",[])) or max(16,obs_dim//2)
+        hidden=max(16,int(learn_conf.get("隐藏单元",128)))
+        obs_dim=max(8,int(obs_dim))
+        act_dim=max(8,int(act_dim))
+        mid=max(8,int(hidden//2))
+        return obs_dim,hidden,act_dim,mid
+    def build_template(self):
+        obs_dim,hidden,act_dim,mid=self.model_dims()
+        return nn.Sequential(nn.Linear(obs_dim,hidden),nn.ReLU(),nn.Linear(hidden,mid),nn.ReLU(),nn.Linear(mid,act_dim))
+    def load_single(self,path):
+        try:
+            loaded=torch.load(path,map_location="cpu")
+        except:
+            return None
+        if isinstance(loaded,nn.Module):
+            model=loaded.to(self.device)
+            model=model.to(self.dtype)
+            model.eval()
+            return model
+        net=self.build_template()
+        if isinstance(loaded,dict):
+            try:
+                net.load_state_dict(loaded,strict=False)
+            except:
+                pass
+        net=net.to(self.device)
+        net=net.to(self.dtype)
+        net.eval()
+        return net
     def ensure_models(self):
         model_dir=self.config["路径"]["AAA"]
+        template=self.build_template()
+        state_dict=template.state_dict()
         for name,filename in self.config["模型文件"].items():
             path=os.path.join(model_dir,filename)
             if not os.path.isfile(path):
-                net=nn.Sequential(nn.Linear(32,64),nn.ReLU(),nn.Linear(64,32))
-                torch.save(net,path)
+                torch.save(state_dict,path)
     def load_models(self):
         model_dir=self.config["路径"]["AAA"]
         for name,filename in self.config["模型文件"].items():
             path=os.path.join(model_dir,filename)
-            try:
-                obj=torch.load(path,map_location=self.device)
-                if isinstance(obj,nn.Module):
-                    obj.to(self.device)
-                    try:
-                        obj.to(self.dtype)
-                    except:
-                        pass
-                    obj.eval()
-                    self.models[name]=obj
-                else:
-                    net=nn.Sequential(nn.Linear(32,64),nn.ReLU(),nn.Linear(64,32)).to(self.device)
-                    net.load_state_dict(obj,strict=False)
-                    net.eval()
-                    self.models[name]=net
-            except:
-                self.models[name]=None
+            self.models[name]=self.load_single(path)
         for f in glob.glob(os.path.join(model_dir,"*.pt"))+glob.glob(os.path.join(model_dir,"*.pth")):
             if f not in [os.path.join(model_dir,x) for x in self.config["模型文件"].values()]:
-                try:
-                    self.models[os.path.basename(f)]=torch.load(f,map_location=self.device)
-                except:
-                    self.models[os.path.basename(f)]=None
+                self.models[os.path.basename(f)]=self.load_single(f)
 class QNetwork(nn.Module):
     def __init__(self,input_dim,output_dim,hidden_dim,dtype):
         super().__init__()
@@ -222,7 +243,7 @@ class QNetwork(nn.Module):
         x=self.fc3(x)
         return x
 class DeepRLAgent:
-    def __init__(self,device,dtype,config,obs_dim,action_dim,hidden_dim,buffer_size,batch_size,gamma,lr,target_sync,epsilon_decay,experience_dir):
+    def __init__(self,device,dtype,config,obs_dim,action_dim,hidden_dim,buffer_size,batch_size,gamma,lr,target_sync,epsilon_decay,experience_dir,weight_decay,value_reg):
         self.device=device
         self.dtype=dtype
         self.hidden_dim=hidden_dim
@@ -231,7 +252,9 @@ class DeepRLAgent:
         self.obs_dim=obs_dim
         self.action_dim=action_dim
         self.build_networks()
-        self.optimizer=optim.Adam(self.policy_net.parameters(),lr=lr)
+        self.weight_decay=weight_decay
+        self.value_reg=value_reg
+        self.optimizer=optim.Adam(self.policy_net.parameters(),lr=lr,weight_decay=self.weight_decay)
         self.replay_buffer=deque(maxlen=buffer_size)
         self.batch_size=batch_size
         self.gamma=gamma
@@ -258,7 +281,7 @@ class DeepRLAgent:
         self.build_networks()
         if lr is not None:
             self.lr=lr
-        self.optimizer=optim.Adam(self.policy_net.parameters(),lr=self.lr)
+        self.optimizer=optim.Adam(self.policy_net.parameters(),lr=self.lr,weight_decay=self.weight_decay)
         self.replay_buffer=deque(maxlen=self.buffer_size)
         self.step_count=0
         self.last_save_step=0
@@ -285,12 +308,18 @@ class DeepRLAgent:
         reward_batch=torch.tensor([b.reward for b in batch],dtype=torch.float32,device=self.device).unsqueeze(1)
         next_state_batch=torch.tensor([b.next_state for b in batch],dtype=torch.float32,device=self.device)
         done_batch=torch.tensor([b.done for b in batch],dtype=torch.float32,device=self.device).unsqueeze(1)
-        q_values=self.policy_net(state_batch).gather(1,action_batch)
+        policy_out=self.policy_net(state_batch)
+        q_values=policy_out.gather(1,action_batch)
         with torch.no_grad():
-            next_actions=torch.argmax(self.policy_net(next_state_batch),dim=1,keepdim=True)
+            next_policy=self.policy_net(next_state_batch)
+            next_actions=torch.argmax(next_policy,dim=1,keepdim=True)
             next_q=self.target_net(next_state_batch).gather(1,next_actions)
+            reward_batch=reward_batch.to(next_q.dtype)
+            done_batch=done_batch.to(next_q.dtype)
             target_q=reward_batch+self.gamma*(1.0-done_batch)*next_q
-        loss=nn.functional.smooth_l1_loss(q_values.to(target_q.dtype),target_q)
+        base_loss=nn.functional.smooth_l1_loss(q_values.to(target_q.dtype),target_q)
+        reg_loss=self.value_reg*torch.mean(policy_out.to(target_q.dtype)**2)
+        loss=base_loss+reg_loss
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(),10.0)
@@ -416,7 +445,11 @@ class GameInterface:
         self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1,"flash":lambda m:m.get("alive",0)==1}
         self.action_funcs={"idle":self.act_idle,"move":self.act_move,"attack_minion":self.act_attack_minion,"attack_tower":self.act_attack_tower,"skill1":self.skill_executor("skill1"),"skill2":self.skill_executor("skill2"),"skill3":self.skill_executor("skill3"),"item":self.act_item,"heal":self.act_heal,"recall":self.act_recall,"flash":self.act_flash}
         self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0}
-        self.reward_memory=deque(maxlen=64)
+        learn_conf=self.config.get("学习",{})
+        window=int(max(8,learn_conf.get("奖励平滑窗口",len(self.action_order)*6)))
+        self.reward_memory=deque(maxlen=window)
+        self.metric_history={k:deque(maxlen=window) for k in ("A","B","C")}
+        self.reward_gain=float(learn_conf.get("奖励调节",0.4))
     def _circle(self,data):
         if not data:
             return CircleRegion(0.0,0.0,1.0)
@@ -557,13 +590,22 @@ class GameInterface:
         dC=curr_metrics["C"]-prev_metrics["C"]
         dB=curr_metrics["B"]-prev_metrics["B"]
         weights=self.config["奖励"]
-        reward=float(weights["A"]*dA+weights["C"]*dC+weights["B"]*dB)
-        preference=max(dA,0.0)+max(dC,0.0)
-        penalty=max(dB,0.0)
-        self.reward_memory.append(preference-penalty)
+        for key,delta in (("A",dA),("B",dB),("C",dC)):
+            self.metric_history[key].append(delta)
+        trend_A=float(np.mean(self.metric_history["A"])) if self.metric_history["A"] else 0.0
+        trend_C=float(np.mean(self.metric_history["C"])) if self.metric_history["C"] else 0.0
+        trend_B=float(np.mean(self.metric_history["B"])) if self.metric_history["B"] else 0.0
+        gain=max(0.0,self.reward_gain)
+        boost_A=max(dA,0.0)*weights["A"]*(1.0+gain*np.clip(trend_A,-1.0,1.0))
+        boost_C=max(dC,0.0)*weights["C"]*(1.0+gain*np.clip(trend_C,-1.0,1.0))
+        penalty=max(dB,0.0)*abs(weights["B"])*(1.0+gain*np.clip(max(0.0,trend_B),0.0,1.5))
+        reward=boost_A+boost_C-penalty
+        if curr_metrics.get("alive",0)==0 and prev_metrics.get("alive",1)==1:
+            reward-=abs(weights["B"])*(1.0+gain)
+        self.reward_memory.append(reward)
         if self.reward_memory:
-            adjust=float(np.clip(np.mean(self.reward_memory),-0.5,1.5))
-            reward*=1.0+adjust
+            smooth=float(np.clip(np.mean(self.reward_memory),-gain,gain))
+            reward*=1.0+smooth
         return reward
     def execute_action(self,action_idx,metrics_prev):
         if action_idx<0 or action_idx>=self.action_dim:
@@ -615,12 +657,14 @@ class BotController:
         while self.running_event.is_set():
             action,eps=self.agent.select_action(obs_prev)
             self.game.execute_action(action,metrics_prev)
-            interval=self.shared.config["动作"].get("循环间隔",0.2)
+            base_interval=float(self.shared.config["动作"].get("循环间隔",0.2))
+            interval=max(0.05,base_interval*(0.5+0.5*eps))
             time.sleep(interval)
             metrics_curr=self.game.get_metrics()
             obs_curr=self.game.metrics_to_obs(metrics_curr)
             reward=self.game.compute_reward(metrics_prev,metrics_curr)
-            self.agent.store(obs_prev,action,reward,obs_curr,False)
+            done=metrics_curr.get("alive",0)==0
+            self.agent.store(obs_prev,action,reward,obs_curr,done)
             self.agent.train_step()
             with self.shared.lock:
                 self.shared.A=metrics_curr["A"]
@@ -749,6 +793,8 @@ def adaptive_hyperparams(hw,config,device):
     lr=base["学习率"]
     target_sync=base["同步步数"]
     epsilon_decay=base["ε衰减"]
+    weight_decay=base.get("权重衰减",lr*0.1)
+    value_reg=base.get("价值正则",0.01)
     if gpu_mem>8192:
         hidden=int(hidden*1.5)
         batch=int(batch*1.5)
@@ -756,18 +802,24 @@ def adaptive_hyperparams(hw,config,device):
         lr=lr*0.7
         epsilon_decay=int(epsilon_decay*1.3)
         target_sync=max(500,int(target_sync*0.8))
+        weight_decay=float(weight_decay)*0.8
+        value_reg=float(value_reg)*0.7
     elif cpu>=8 and mem>12:
         hidden=int(hidden*1.3)
         batch=int(batch*1.2)
         buffer=int(buffer*1.2)
         epsilon_decay=int(epsilon_decay*1.1)
+        weight_decay=float(weight_decay)*0.9
     elif mem<6:
         batch=max(16,int(batch*0.6))
         buffer=max(8000,int(buffer*0.5))
         target_sync=int(target_sync*1.2)
+        weight_decay=float(weight_decay)*1.2
+        value_reg=float(value_reg)*1.3
     if device=="cpu":
         lr=max(lr,1e-4)
-    return {"hidden_dim":hidden,"batch_size":batch,"buffer_size":buffer,"lr":lr,"target_sync":target_sync,"epsilon_decay":epsilon_decay,"gamma":base["折扣"]}
+        weight_decay=float(weight_decay)*1.1
+    return {"hidden_dim":hidden,"batch_size":batch,"buffer_size":buffer,"lr":lr,"target_sync":target_sync,"epsilon_decay":epsilon_decay,"gamma":base["折扣"],"weight_decay":float(weight_decay),"value_reg":float(value_reg)}
 def main():
     config_manager=ConfigManager()
     config=config_manager.config
@@ -782,7 +834,7 @@ def main():
     params=adaptive_hyperparams(hw,config,device)
     experience_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
     game=GameInterface(config,config["路径"]["ADB"])
-    agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir)
+    agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir,weight_decay=params["weight_decay"],value_reg=params["value_reg"])
     model_manager=ModelManager(config,device,dtype)
     controller=BotController(shared,agent,model_manager,game)
     ui=BotUI(shared,controller,config_manager)
