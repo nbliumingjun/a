@@ -28,6 +28,48 @@ class RectRegion:
     y:float
     w:float
     h:float
+class RegionScaler:
+    def __init__(self,config):
+        screen=config.get("屏幕",{})
+        self.base_w=float(screen.get("基准宽度",2560))
+        self.base_h=float(screen.get("基准高度",1600))
+        self.circle_conf=config.get("圆形区域",{})
+        self.rect_conf=config.get("识别",{})
+        self.screen_w=self.base_w
+        self.screen_h=self.base_h
+    def update(self,width,height):
+        self.screen_w=max(1.0,float(width))
+        self.screen_h=max(1.0,float(height))
+    def _ratio(self,data,key,fallback):
+        value=data.get(key)
+        if isinstance(value,list) and len(value)>=2:
+            return [float(value[0]),float(value[1])]
+        return fallback
+    def circle(self,name):
+        data=self.circle_conf.get(name)
+        if not isinstance(data,dict):
+            return CircleRegion(0.0,0.0,1.0)
+        ratio=self._ratio(data,"左上角比例",self._ratio(data,"左上角",[0.0,0.0]))
+        dia_ratio=data.get("直径比例")
+        if dia_ratio is None:
+            dia=float(data.get("直径",1.0))/self.base_w if self.base_w else 0.0
+        else:
+            dia=float(dia_ratio)
+        return CircleRegion(ratio[0]*self.screen_w,ratio[1]*self.screen_h,dia*self.screen_w)
+    def rect(self,name):
+        data=self.rect_conf.get(name)
+        if not isinstance(data,dict):
+            return RectRegion(0.0,0.0,1.0,1.0)
+        ratio=self._ratio(data,"左上角比例",self._ratio(data,"左上角",[0.0,0.0]))
+        size_ratio=data.get("尺寸比例")
+        if isinstance(size_ratio,list) and len(size_ratio)>=2:
+            sw=float(size_ratio[0])
+            sh=float(size_ratio[1])
+        else:
+            size=data.get("尺寸",[1.0,1.0])
+            sw=float(size[0])/self.base_w if self.base_w else 0.0
+            sh=float(size[1])/self.base_h if self.base_h else 0.0
+        return RectRegion(ratio[0]*self.screen_w,ratio[1]*self.screen_h,sw*self.screen_w,sh*self.screen_h)
 def default_config(base_dir):
     base_w=2560
     base_h=1600
@@ -363,13 +405,11 @@ class VisionModule:
     def __init__(self,config):
         self.config=config
         self.prev_ready={}
-    def crop_cv(self,pil_img,x,y,w,h,scale_x,scale_y):
-        sx=int(x*scale_x)
-        sy=int(y*scale_y)
-        sw=max(1,int(w*scale_x))
-        sh=max(1,int(h*scale_y))
-        ex=min(pil_img.width,sx+sw)
-        ey=min(pil_img.height,sy+sh)
+    def crop_cv(self,pil_img,x,y,w,h):
+        sx=max(0,int(x))
+        sy=max(0,int(y))
+        ex=min(pil_img.width,max(1,int(x+w)))
+        ey=min(pil_img.height,max(1,int(y+h)))
         crop_pil=pil_img.crop((sx,sy,ex,ey))
         return cv2.cvtColor(np.array(crop_pil),cv2.COLOR_RGB2BGR)
     def region_stats(self,cv_img):
@@ -408,10 +448,9 @@ class GameInterface:
     def __init__(self,config,adb_path):
         self.config=config
         self.adb_path=adb_path
-        self.base_w=self.config["屏幕"]["基准宽度"]
-        self.base_h=self.config["屏幕"]["基准高度"]
-        self.screen_w=self.base_w
-        self.screen_h=self.base_h
+        self.scaler=RegionScaler(config)
+        self.screen_w=self.scaler.screen_w
+        self.screen_h=self.scaler.screen_h
         self.vision=VisionModule(config)
         self.last_screenshot=None
         self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]))
@@ -421,27 +460,11 @@ class GameInterface:
         self.obs_dim=len(self.obs_keys)
         self.action_dim=len(self.action_order)
         self.joystick_ratio=float(self.config["动作"].get("摇杆幅度",0.8))
-        circle_conf=self.config["圆形区域"]
-        rect_conf=self.config["识别"]
-        self.circle_regions={
-            "joystick":self._circle(circle_conf.get("移动轮盘")),
-            "recall":self._circle(circle_conf.get("回城")),
-            "heal":self._circle(circle_conf.get("恢复")),
-            "flash":self._circle(circle_conf.get("闪现")),
-            "skill1":self._circle(circle_conf.get("一技能")),
-            "skill2":self._circle(circle_conf.get("二技能")),
-            "skill3":self._circle(circle_conf.get("三技能")),
-            "cancel":self._circle(circle_conf.get("取消施法")),
-            "attack_min":self._circle(circle_conf.get("普攻补刀")),
-            "attack_tower":self._circle(circle_conf.get("普攻点塔")),
-            "active_item":self._circle(circle_conf.get("主动装备"))
-        }
-        self.rect_regions={
-            "A":self._rect(rect_conf.get("A")),
-            "B":self._rect(rect_conf.get("B")),
-            "C":self._rect(rect_conf.get("C")),
-            "minimap":self._rect(rect_conf.get("小地图"))
-        }
+        self.circle_map={"joystick":"移动轮盘","recall":"回城","heal":"恢复","flash":"闪现","skill1":"一技能","skill2":"二技能","skill3":"三技能","cancel":"取消施法","attack_min":"普攻补刀","attack_tower":"普攻点塔","active_item":"主动装备"}
+        self.rect_map={"A":"A","B":"B","C":"C","minimap":"小地图"}
+        self.circle_regions={}
+        self.rect_regions={}
+        self.refresh_regions()
         self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1,"flash":lambda m:m.get("alive",0)==1}
         self.action_funcs={"idle":self.act_idle,"move":self.act_move,"attack_minion":self.act_attack_minion,"attack_tower":self.act_attack_tower,"skill1":self.skill_executor("skill1"),"skill2":self.skill_executor("skill2"),"skill3":self.skill_executor("skill3"),"item":self.act_item,"heal":self.act_heal,"recall":self.act_recall,"flash":self.act_flash}
         self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0}
@@ -450,17 +473,13 @@ class GameInterface:
         self.reward_memory=deque(maxlen=window)
         self.metric_history={k:deque(maxlen=window) for k in ("A","B","C")}
         self.reward_gain=float(learn_conf.get("奖励调节",0.4))
-    def _circle(self,data):
-        if not data:
-            return CircleRegion(0.0,0.0,1.0)
-        tl=data.get("左上角",[0.0,0.0])
-        return CircleRegion(float(tl[0]),float(tl[1]),float(data.get("直径",1.0)))
-    def _rect(self,data):
-        if not data:
-            return RectRegion(0.0,0.0,1.0,1.0)
-        tl=data.get("左上角",[0.0,0.0])
-        sz=data.get("尺寸",[1.0,1.0])
-        return RectRegion(float(tl[0]),float(tl[1]),float(sz[0]),float(sz[1]))
+    def refresh_regions(self):
+        for alias,name in self.circle_map.items():
+            self.circle_regions[alias]=self.scaler.circle(name)
+        for alias,name in self.rect_map.items():
+            self.rect_regions[alias]=self.scaler.rect(name)
+        self.screen_w=self.scaler.screen_w
+        self.screen_h=self.scaler.screen_h
     def adb_tap(self,x,y):
         try:
             subprocess.call([self.adb_path,"shell","input","tap",str(int(x)),str(int(y))])
@@ -476,14 +495,13 @@ class GameInterface:
             png_bytes=subprocess.check_output([self.adb_path,"exec-out","screencap","-p"],timeout=5)
             img=Image.open(io.BytesIO(png_bytes)).convert("RGB")
             self.last_screenshot=img
-            self.screen_w,self.screen_h=img.size
+            self.scaler.update(*img.size)
+            self.refresh_regions()
             return img
         except:
             return self.last_screenshot
     def scaled_xy(self,x,y):
-        sx=int(x*self.screen_w/self.base_w)
-        sy=int(y*self.screen_h/self.base_h)
-        return sx,sy
+        return int(x),int(y)
     def circle_center(self,region):
         return region.x+region.d/2.0,region.y+region.d/2.0
     def tap_circle(self,region):
@@ -553,14 +571,11 @@ class GameInterface:
         img=self.get_screenshot()
         if img is None:
             return self.prev_metrics
-        w,h=img.size
-        scale_x=w/self.base_w
-        scale_y=h/self.base_h
         v=self.vision
         def crop_circle(region):
-            return v.crop_cv(img,region.x,region.y,region.d,region.d,scale_x,scale_y)
+            return v.crop_cv(img,region.x,region.y,region.d,region.d)
         def crop_rect(region):
-            return v.crop_cv(img,region.x,region.y,region.w,region.h,scale_x,scale_y)
+            return v.crop_cv(img,region.x,region.y,region.w,region.h)
         A_img=crop_rect(self.rect_regions["A"])
         B_img=crop_rect(self.rect_regions["B"])
         C_img=crop_rect(self.rect_regions["C"])
