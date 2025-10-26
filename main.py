@@ -78,7 +78,7 @@ class RegionScaler:
 def default_config(base_dir):
     base_w=2560
     base_h=1600
-    model_pairs=[("一技能","skill1_model.pt"),("二技能","skill2_model.pt"),("三技能","skill3_model.pt"),("移动轮盘","move_model.pt"),("普攻","attack_model.pt"),("回城","recall_model.pt"),("视觉","vision_model.pt")]
+    model_pairs=[("一技能","skill1_model.pt"),("二技能","skill2_model.pt"),("三技能","skill3_model.pt"),("移动轮盘","move_model.pt"),("普攻","attack_model.pt"),("回城","recall_model.pt"),("视觉","vision_model.pt"),("恢复","heal_model.pt"),("闪现","flash_model.pt"),("小地图","minimap_model.pt")]
     model_names={k:v for k,v in model_pairs}
     circle_items=[("移动轮盘",166,915,536),("回城",1083,1263,162),("恢复",1271,1263,162),("闪现",1467,1263,162),("一技能",1672,1220,195),("二技能",1825,956,195),("三技能",2088,803,195),("取消施法",2165,252,250),("普攻补刀",1915,1296,123),("普攻点塔",2241,1014,123),("主动装备",2092,544,161)]
     rect_items=[("A",1904,122,56,56),("B",1996,122,56,56),("C",2087,122,56,56),("小地图",0,72,453,453)]
