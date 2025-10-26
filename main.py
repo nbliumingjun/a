@@ -88,7 +88,7 @@ def default_config(base_dir):
     rect_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"尺寸":[float(w),float(h)],"尺寸比例":[float(w)/base_w,float(h)/base_h]} for k,(x,y,w,h) in rect_raw.items()}
     flash_offset=[150.0,0.0]
     flash_ratio=[flash_offset[0]/base_w,flash_offset[1]/base_h]
-    obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]
+    obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall"]
     action_names=["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]
     lr=0.0003
     reward_window=max(12,len(action_names)*6)
@@ -215,6 +215,8 @@ class SharedState:
         self.cd3=0
         self.cd_item=0
         self.cd_heal=0
+        self.cd_flash=0
+        self.cd_recall=0
         self.running=False
         self.epsilon=1.0
         self.device="cpu"
@@ -279,6 +281,19 @@ class ModelManager:
         for f in glob.glob(os.path.join(model_dir,"*.pt"))+glob.glob(os.path.join(model_dir,"*.pth")):
             if f not in [os.path.join(model_dir,x) for x in self.config["模型文件"].values()]:
                 self.models[os.path.basename(f)]=self.load_single(f)
+    def infer(self,name,input_vec):
+        model=self.models.get(name)
+        if model is None:
+            return None
+        try:
+            with torch.no_grad():
+                t=torch.tensor(input_vec,dtype=torch.float32,device=self.device)
+                if t.ndim==1:
+                    t=t.unsqueeze(0)
+                out=model(t)
+                return out.squeeze(0).detach().cpu().numpy()
+        except:
+            return None
 class QNetwork(nn.Module):
     def __init__(self,input_dim,output_dim,hidden_dim,dtype):
         super().__init__()
@@ -625,15 +640,16 @@ class ModeManager:
                 self.last_frame=now
             time.sleep(max(0.1,interval*0.5))
 class GameInterface:
-    def __init__(self,config,adb_path):
+    def __init__(self,config,adb_path,model_manager,experience_dir):
         self.config=config
         self.adb_path=adb_path
+        self.model_manager=model_manager
         self.scaler=RegionScaler(config)
         self.screen_w=self.scaler.screen_w
         self.screen_h=self.scaler.screen_h
         self.vision=VisionModule(config)
         self.last_screenshot=None
-        self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]))
+        self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall"]))
         self.metric_caps={k:float(v) for k,v in self.config.get("数值上限",{}).items()}
         self.binary_keys={k for k in self.obs_keys if k=="alive" or k.startswith("cd")}
         self.action_order=list(self.config.get("动作名称",["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]))
@@ -645,14 +661,18 @@ class GameInterface:
         self.circle_regions={}
         self.rect_regions={}
         self.refresh_regions()
-        self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1,"flash":lambda m:m.get("alive",0)==1}
+        self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1 and m.get("cd_recall",0)==1,"flash":lambda m:m.get("alive",0)==1 and m.get("cd_flash",0)==1}
         self.action_funcs={"idle":self.act_idle,"move":self.act_move,"attack_minion":self.act_attack_minion,"attack_tower":self.act_attack_tower,"skill1":self.skill_executor("skill1"),"skill2":self.skill_executor("skill2"),"skill3":self.skill_executor("skill3"),"item":self.act_item,"heal":self.act_heal,"recall":self.act_recall,"flash":self.act_flash}
-        self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0}
+        self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0,"cd_flash":0,"cd_recall":0}
         learn_conf=self.config.get("学习",{})
         window=int(max(8,learn_conf.get("奖励平滑窗口",len(self.action_order)*6)))
         self.reward_memory=deque(maxlen=window)
         self.metric_history={k:deque(maxlen=window) for k in ("A","B","C")}
         self.reward_gain=float(learn_conf.get("奖励调节",0.4))
+        self.experience_dir=experience_dir
+        os.makedirs(self.experience_dir,exist_ok=True)
+        self.skill_path_file=os.path.join(self.experience_dir,"skill_paths.json")
+        self.skill_paths=self.load_skill_paths()
     def refresh_regions(self):
         for alias,name in self.circle_map.items():
             self.circle_regions[alias]=self.scaler.circle(name)
@@ -660,6 +680,57 @@ class GameInterface:
             self.rect_regions[alias]=self.scaler.rect(name)
         self.screen_w=self.scaler.screen_w
         self.screen_h=self.scaler.screen_h
+    def load_skill_paths(self):
+        if not os.path.isfile(self.skill_path_file):
+            return {}
+        try:
+            with open(self.skill_path_file,"r",encoding="utf-8") as f:
+                data=json.load(f)
+            if isinstance(data,dict):
+                return data
+        except:
+            pass
+        return {}
+    def save_skill_paths(self):
+        try:
+            with open(self.skill_path_file,"w",encoding="utf-8") as f:
+                json.dump(self.skill_paths,f,ensure_ascii=False)
+        except:
+            pass
+    def experience_path(self,key,center,radius,seed):
+        entry=self.skill_paths.get(key)
+        if not isinstance(entry,list) or len(entry)==0:
+            return None,False
+        idx=int(abs(seed)%len(entry))
+        data=entry[idx]
+        pts=data.get("points")
+        cancel=bool(data.get("cancel",False))
+        if not isinstance(pts,list):
+            return None,cancel
+        path=[center]
+        for item in pts:
+            if not isinstance(item,list) or len(item)<2:
+                continue
+            px=center[0]+float(item[0])*radius
+            py=center[1]+float(item[1])*radius
+            path.append((px,py))
+        return path,cancel
+    def record_skill_path(self,key,path,cancel,center,radius):
+        if len(path)<=1:
+            return
+        norm=[]
+        inv=max(radius,1.0)
+        for pt in path[1:]:
+            norm.append([(pt[0]-center[0])/inv,(pt[1]-center[1])/inv])
+        data={"points":norm,"cancel":1 if cancel else 0,"t":time.time()}
+        bucket=self.skill_paths.get(key,[])
+        bucket=[d for d in bucket if isinstance(d,dict)]
+        bucket.append(data)
+        limit=max(8,int(self.config["学习"].get("批次",64)//2))
+        if len(bucket)>limit:
+            bucket=bucket[-limit:]
+        self.skill_paths[key]=bucket
+        self.save_skill_paths()
     def adb_tap(self,x,y):
         try:
             subprocess.call([self.adb_path,"shell","input","tap",str(int(x)),str(int(y))])
@@ -690,7 +761,7 @@ class GameInterface:
         self.adb_tap(sx,sy)
     def skill_executor(self,key):
         def runner(metrics):
-            self.cast_skill(key)
+            self.cast_skill(key,metrics)
         return runner
     def act_idle(self,metrics):
         return
@@ -723,8 +794,101 @@ class GameInterface:
         self.tap_circle(self.circle_regions["attack_min"])
     def basic_attack_tower(self):
         self.tap_circle(self.circle_regions["attack_tower"])
-    def cast_skill(self,key):
-        self.tap_circle(self.circle_regions[key])
+    def model_direction(self,key,obs):
+        name_map={"skill1":"一技能","skill2":"二技能","skill3":"三技能"}
+        name=name_map.get(key)
+        if not name or not self.model_manager:
+            return None
+        out=self.model_manager.infer(name,obs)
+        if out is None:
+            return None
+        try:
+            arr=np.array(out,dtype=np.float32).flatten()
+        except:
+            return None
+        if arr.size==0:
+            return None
+        return arr
+    def generate_drag_path(self,key,metrics):
+        region=self.circle_regions[key]
+        center=self.circle_center(region)
+        radius=max(region.d/2.0,1.0)
+        obs=self.metrics_to_obs(metrics)
+        seed=sum(obs)+metrics.get("A",0)+metrics.get("C",0)+time.time()%1.0
+        path,cancel=self.experience_path(key,center,radius,seed)
+        if not path:
+            vec=self.model_direction(key,obs)
+            direction=None
+            cancel_score=0.0
+            curvature=seed
+            if vec is not None:
+                length=float(np.linalg.norm(vec[:2])) if vec.size>=2 else 0.0
+                denom=max(length,np.finfo(np.float32).eps)
+                scale=length/(1.0+length) if length>0 else 0.0
+                base_mag=radius*self.joystick_ratio*scale if scale>0 else radius*self.joystick_ratio*0.5
+                direction=(vec[0]/denom if vec.size>=1 else 1.0,vec[1]/denom if vec.size>=2 else 0.0)
+                cancel_score=float(vec[2]) if vec.size>=3 else 0.0
+                curvature=float(vec[3]) if vec.size>=4 else seed
+                target=(center[0]+direction[0]*base_mag,center[1]+direction[1]*base_mag)
+            else:
+                ang=seed*math.tau if hasattr(math,"tau") else seed*math.pi*2.0
+                direction=(math.cos(ang),math.sin(ang))
+                target=(center[0]+direction[0]*radius*self.joystick_ratio,center[1]+direction[1]*radius*self.joystick_ratio)
+                curvature=seed
+            if direction is None:
+                direction=(0.0,1.0)
+                target=(center[0],center[1]+radius*self.joystick_ratio)
+            path=[center]
+            steps=max(3,int(len(self.obs_keys)/2))
+            unit=math.sqrt(direction[0]**2+direction[1]**2)
+            if unit<=np.finfo(np.float32).eps:
+                direction=(0.0,1.0)
+                unit=1.0
+            perp=(-direction[1]/unit,direction[0]/unit)
+            readiness=max(0.0,metrics.get("cd1",0)+metrics.get("cd2",0)+metrics.get("cd3",0)+metrics.get("cd_flash",0)+metrics.get("cd_item",0))
+            caution=max(0.0,metrics.get("B",0)+1.0)/(metrics.get("A",0)+metrics.get("C",0)+1.0)
+            curve_gain=self.reward_gain/(len(self.obs_keys)+1)
+            for i in range(1,steps+1):
+                ratio=i/steps
+                base_x=center[0]+(target[0]-center[0])*ratio
+                base_y=center[1]+(target[1]-center[1])*ratio
+                wave=math.sin(curvature*ratio+self.reward_gain*readiness)
+                offset=radius*self.joystick_ratio*wave*curve_gain*caution
+                path.append((base_x+perp[0]*offset,base_y+perp[1]*offset))
+            cancel_prob=1.0/(1.0+math.exp(-cancel_score)) if cancel_score!=0.0 else 0.0
+            threshold=0.5+self.reward_gain/(2.0+self.reward_gain)
+            cancel=cancel or metrics.get("alive",1)==0 or cancel_prob>threshold
+        return path,cancel
+    def drag_path(self,path):
+        if not path or len(path)<2:
+            return
+        total=0.0
+        segments=[]
+        for i in range(len(path)-1):
+            x1,y1=path[i]
+            x2,y2=path[i+1]
+            dist=math.hypot(x2-x1,y2-y1)
+            segments.append((x1,y1,x2,y2,dist))
+            total+=dist
+        base=self.config["动作"].get("拖动耗时",0.2)*1000.0
+        base=max(base,1.0)
+        for x1,y1,x2,y2,dist in segments:
+            duration=int(base*(dist/total if total>0 else 1.0))
+            duration=max(duration,1)
+            sx,sy=self.scaled_xy(x1,y1)
+            ex,ey=self.scaled_xy(x2,y2)
+            self.adb_swipe(sx,sy,ex,ey,duration)
+    def cast_skill(self,key,metrics):
+        path,cancel=self.generate_drag_path(key,metrics)
+        if cancel:
+            cancel_region=self.circle_regions["cancel"]
+            cancel_center=self.circle_center(cancel_region)
+            path=list(path)
+            path.append(cancel_center)
+        self.drag_path(path)
+        region=self.circle_regions[key]
+        center=self.circle_center(region)
+        self.record_skill_path(key,path,cancel,center,max(region.d/2.0,1.0))
     def use_item(self):
         self.tap_circle(self.circle_regions["active_item"])
     def heal(self):
@@ -767,7 +931,9 @@ class GameInterface:
         skill3_img=crop_circle(self.circle_regions["skill3"])
         item_img=crop_circle(self.circle_regions["active_item"])
         heal_img=crop_circle(self.circle_regions["heal"])
-        metrics={"A":v.ocr_digits(A_img),"B":v.ocr_digits(B_img),"C":v.ocr_digits(C_img),"alive":v.alive_state(attack_img),"cd1":v.cooldown_ready("skill1",skill1_img),"cd2":v.cooldown_ready("skill2",skill2_img),"cd3":v.cooldown_ready("skill3",skill3_img),"cd_item":v.cooldown_ready("item",item_img),"cd_heal":v.cooldown_ready("heal",heal_img)}
+        flash_img=crop_circle(self.circle_regions["flash"])
+        recall_img=crop_circle(self.circle_regions["recall"])
+        metrics={"A":v.ocr_digits(A_img),"B":v.ocr_digits(B_img),"C":v.ocr_digits(C_img),"alive":v.alive_state(attack_img),"cd1":v.cooldown_ready("skill1",skill1_img),"cd2":v.cooldown_ready("skill2",skill2_img),"cd3":v.cooldown_ready("skill3",skill3_img),"cd_item":v.cooldown_ready("item",item_img),"cd_heal":v.cooldown_ready("heal",heal_img),"cd_flash":v.cooldown_ready("flash",flash_img),"cd_recall":v.cooldown_ready("recall",recall_img)}
         if update_prev or capture_needed:
             self.prev_metrics=metrics
         return metrics
@@ -800,6 +966,10 @@ class GameInterface:
         reward=boost_A+boost_C-penalty
         if curr_metrics.get("alive",0)==0 and prev_metrics.get("alive",1)==1:
             reward-=abs(weights["B"])*(1.0+gain)
+        flash_delta=curr_metrics.get("cd_flash",0)-prev_metrics.get("cd_flash",0)
+        recall_delta=curr_metrics.get("cd_recall",0)-prev_metrics.get("cd_recall",0)
+        readiness_scale=(abs(weights["A"])+abs(weights["C"]))/(abs(weights["B"])+1.0)
+        reward+=readiness_scale*(flash_delta+recall_delta/(len(self.obs_keys)+1))
         self.reward_memory.append(reward)
         if self.reward_memory:
             smooth=float(np.clip(np.mean(self.reward_memory),-gain,gain))
@@ -835,10 +1005,12 @@ class BotController:
         target_aaa=aaa_path if aaa_path else cm.config["路径"]["AAA"]
         cm.update_paths(self.adb_path,self.dnplayer_path,target_aaa)
         self.shared.config=cm.config
-        new_game=GameInterface(cm.config,self.adb_path)
+        experience_dir=os.path.join(cm.config["路径"]["AAA"],cm.config["经验目录"])
+        new_model_manager=ModelManager(cm.config,self.agent.device,self.agent.dtype)
+        self.model_manager=new_model_manager
+        new_game=GameInterface(cm.config,self.adb_path,self.model_manager,experience_dir)
         if new_game.obs_dim!=self.game.obs_dim or new_game.action_dim!=self.game.action_dim:
             self.agent.rebuild(new_game.obs_dim,new_game.action_dim)
-        self.model_manager=ModelManager(cm.config,self.agent.device,self.agent.dtype)
         self.game=new_game
     def start(self):
         if self.running_event.is_set():
@@ -884,6 +1056,8 @@ class BotController:
                 self.shared.cd3=metrics_curr["cd3"]
                 self.shared.cd_item=metrics_curr["cd_item"]
                 self.shared.cd_heal=metrics_curr["cd_heal"]
+                self.shared.cd_flash=metrics_curr["cd_flash"]
+                self.shared.cd_recall=metrics_curr["cd_recall"]
                 self.shared.epsilon=eps
                 self.shared.running=True
             metrics_prev=metrics_curr
@@ -896,7 +1070,7 @@ class BotUI:
         self.mode_manager=mode_manager
         self.root=tk.Tk()
         self.root.title("AI强化学习深度学习控制面板")
-        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","epsilon","status","device","hw","adb","dn","aaa"]}
+        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall","epsilon","status","device","hw","adb","dn","aaa"]}
         self.vars["adb"].set(self.shared.config["路径"]["ADB"])
         self.vars["dn"].set(self.shared.config["路径"]["模拟器"])
         self.vars["aaa"].set(self.shared.config["路径"]["AAA"])
@@ -905,7 +1079,7 @@ class BotUI:
     def build_ui(self):
         frame_state=tk.Frame(self.root)
         frame_state.pack(side="top",fill="x")
-        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw")]
+        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("闪现","cd_flash"),("回城","cd_recall"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw")]
         for idx,(text,key) in enumerate(labels):
             tk.Label(frame_state,text=text).grid(row=idx,column=0,sticky="w")
             tk.Label(frame_state,textvariable=self.vars[key]).grid(row=idx,column=1,sticky="w")
@@ -952,6 +1126,8 @@ class BotUI:
             self.vars["cd3"].set("可用" if self.shared.cd3==1 else "冷却")
             self.vars["cd_item"].set("可用" if self.shared.cd_item==1 else "冷却")
             self.vars["cd_heal"].set("可用" if self.shared.cd_heal==1 else "冷却")
+            self.vars["cd_flash"].set("可用" if self.shared.cd_flash==1 else "冷却")
+            self.vars["cd_recall"].set("可用" if self.shared.cd_recall==1 else "冷却")
             self.vars["epsilon"].set("{:.3f}".format(self.shared.epsilon))
             status_prefix="运行" if self.shared.running else "停止"
             self.vars["status"].set(f"{status_prefix}-{self.shared.mode}")
@@ -1047,9 +1223,9 @@ def main():
     shared.hw_profile=hw
     params=adaptive_hyperparams(hw,config,device)
     experience_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
-    game=GameInterface(config,config["路径"]["ADB"])
-    agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir,weight_decay=params["weight_decay"],value_reg=params["value_reg"])
     model_manager=ModelManager(config,device,dtype)
+    game=GameInterface(config,config["路径"]["ADB"],model_manager,experience_dir)
+    agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir,weight_decay=params["weight_decay"],value_reg=params["value_reg"])
     controller=BotController(shared,agent,model_manager,game)
     recorder=ExperienceRecorder(config)
     mode_manager=ModeManager(shared,controller,recorder,config)
