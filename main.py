@@ -1,4 +1,4 @@
-import os,subprocess,threading,time,random,math,platform,json,io,glob,re
+import os,subprocess,threading,time,random,math,platform,json,io,glob,re,shutil
 from collections import deque,namedtuple
 from dataclasses import dataclass
 try:
@@ -118,6 +118,17 @@ class ConfigManager:
         self.load()
     def ensure_dir(self,path):
         os.makedirs(path,exist_ok=True)
+    def unique_path(self,base,name):
+        candidate=os.path.join(base,name)
+        if not os.path.exists(candidate):
+            return candidate
+        root,ext=os.path.splitext(name)
+        idx=1
+        while True:
+            candidate=os.path.join(base,f"{root}_{idx}{ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            idx+=1
     def merge_dict(self,base,override):
         if not isinstance(base,dict):
             return override if override is not None else base
@@ -166,6 +177,7 @@ class ConfigManager:
         with open(path,"w",encoding="utf-8") as f:
             json.dump(target,f,ensure_ascii=False,indent=2)
     def update_paths(self,adb_path,dn_path,aaa_dir):
+        old_aaa=self.config["路径"]["AAA"]
         if adb_path:
             self.config["路径"]["ADB"]=adb_path
         if dn_path:
@@ -174,6 +186,30 @@ class ConfigManager:
             normalized=os.path.normpath(os.path.abspath(aaa_dir))
             if normalized!=self.config["路径"]["AAA"]:
                 self.ensure_dir(normalized)
+                if os.path.isdir(old_aaa) and os.path.abspath(old_aaa)!=os.path.abspath(normalized):
+                    try:
+                        for item in os.listdir(old_aaa):
+                            src=os.path.join(old_aaa,item)
+                            dst=os.path.join(normalized,item)
+                            if os.path.exists(dst):
+                                dst=self.unique_path(normalized,item)
+                            try:
+                                shutil.move(src,dst)
+                            except:
+                                try:
+                                    if os.path.isdir(src):
+                                        shutil.copytree(src,dst,dirs_exist_ok=True)
+                                    else:
+                                        shutil.copy2(src,dst)
+                                except:
+                                    pass
+                        try:
+                            if not os.listdir(old_aaa):
+                                os.rmdir(old_aaa)
+                        except:
+                            pass
+                    except:
+                        pass
                 self.config["路径"]["AAA"]=normalized
         self.config_path=os.path.join(self.config["路径"]["AAA"],"配置.json")
         self.ensure_dir(os.path.join(self.config["路径"]["AAA"],self.config["经验目录"]))
@@ -352,6 +388,7 @@ class DeepRLAgent:
         self.last_save_step=0
         self.config=config
         self.load_experience()
+        self.refresh_config(config)
     def build_networks(self):
         self.policy_net=QNetwork(self.obs_dim,self.action_dim,self.hidden_dim,self.dtype).to(self.device)
         self.target_net=QNetwork(self.obs_dim,self.action_dim,self.hidden_dim,self.dtype).to(self.device)
@@ -443,7 +480,272 @@ class DeepRLAgent:
                 self.target_net.load_state_dict(self.policy_net.state_dict())
         except:
             pass
+    def refresh_config(self,config):
+        self.config=config
+        self.obs_keys=list(self.config.get("观测键",[]))
+        self.action_names=list(self.config.get("动作名称",[]))
+        self.action_to_index={name:idx for idx,name in enumerate(self.action_names)}
+        learn_conf=self.config.get("学习",{})
+        window=int(max(8,learn_conf.get("奖励平滑窗口",len(self.action_names)*6)))
+        self.offline_metric_caps={k:float(v) for k,v in self.config.get("数值上限",{}).items()}
+        self.offline_binary={k for k in self.obs_keys if k=="alive" or k.startswith("cd") or k=="recalling"}
+        self.reward_weights={k:float(v) for k,v in self.config.get("奖励",{}).items()}
+        self.offline_metric_history={k:deque(maxlen=window) for k in ("A","B","C")}
+        self.offline_reward_memory=deque(maxlen=window)
+        self.offline_reward_gain=float(learn_conf.get("奖励调节",0.4))
+        self.circle_regions_config=self.config.get("圆形区域",{})
+        self.input_action_centers=self.build_input_action_centers()
+        self.offline_state={}
+        self.load_offline_state()
+    def build_input_action_centers(self):
+        centers=[]
+        mapping={"move":"移动轮盘","attack_minion":"普攻补刀","attack_tower":"普攻点塔","skill1":"一技能","skill2":"二技能","skill3":"三技能","item":"主动装备","heal":"恢复","flash":"闪现","recall":"回城"}
+        for action,name in mapping.items():
+            data=self.circle_regions_config.get(name)
+            if isinstance(data,dict):
+                top=data.get("左上角")
+                dia=data.get("直径")
+                if isinstance(top,list) and len(top)>=2 and dia is not None:
+                    try:
+                        cx=float(top[0])+float(dia)/2.0
+                        cy=float(top[1])+float(dia)/2.0
+                        radius=float(dia)/2.0
+                        centers.append((action,cx,cy,max(radius,1.0)))
+                    except:
+                        continue
+        return centers
+    def set_experience_dir(self,path):
+        if not path:
+            return
+        normalized=os.path.normpath(os.path.abspath(path))
+        if self.experience_dir and os.path.normpath(os.path.abspath(self.experience_dir))==normalized:
+            return
+        self.experience_dir=normalized
+        os.makedirs(self.experience_dir,exist_ok=True)
+        self.last_save_step=0
+        self.offline_state={}
+        self.load_offline_state()
+        if len(self.replay_buffer)==0:
+            self.load_experience()
+    def offline_state_file(self):
+        if not self.experience_dir:
+            return None
+        return os.path.join(self.experience_dir,"offline_state.json")
+    def load_offline_state(self):
+        self.offline_state={"metrics":0,"inputs":0,"prev_metrics":None,"last_action":"idle"}
+        path=self.offline_state_file()
+        if path and os.path.isfile(path):
+            try:
+                with open(path,"r",encoding="utf-8") as f:
+                    data=json.load(f)
+                if isinstance(data,dict):
+                    self.offline_state["metrics"]=int(data.get("metrics",0))
+                    self.offline_state["inputs"]=int(data.get("inputs",0))
+                    prev=data.get("prev_metrics")
+                    if isinstance(prev,dict) and "metrics" in prev and "t" in prev:
+                        self.offline_state["prev_metrics"]={"t":int(prev.get("t",0)),"metrics":prev.get("metrics",{})}
+                    self.offline_state["last_action"]=str(data.get("last_action","idle"))
+            except:
+                pass
+    def save_offline_state(self):
+        path=self.offline_state_file()
+        if not path:
+            return
+        try:
+            with open(path,"w",encoding="utf-8") as f:
+                json.dump(self.offline_state,f,ensure_ascii=False)
+        except:
+            pass
+    def metrics_to_obs_vector(self,metrics):
+        obs=[]
+        for key in self.obs_keys:
+            value=float(metrics.get(key,0))
+            if key in self.offline_metric_caps:
+                cap=max(1.0,self.offline_metric_caps[key])
+                obs.append(min(value,cap)/cap)
+            elif key in self.offline_binary:
+                obs.append(1.0 if value>=1.0 else 0.0)
+            else:
+                obs.append(value)
+        if len(obs)<self.obs_dim:
+            obs.extend([0.0]*(self.obs_dim-len(obs)))
+        elif len(obs)>self.obs_dim:
+            obs=obs[:self.obs_dim]
+        return obs
+    def compute_offline_reward(self,prev,curr):
+        dA=float(curr.get("A",0))-float(prev.get("A",0))
+        dB=float(curr.get("B",0))-float(prev.get("B",0))
+        dC=float(curr.get("C",0))-float(prev.get("C",0))
+        self.offline_metric_history["A"].append(dA)
+        self.offline_metric_history["B"].append(dB)
+        self.offline_metric_history["C"].append(dC)
+        trend_A=float(np.mean(self.offline_metric_history["A"])) if self.offline_metric_history["A"] else 0.0
+        trend_B=float(np.mean(self.offline_metric_history["B"])) if self.offline_metric_history["B"] else 0.0
+        trend_C=float(np.mean(self.offline_metric_history["C"])) if self.offline_metric_history["C"] else 0.0
+        gain=max(0.0,self.offline_reward_gain)
+        wA=self.reward_weights.get("A",0.0)
+        wB=self.reward_weights.get("B",0.0)
+        wC=self.reward_weights.get("C",0.0)
+        boost_A=max(dA,0.0)*wA*(1.0+gain*np.clip(trend_A,-1.0,1.0))
+        boost_C=max(dC,0.0)*wC*(1.0+gain*np.clip(trend_C,-1.0,1.0))
+        penalty=max(dB,0.0)*abs(wB)*(1.0+gain*np.clip(max(0.0,trend_B),0.0,1.5))
+        boost_A*=1.0+max(0.0,trend_A)
+        boost_C*=0.6+0.4*max(0.0,trend_C)
+        penalty*=0.8+0.2*max(0.0,trend_B)
+        if boost_A>0.0:
+            dominance=max(1.0,abs(wA)/(abs(wB)+1e-6))
+            penalty=min(penalty,boost_A*dominance)
+        reward=boost_A+boost_C-penalty
+        if curr.get("alive",0)==0 and prev.get("alive",1)==1:
+            reward-=abs(wB)*(1.0+gain)
+        flash_delta=float(curr.get("cd_flash",0))-float(prev.get("cd_flash",0))
+        readiness_scale=(abs(wA)+abs(wC))/(abs(wB)+1.0)
+        recall_block=1.0 if curr.get("recalling",0)==1 else 0.0
+        reward+=readiness_scale*(flash_delta-recall_block/(len(self.obs_keys)+1))
+        self.offline_reward_memory.append(reward)
+        if self.offline_reward_memory:
+            smooth=float(np.clip(np.mean(self.offline_reward_memory),-gain,gain))
+            reward*=1.0+smooth
+        return reward
+    def nearest_action_from_xy(self,x,y):
+        best=None
+        best_score=None
+        for action,cx,cy,radius in self.input_action_centers:
+            dist=math.hypot(x-cx,y-cy)
+            score=dist/radius
+            if best is None or score<best_score:
+                best=action
+                best_score=score
+        if best is not None and best_score is not None and best_score<=1.4:
+            return best
+        return None
+    def action_from_input(self,record,last_action):
+        event=str(record.get("type",""))
+        data=record.get("data",{})
+        action=None
+        if event=="AI_ACTION" and isinstance(data,dict):
+            action=str(data.get("action","idle"))
+        elif event in ("鼠标","鼠标移动") and isinstance(data,dict):
+            try:
+                x=float(data.get("x",0))
+                y=float(data.get("y",0))
+            except:
+                x=y=0.0
+            candidate=self.nearest_action_from_xy(x,y)
+            pressed=str(data.get("pressed","False")).lower()
+            if candidate and (event=="鼠标移动" or pressed in ("true","1","press","down")):
+                action=candidate
+            else:
+                action="move" if "move" in self.action_to_index else last_action
+        elif event=="鼠标滚轮":
+            action="move" if "move" in self.action_to_index else last_action
+        elif event=="键盘" and isinstance(data,dict):
+            key=str(data.get("key",""))
+            lower=key.lower()
+            if "space" in lower and "attack_minion" in self.action_to_index:
+                action="attack_minion"
+            elif "shift" in lower and "attack_tower" in self.action_to_index:
+                action="attack_tower"
+            elif "f" in lower and "flash" in self.action_to_index:
+                action="flash"
+            elif "d" in lower and "item" in self.action_to_index:
+                action="item"
+            elif "b" in lower and "recall" in self.action_to_index:
+                action="recall"
+            elif "q" in lower and "skill1" in self.action_to_index:
+                action="skill1"
+            elif "w" in lower and "skill2" in self.action_to_index:
+                action="skill2"
+            elif "e" in lower and "skill3" in self.action_to_index:
+                action="skill3"
+            else:
+                action=last_action
+        if action is None:
+            action=last_action if last_action in self.action_to_index else ("idle" if "idle" in self.action_to_index else self.action_names[0] if self.action_names else "idle")
+        return action
+    def ingest_experience_from_logs(self):
+        if not self.experience_dir:
+            return 0
+        metrics_path=os.path.join(self.experience_dir,"metrics.log")
+        input_path=os.path.join(self.experience_dir,"inputs.log")
+        new_metrics=[]
+        try:
+            if os.path.isfile(metrics_path):
+                with open(metrics_path,"r",encoding="utf-8") as f:
+                    for line in f:
+                        line=line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record=json.loads(line)
+                        except:
+                            continue
+                        t=int(record.get("t",0))
+                        if t<=self.offline_state.get("metrics",0):
+                            continue
+                        metrics=record.get("metrics")
+                        if isinstance(metrics,dict):
+                            new_metrics.append({"t":t,"metrics":metrics,"mode":record.get("mode","学习")})
+        except:
+            return 0
+        inputs=[]
+        try:
+            if os.path.isfile(input_path):
+                with open(input_path,"r",encoding="utf-8") as f:
+                    for line in f:
+                        line=line.strip()
+                        if not line:
+                            continue
+                        try:
+                            record=json.loads(line)
+                        except:
+                            continue
+                        t=int(record.get("t",0))
+                        if t<=self.offline_state.get("inputs",0):
+                            continue
+                        action=self.action_from_input(record,self.offline_state.get("last_action","idle"))
+                        inputs.append({"t":t,"action":action})
+        except:
+            inputs=[]
+        if not new_metrics and not inputs:
+            return 0
+        new_metrics=sorted(new_metrics,key=lambda x:x["t"])
+        inputs=sorted(inputs,key=lambda x:x["t"])
+        prev_record=self.offline_state.get("prev_metrics")
+        prev_entry=prev_record if isinstance(prev_record,dict) else None
+        idx=0
+        processed_input_ts=self.offline_state.get("inputs",0)
+        last_action=self.offline_state.get("last_action","idle")
+        transitions=0
+        for entry in new_metrics:
+            if prev_entry is None:
+                prev_entry=entry
+                continue
+            prev_t=prev_entry.get("t",0)
+            curr_t=entry.get("t",0)
+            while idx<len(inputs) and inputs[idx]["t"]<=curr_t:
+                if inputs[idx]["t"]>=prev_t:
+                    last_action=inputs[idx]["action"]
+                processed_input_ts=max(processed_input_ts,inputs[idx]["t"])
+                idx+=1
+            action_name=last_action if last_action in self.action_to_index else ("idle" if "idle" in self.action_to_index else self.action_names[0] if self.action_names else "idle")
+            action_idx=self.action_to_index.get(action_name,0)
+            state=self.metrics_to_obs_vector(prev_entry["metrics"])
+            next_state=self.metrics_to_obs_vector(entry["metrics"])
+            reward=self.compute_offline_reward(prev_entry["metrics"],entry["metrics"])
+            done=entry["metrics"].get("alive",0)==0
+            self.replay_buffer.append(self.Transition(state,action_idx,reward,next_state,done))
+            transitions+=1
+            prev_entry=entry
+        if prev_entry:
+            self.offline_state["prev_metrics"]={"t":prev_entry.get("t",0),"metrics":prev_entry.get("metrics",{})}
+            self.offline_state["metrics"]=prev_entry.get("t",self.offline_state.get("metrics",0))
+        self.offline_state["inputs"]=processed_input_ts
+        self.offline_state["last_action"]=last_action
+        self.save_offline_state()
+        return transitions
     def offline_optimize(self,progress_callback=None):
+        self.ingest_experience_from_logs()
         total=len(self.replay_buffer)
         if total<self.batch_size:
             if progress_callback:
@@ -457,6 +759,7 @@ class DeepRLAgent:
                 progress_callback((i+1)/steps)
         if progress_callback:
             progress_callback(1.0)
+        self.save_experience()
         return steps
 class VisionModule:
     def __init__(self,config):
@@ -478,14 +781,43 @@ class VisionModule:
         std_v=float(np.std(hsv[:,:,2]))
         return mean_v,mean_s,std_v
     def cooldown_ready(self,key,cv_img):
-        mean_v,mean_s,std_v=self.region_stats(cv_img)
-        bright=mean_v>self.config["OCR"]["亮度阈值"]
-        saturated=mean_s>self.config["OCR"]["饱和阈值"]
-        stable=std_v<self.config["OCR"]["波动阈值"]
-        ready=1 if bright and saturated and stable else 0
+        if cv_img is None or getattr(cv_img,"size",0)==0:
+            return 0
+        h=cv_img.shape[0]
+        w=cv_img.shape[1]
+        if h==0 or w==0:
+            return 0
+        hsv=cv2.cvtColor(cv_img,cv2.COLOR_BGR2HSV)
+        value=hsv[:,:,2].astype(np.float32)/255.0
+        sat=hsv[:,:,1].astype(np.float32)/255.0
+        gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY).astype(np.float32)/255.0
+        grad=cv2.Laplacian(gray,cv2.CV_32F)
+        energy=float(np.mean(np.abs(grad)))
+        yy,xx=np.ogrid[:h,:w]
+        cx=w/2.0
+        cy=h/2.0
+        radius=np.sqrt((xx-cx)**2+(yy-cy)**2)
+        max_radius=np.max(radius)
+        if max_radius<=0:
+            max_radius=1.0
+        norm=radius/max_radius
+        ring_mask=(norm>=0.45)&(norm<=0.95)
+        core_mask=norm<=0.35
+        ring_val=value[ring_mask] if np.any(ring_mask) else value.reshape(-1)
+        core_val=value[core_mask] if np.any(core_mask) else value.reshape(-1)
+        ring_sat=sat[ring_mask] if np.any(ring_mask) else sat.reshape(-1)
+        ring_brightness=float(np.mean(ring_val))
+        core_brightness=float(np.mean(core_val))
+        sat_level=float(np.mean(ring_sat))
+        contrast=max(ring_brightness-core_brightness,0.0)
+        variance=float(np.std(value))
+        stability=1.0/(1.0+energy*6.0+variance*2.0)
+        score=ring_brightness*0.55+sat_level*0.3+contrast*0.6+stability*0.25-energy*0.4
+        score=float(np.clip(score,0.0,1.5))
         prev=self.prev_ready.get(key,0.0)
-        ready=max(ready,prev*0.5)
-        self.prev_ready[key]=ready
+        readiness=np.clip(prev*0.4+score*0.6,0.0,1.0)
+        ready=1 if readiness>=0.58 else 0
+        self.prev_ready[key]=1.0 if ready==1 else readiness
         return ready
     def alive_state(self,cv_img):
         mean_v,mean_s,_=self.region_stats(cv_img)
@@ -605,16 +937,17 @@ class RecallMonitor:
         self.progress=0.0
 class ExperienceRecorder:
     def __init__(self,config):
-        self.base_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
-        self.frame_dir=os.path.join(self.base_dir,"frames")
-        self.input_path=os.path.join(self.base_dir,"inputs.log")
-        self.metric_path=os.path.join(self.base_dir,"metrics.log")
-        os.makedirs(self.frame_dir,exist_ok=True)
         self.lock=threading.Lock()
         self.frame_paths=deque()
         learn_conf=config.get("学习",{})
         self.max_frames=max(200,int(learn_conf.get("缓冲大小",20000)//10))
         self.paused=False
+        self.config=None
+        self.base_dir=""
+        self.frame_dir=""
+        self.input_path=""
+        self.metric_path=""
+        self.retarget(config)
     def set_paused(self,value):
         self.paused=bool(value)
     def _timestamp(self):
@@ -656,6 +989,30 @@ class ExperienceRecorder:
                         pass
         except:
             pass
+    def retarget(self,config):
+        learn_conf=config.get("学习",{})
+        self.max_frames=max(200,int(learn_conf.get("缓冲大小",20000)//10))
+        base=os.path.join(config["路径"]["AAA"],config["经验目录"])
+        frame_dir=os.path.join(base,"frames")
+        os.makedirs(frame_dir,exist_ok=True)
+        os.makedirs(base,exist_ok=True)
+        with self.lock:
+            self.config=config
+            self.base_dir=base
+            self.frame_dir=frame_dir
+            self.input_path=os.path.join(base,"inputs.log")
+            self.metric_path=os.path.join(base,"metrics.log")
+            try:
+                items=os.listdir(frame_dir)
+            except:
+                items=[]
+            frame_list=[os.path.join(frame_dir,f) for f in items if isinstance(f,str) and f.lower().endswith(".png")]
+            try:
+                frame_list=sorted(frame_list,key=lambda p:os.path.getmtime(p))
+            except:
+                frame_list=sorted(frame_list)
+            trimmed=frame_list[-self.max_frames:]
+            self.frame_paths=deque(trimmed)
 class InputMonitor:
     def __init__(self,mode_manager):
         self.mode_manager=mode_manager
@@ -717,6 +1074,16 @@ class ModeManager:
         self.controller.set_recorder(recorder)
         self.optimizing=False
         self.optimize_wait=False
+    def update_config(self,config):
+        self.config=config
+        mode_conf=config.get("模式",{})
+        self.idle_threshold=float(mode_conf.get("学习静默阈值",10.0))
+        self.learn_interval=float(mode_conf.get("学习采样间隔",0.4))
+        self.train_interval=float(mode_conf.get("训练采样间隔",0.2))
+        self.recorder.retarget(config)
+        self.controller.set_recorder(self.recorder)
+        with self.shared.lock:
+            self.shared.config=config
     def start(self):
         if self.running:
             return
@@ -1436,6 +1803,8 @@ class BotController:
         cm.update_paths(self.adb_path,self.dnplayer_path,target_aaa)
         self.shared.config=cm.config
         experience_dir=os.path.join(cm.config["路径"]["AAA"],cm.config["经验目录"])
+        self.agent.set_experience_dir(experience_dir)
+        self.agent.refresh_config(cm.config)
         new_model_manager=ModelManager(cm.config,self.agent.device,self.agent.dtype)
         self.model_manager=new_model_manager
         new_game=GameInterface(cm.config,self.adb_path,self.model_manager,experience_dir)
@@ -1603,14 +1972,12 @@ class BotUI:
         adb_path=self.vars["adb"].get()
         dn_path=self.vars["dn"].get()
         aaa_path=self.vars["aaa"].get()
-        if adb_path:
-            self.shared.config["路径"]["ADB"]=adb_path
-        if dn_path:
-            self.shared.config["路径"]["模拟器"]=dn_path
-        if aaa_path:
-            self.config_manager.update_paths(adb_path,dn_path,aaa_path)
-            self.shared.config=self.config_manager.config
         self.controller.update_paths(adb_path,dn_path,aaa_path)
+        self.shared.config=self.config_manager.config
+        self.mode_manager.update_config(self.shared.config)
+        self.vars["adb"].set(self.shared.config["路径"]["ADB"])
+        self.vars["dn"].set(self.shared.config["路径"]["模拟器"])
+        self.vars["aaa"].set(self.shared.config["路径"]["AAA"])
     def update_loop(self):
         if self.shared.terminate:
             self.controller.stop()
