@@ -29,7 +29,16 @@ class RectRegion:
     w:float
     h:float
 def default_config(base_dir):
-    return {"屏幕":{"基准宽度":2560,"基准高度":1600},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":{"一技能":"skill1_model.pt","二技能":"skill2_model.pt","三技能":"skill3_model.pt","移动轮盘":"move_model.pt","普攻":"attack_model.pt","回城":"recall_model.pt","视觉":"vision_model.pt"},"识别":{"A":{"左上角":[1904,122],"尺寸":[56,56]},"B":{"左上角":[1996,122],"尺寸":[56,56]},"C":{"左上角":[2087,122],"尺寸":[56,56]},"小地图":{"左上角":[0,72],"尺寸":[453,453]}},"圆形区域":{"移动轮盘":{"左上角":[166,915],"直径":536},"回城":{"左上角":[1083,1263],"直径":162},"恢复":{"左上角":[1271,1263],"直径":162},"闪现":{"左上角":[1467,1263],"直径":162},"一技能":{"左上角":[1672,1220],"直径":195},"二技能":{"左上角":[1825,956],"直径":195},"三技能":{"左上角":[2088,803],"直径":195},"取消施法":{"左上角":[2165,252],"直径":250},"普攻补刀":{"左上角":[1915,1296],"直径":123},"普攻点塔":{"左上角":[2241,1014],"直径":123},"主动装备":{"左上角":[2092,544],"直径":161}},"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":[150.0,0.0]},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55},"学习":{"折扣":0.99,"学习率":0.0003,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000}}
+    base_w=2560
+    base_h=1600
+    model_names={"一技能":"skill1_model.pt","二技能":"skill2_model.pt","三技能":"skill3_model.pt","移动轮盘":"move_model.pt","普攻":"attack_model.pt","回城":"recall_model.pt","视觉":"vision_model.pt"}
+    circle_raw={"移动轮盘":(166,915,536),"回城":(1083,1263,162),"恢复":(1271,1263,162),"闪现":(1467,1263,162),"一技能":(1672,1220,195),"二技能":(1825,956,195),"三技能":(2088,803,195),"取消施法":(2165,252,250),"普攻补刀":(1915,1296,123),"普攻点塔":(2241,1014,123),"主动装备":(2092,544,161)}
+    rect_raw={"A":(1904,122,56,56),"B":(1996,122,56,56),"C":(2087,122,56,56),"小地图":(0,72,453,453)}
+    circle_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"直径":float(d),"直径比例":float(d)/base_w} for k,(x,y,d) in circle_raw.items()}
+    rect_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"尺寸":[float(w),float(h)],"尺寸比例":[float(w)/base_w,float(h)/base_h]} for k,(x,y,w,h) in rect_raw.items()}
+    flash_offset=[150.0,0.0]
+    flash_ratio=[flash_offset[0]/base_w,flash_offset[1]/base_h]
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55},"学习":{"折扣":0.99,"学习率":0.0003,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -63,6 +72,7 @@ class ConfigManager:
                     data=default_config(aaa_dir)
                     self.save_config(data)
         self.config=data
+        self.ensure_region_ratios()
         self.ensure_dir(os.path.join(self.config["路径"]["AAA"],self.config["经验目录"]))
     def save_config(self,data=None):
         target=data if data is not None else self.config
@@ -80,6 +90,43 @@ class ConfigManager:
         self.config_path=os.path.join(self.config["路径"]["AAA"],"配置.json")
         self.ensure_dir(os.path.join(self.config["路径"]["AAA"],self.config["经验目录"]))
         self.save_config()
+    def ensure_region_ratios(self):
+        if not self.config:
+            return
+        screen=self.config.get("屏幕",{})
+        base_w=float(screen.get("基准宽度",2560))
+        base_h=float(screen.get("基准高度",1600))
+        circle_conf=self.config.get("圆形区域",{})
+        rect_conf=self.config.get("识别",{})
+        for name,data in circle_conf.items():
+            if not isinstance(data,dict):
+                continue
+            tl=data.get("左上角") or [0.0,0.0]
+            ratio=data.get("左上角比例") or [tl[0]/base_w if base_w else 0.0,tl[1]/base_h if base_h else 0.0]
+            data["左上角比例"]=ratio
+            data["左上角"]= [ratio[0]*base_w,ratio[1]*base_h]
+            dia=data.get("直径") if data.get("直径") is not None else 0.0
+            ratio_d=data.get("直径比例") if data.get("直径比例") is not None else (dia/base_w if base_w else 0.0)
+            data["直径比例"]=ratio_d
+            data["直径"]=ratio_d*base_w
+        for name,data in rect_conf.items():
+            if not isinstance(data,dict):
+                continue
+            tl=data.get("左上角") or [0.0,0.0]
+            ratio=data.get("左上角比例") or [tl[0]/base_w if base_w else 0.0,tl[1]/base_h if base_h else 0.0]
+            data["左上角比例"]=ratio
+            data["左上角"]= [ratio[0]*base_w,ratio[1]*base_h]
+            size=data.get("尺寸") or [1.0,1.0]
+            ratio_s=data.get("尺寸比例") or [size[0]/base_w if base_w else 0.0,size[1]/base_h if base_h else 0.0]
+            data["尺寸比例"]=ratio_s
+            data["尺寸"]= [ratio_s[0]*base_w,ratio_s[1]*base_h]
+        cooldown=self.config.get("动作冷却",{})
+        flash=cooldown.get("闪现位移")
+        flash_ratio=cooldown.get("闪现位移比例")
+        if flash_ratio and not flash:
+            cooldown["闪现位移"]= [flash_ratio[0]*base_w,flash_ratio[1]*base_h]
+        elif flash and not flash_ratio:
+            cooldown["闪现位移比例"]= [flash[0]/base_w if base_w else 0.0,flash[1]/base_h if base_h else 0.0]
 class SharedState:
     def __init__(self,config):
         self.lock=threading.Lock()
@@ -323,6 +370,7 @@ class GameInterface:
             "minimap":self._rect(rect_conf.get("小地图"))
         }
         self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0}
+        self.reward_memory=deque(maxlen=64)
     def _circle(self,data):
         if not data:
             return CircleRegion(0.0,0.0,1.0)
@@ -389,9 +437,15 @@ class GameInterface:
     def flash_forward(self):
         region=self.circle_regions["flash"]
         cx,cy=self.circle_center(region)
-        offset=self.config["动作冷却"]["闪现位移"]
-        ex=cx+offset[0]
-        ey=cy+offset[1]
+        cooldown=self.config["动作冷却"]
+        ratio=cooldown.get("闪现位移比例")
+        if ratio:
+            ex=cx+ratio[0]*self.screen_w
+            ey=cy+ratio[1]*self.screen_h
+        else:
+            offset=cooldown.get("闪现位移",[0.0,0.0])
+            ex=cx+offset[0]
+            ey=cy+offset[1]
         sx,sy=self.scaled_xy(cx,cy)
         exs,eys=self.scaled_xy(ex,ey)
         self.adb_swipe(sx,sy,exs,eys,int(self.config["动作"]["拖动耗时"]*1000))
@@ -426,7 +480,14 @@ class GameInterface:
         dC=curr_metrics["C"]-prev_metrics["C"]
         dB=curr_metrics["B"]-prev_metrics["B"]
         weights=self.config["奖励"]
-        return float(weights["A"]*dA+weights["C"]*dC+weights["B"]*dB)
+        reward=float(weights["A"]*dA+weights["C"]*dC+weights["B"]*dB)
+        preference=max(dA,0.0)+max(dC,0.0)
+        penalty=max(dB,0.0)
+        self.reward_memory.append(preference-penalty)
+        if self.reward_memory:
+            adjust=float(np.clip(np.mean(self.reward_memory),-0.5,1.5))
+            reward*=1.0+adjust
+        return reward
     def execute_action(self,action_idx,metrics_prev):
         if action_idx==0:
             return
