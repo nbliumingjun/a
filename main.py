@@ -841,6 +841,7 @@ class GameInterface:
         self.reward_memory=deque(maxlen=window)
         self.metric_history={k:deque(maxlen=window) for k in ("A","B","C")}
         self.reward_gain=float(learn_conf.get("奖励调节",0.4))
+        self.reward_weights={k:float(v) for k,v in self.config.get("奖励",{}).items()}
         self.experience_dir=experience_dir
         os.makedirs(self.experience_dir,exist_ok=True)
         self.skill_path_file=os.path.join(self.experience_dir,"skill_paths.json")
@@ -1235,16 +1236,19 @@ class GameInterface:
         dA=curr_metrics["A"]-prev_metrics["A"]
         dC=curr_metrics["C"]-prev_metrics["C"]
         dB=curr_metrics["B"]-prev_metrics["B"]
-        weights=self.config["奖励"]
+        weights=self.reward_weights
+        wA=weights.get("A",0.0)
+        wB=weights.get("B",0.0)
+        wC=weights.get("C",0.0)
         for key,delta in (("A",dA),("B",dB),("C",dC)):
             self.metric_history[key].append(delta)
         trend_A=float(np.mean(self.metric_history["A"])) if self.metric_history["A"] else 0.0
         trend_C=float(np.mean(self.metric_history["C"])) if self.metric_history["C"] else 0.0
         trend_B=float(np.mean(self.metric_history["B"])) if self.metric_history["B"] else 0.0
         gain=max(0.0,self.reward_gain)
-        boost_A=max(dA,0.0)*weights["A"]*(1.0+gain*np.clip(trend_A,-1.0,1.0))
-        boost_C=max(dC,0.0)*weights["C"]*(1.0+gain*np.clip(trend_C,-1.0,1.0))
-        penalty=max(dB,0.0)*abs(weights["B"])*(1.0+gain*np.clip(max(0.0,trend_B),0.0,1.5))
+        boost_A=max(dA,0.0)*wA*(1.0+gain*np.clip(trend_A,-1.0,1.0))
+        boost_C=max(dC,0.0)*wC*(1.0+gain*np.clip(trend_C,-1.0,1.0))
+        penalty=max(dB,0.0)*abs(wB)*(1.0+gain*np.clip(max(0.0,trend_B),0.0,1.5))
         priority_scale=1.0+max(0.0,trend_A)
         boost_A*=priority_scale
         c_scale=0.6+0.4*max(0.0,trend_C)
@@ -1252,13 +1256,13 @@ class GameInterface:
         penalty_scale=0.8+0.2*max(0.0,trend_B)
         penalty*=penalty_scale
         if boost_A>0.0:
-            dominance=max(1.0,abs(weights["A"])/(abs(weights["B"])+1e-6))
+            dominance=max(1.0,abs(wA)/(abs(wB)+1e-6))
             penalty=min(penalty,boost_A*dominance)
         reward=boost_A+boost_C-penalty
         if curr_metrics.get("alive",0)==0 and prev_metrics.get("alive",1)==1:
-            reward-=abs(weights["B"])*(1.0+gain)
+            reward-=abs(wB)*(1.0+gain)
         flash_delta=curr_metrics.get("cd_flash",0)-prev_metrics.get("cd_flash",0)
-        readiness_scale=(abs(weights["A"])+abs(weights["C"]))/(abs(weights["B"])+1.0)
+        readiness_scale=(abs(wA)+abs(wC))/(abs(wB)+1.0)
         recall_block=1.0 if curr_metrics.get("recalling",0)==1 else 0.0
         reward+=readiness_scale*(flash_delta-recall_block/(len(self.obs_keys)+1))
         self.reward_memory.append(reward)
