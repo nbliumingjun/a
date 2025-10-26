@@ -14,7 +14,7 @@ try:
 except:
     mss=None
 import numpy as np
-from PIL import Image
+from PIL import Image,ImageDraw,ImageFont
 try:
     from PIL import ImageGrab
 except:
@@ -767,6 +767,45 @@ class VisionModule:
         self.prev_ready={}
         self.recall_ref=None
         self.recall_trace=0.0
+        self.tesseract_ready=self.ensure_tesseract()
+        self.digit_templates=self.build_digit_templates()
+        self.prev_alive_score=1.0
+    def ensure_tesseract(self):
+        ocr_conf=self.config.get("OCR",{})
+        candidates=[]
+        path=ocr_conf.get("Tesseract路径")
+        if path:
+            candidates.append(path)
+        candidates.extend(["C:\\Program Files\\Tesseract-OCR\\tesseract.exe","C:\\Program Files (x86)\\Tesseract-OCR\\tesseract.exe"])
+        for cand in candidates:
+            if cand and os.path.isfile(cand):
+                pytesseract.pytesseract.tesseract_cmd=cand
+                return True
+        auto=shutil.which("tesseract")
+        if auto:
+            pytesseract.pytesseract.tesseract_cmd=auto
+            return True
+        return False
+    def build_digit_templates(self):
+        templates={}
+        for digit in range(10):
+            canvas=Image.new("L",(40,60),0)
+            draw=ImageDraw.Draw(canvas)
+            font=None
+            for size in (52,60,48,40):
+                try:
+                    font=ImageFont.truetype("arial.ttf",size)
+                    break
+                except:
+                    font=None
+            if font is None:
+                font=ImageFont.load_default()
+            text=str(digit)
+            w,h=draw.textsize(text,font=font)
+            draw.text(((40-w)/2.0,(60-h)/2.0),text,fill=255,font=font)
+            arr=np.array(canvas,dtype=np.float32)/255.0
+            templates[str(digit)]=arr
+        return templates
     def crop_cv(self,pil_img,x,y,w,h):
         sx=max(0,int(x))
         sy=max(0,int(y))
@@ -801,40 +840,143 @@ class VisionModule:
         if max_radius<=0:
             max_radius=1.0
         norm=radius/max_radius
-        ring_mask=(norm>=0.45)&(norm<=0.95)
-        core_mask=norm<=0.35
-        ring_val=value[ring_mask] if np.any(ring_mask) else value.reshape(-1)
-        core_val=value[core_mask] if np.any(core_mask) else value.reshape(-1)
-        ring_sat=sat[ring_mask] if np.any(ring_mask) else sat.reshape(-1)
-        ring_brightness=float(np.mean(ring_val))
-        core_brightness=float(np.mean(core_val))
-        sat_level=float(np.mean(ring_sat))
-        contrast=max(ring_brightness-core_brightness,0.0)
-        variance=float(np.std(value))
-        stability=1.0/(1.0+energy*6.0+variance*2.0)
-        score=ring_brightness*0.55+sat_level*0.3+contrast*0.6+stability*0.25-energy*0.4
-        score=float(np.clip(score,0.0,1.5))
+        ring_mask=(norm>=0.4)&(norm<=0.98)
+        core_mask=norm<=0.32
+        weights=np.clip(1.0-norm,0.0,1.0)
+        ring_weight=np.where(ring_mask,weights,0.0)
+        core_weight=np.where(core_mask,1.0,0.0)
+        denom_ring=float(np.sum(ring_weight))+1e-6
+        denom_core=float(np.sum(core_weight))+1e-6
+        ring_val=np.sum(value*ring_weight)/denom_ring
+        core_val=np.sum(value*core_weight)/denom_core
+        ring_sat=np.sum(sat*ring_weight)/denom_ring
+        gray_ratio=float(np.mean((value<0.42)&(sat<0.28)))
+        ready_mask=(value>0.62)&(sat>0.36)
+        glow_mask=(value>0.75)&(sat>0.4)
+        ready_ratio=float(np.sum(ready_mask*ring_weight)/(denom_ring+1e-6))
+        glow_ratio=float(np.sum(glow_mask*ring_weight)/(denom_ring+1e-6))
+        contrast=max(ring_val-core_val,0.0)
+        variance=float(np.var(value))
+        stability=1.0/(1.0+energy*4.5+variance*3.0)
+        score=ready_ratio*0.55+glow_ratio*0.25+(1.0-gray_ratio)*0.25+contrast*0.2+stability*0.15
+        score=float(np.clip(score,0.0,1.2))
         prev=self.prev_ready.get(key,0.0)
-        readiness=np.clip(prev*0.4+score*0.6,0.0,1.0)
-        ready=1 if readiness>=0.58 else 0
-        self.prev_ready[key]=1.0 if ready==1 else readiness
+        blend_ratio=np.clip(0.35+ready_ratio*0.3,0.35,0.85)
+        readiness=np.clip(prev*(1.0-blend_ratio)+score*blend_ratio,0.0,1.0)
+        ready=1 if readiness>=0.56 else 0
+        self.prev_ready[key]=0.9 if ready==1 else readiness
         return ready
     def alive_state(self,cv_img):
-        mean_v,mean_s,_=self.region_stats(cv_img)
-        bright_ratio=self.config["OCR"].get("存活亮度比",0.8)
-        sat_ratio=self.config["OCR"].get("存活饱和比",0.6)
-        return 1 if mean_v>self.config["OCR"]["亮度阈值"]*bright_ratio and mean_s>self.config["OCR"]["饱和阈值"]*sat_ratio else 0
-    def ocr_digits(self,cv_img):
+        if cv_img is None or getattr(cv_img,"size",0)==0:
+            return 0
+        hsv=cv2.cvtColor(cv_img,cv2.COLOR_BGR2HSV)
+        value=hsv[:,:,2].astype(np.float32)/255.0
+        sat=hsv[:,:,1].astype(np.float32)/255.0
+        bright_mean=float(np.mean(value))
+        sat_mean=float(np.mean(sat))
+        bright_active=float(np.mean((value>0.65)*(sat>0.32)))
+        dark_ratio=float(np.mean(value<0.25))
         gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
-        _,th=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
-        txt=pytesseract.image_to_string(th,config="--psm 7 -c tessedit_char_whitelist=0123456789")
-        digits="".join([c for c in txt if c.isdigit()])
-        if digits=="":
+        texture=float(np.mean(np.abs(cv2.Laplacian(gray,cv2.CV_32F))))/(np.mean(value)+1e-6)
+        ocr_conf=self.config.get("OCR",{})
+        bright_thresh=float(ocr_conf.get("亮度阈值",110))/255.0*float(ocr_conf.get("存活亮度比",0.8))
+        sat_thresh=float(ocr_conf.get("饱和阈值",60))/255.0*float(ocr_conf.get("存活饱和比",0.6))
+        base_score=bright_mean/(bright_thresh+1e-6)*0.4+sat_mean/(sat_thresh+1e-6)*0.3+bright_active*0.3
+        base_score=max(0.0,min(base_score,1.6))
+        penalty=np.clip(dark_ratio*0.5,0.0,0.6)
+        texture_score=np.clip(texture*0.25,0.0,0.6)
+        alive_score=np.clip(base_score+texture_score-penalty,0.0,1.2)
+        filtered=self.prev_alive_score*0.6+alive_score*0.4
+        if dark_ratio>0.82 and bright_mean<bright_thresh*0.8:
+            filtered=filtered*0.5
+        self.prev_alive_score=np.clip(filtered,0.0,1.0)
+        return 1 if self.prev_alive_score>=0.52 else 0
+    def ocr_digits(self,cv_img):
+        if cv_img is None or getattr(cv_img,"size",0)==0:
             return 0
+        gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
+        blur=cv2.GaussianBlur(gray,(3,3),0)
+        _,th1=cv2.threshold(blur,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+        _,th2=cv2.threshold(blur,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)
+        candidates=[th1,th2]
+        if self.tesseract_ready:
+            for src in candidates:
+                try:
+                    txt=pytesseract.image_to_string(src,config="--psm 7 -c tessedit_char_whitelist=0123456789")
+                    digits="".join([c for c in txt if c.isdigit()])
+                    if digits:
+                        return int(digits)
+                except pytesseract.pytesseract.TesseractNotFoundError:
+                    self.tesseract_ready=False
+                    break
+                except:
+                    continue
+        best_value=0
+        best_score=0.0
+        for src in candidates:
+            value,score=self.template_ocr(src)
+            if score>best_score:
+                best_score=score
+                best_value=value
+        return best_value
+    def template_ocr(self,binary):
+        if not self.digit_templates:
+            return (0,0.0)
+        if binary is None or binary.size==0:
+            return (0,0.0)
+        src=binary.copy()
+        if np.mean(src)>200:
+            src=255-src
+        contours=cv2.findContours(src,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+        contours=contours[0] if len(contours)==2 else contours[1]
+        boxes=[]
+        area=src.shape[0]*src.shape[1]
+        for cnt in contours:
+            x,y,w,h=cv2.boundingRect(cnt)
+            if w*h<max(20,int(area*0.02)):
+                continue
+            boxes.append((x,y,w,h))
+        if not boxes:
+            return (0,0.0)
+        boxes=sorted(boxes,key=lambda b:b[0])
+        digits=[]
+        scores=[]
+        for x,y,w,h in boxes:
+            segment=src[y:y+h,x:x+w]
+            digit,score=self.match_digit_template(segment)
+            if digit is None:
+                continue
+            digits.append(digit)
+            scores.append(score)
+        if not digits:
+            return (0,0.0)
         try:
-            return int(digits)
+            value=int("".join(digits))
         except:
-            return 0
+            value=0
+        return (value,float(np.mean(scores)))
+    def match_digit_template(self,segment):
+        if segment is None or segment.size==0:
+            return (None,0.0)
+        resized=cv2.resize(segment,(40,60),interpolation=cv2.INTER_AREA)
+        arr=resized.astype(np.float32)/255.0
+        if np.mean(arr)>0.5:
+            arr=1.0-arr
+        best_digit=None
+        best_score=0.0
+        for digit,template in self.digit_templates.items():
+            tpl=template
+            if tpl.shape!=arr.shape:
+                tpl=cv2.resize(tpl,(arr.shape[1],arr.shape[0]))
+            num=float(np.sum(arr*tpl))
+            den=float(np.sqrt(np.sum(arr**2))*np.sqrt(np.sum(tpl**2))+1e-6)
+            score=num/den
+            if score>best_score:
+                best_score=score
+                best_digit=digit
+        if best_score<0.45:
+            return (None,best_score)
+        return (best_digit,best_score)
     def recall_signature(self,cv_img):
         if cv_img is None or cv_img.size==0:
             return 0.0,0.0,0.0,0.0
