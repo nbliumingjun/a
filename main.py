@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tkinter as tk
+try:
+    from pynput import mouse,keyboard
+except:
+    mouse=None
+    keyboard=None
 @dataclass
 class CircleRegion:
     x:float
@@ -89,7 +94,11 @@ def default_config(base_dir):
     reward_window=max(12,len(action_names)*6)
     reward_gain=0.3+len(action_names)/100.0
     value_reg=0.25/max(8,len(obs_keys))
-    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
+    base_interval=0.2
+    idle_switch=max(10.0,reward_window*base_interval*0.5)
+    learn_sample=max(base_interval,base_interval*2.0)
+    train_sample=max(base_interval,base_interval*1.5)
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":base_interval,"拖动耗时":base_interval,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"模式":{"学习静默阈值":idle_switch,"学习采样间隔":learn_sample,"训练采样间隔":train_sample},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -212,6 +221,8 @@ class SharedState:
         self.hw_profile={}
         self.config=config
         self.config_manager=None
+        self.mode="学习"
+        self.terminate=False
 class ModelManager:
     def __init__(self,config,device,dtype):
         self.config=config
@@ -444,6 +455,175 @@ class VisionModule:
             return int(digits)
         except:
             return 0
+class ExperienceRecorder:
+    def __init__(self,config):
+        self.base_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
+        self.frame_dir=os.path.join(self.base_dir,"frames")
+        self.input_path=os.path.join(self.base_dir,"inputs.log")
+        self.metric_path=os.path.join(self.base_dir,"metrics.log")
+        os.makedirs(self.frame_dir,exist_ok=True)
+        self.lock=threading.Lock()
+        self.frame_paths=deque()
+        learn_conf=config.get("学习",{})
+        self.max_frames=max(200,int(learn_conf.get("缓冲大小",20000)//10))
+    def record_input(self,mode,event_type,data):
+        payload={"t":time.time(),"mode":mode,"type":event_type,"data":data}
+        try:
+            with self.lock:
+                with open(self.input_path,"a",encoding="utf-8") as f:
+                    f.write(json.dumps(payload,ensure_ascii=False)+"\n")
+        except:
+            pass
+    def record_metrics(self,mode,metrics):
+        payload={"t":time.time(),"mode":mode,"metrics":metrics}
+        try:
+            with self.lock:
+                with open(self.metric_path,"a",encoding="utf-8") as f:
+                    f.write(json.dumps(payload,ensure_ascii=False)+"\n")
+        except:
+            pass
+    def record_frame(self,mode,image):
+        if image is None:
+            return
+        ts="{:.3f}".format(time.time()).replace(".","_")
+        name=f"{mode}_{ts}_{len(self.frame_paths)}.png"
+        path=os.path.join(self.frame_dir,name)
+        try:
+            with self.lock:
+                image.save(path)
+                self.frame_paths.append(path)
+                while len(self.frame_paths)>self.max_frames:
+                    old=self.frame_paths.popleft()
+                    try:
+                        os.remove(old)
+                    except:
+                        pass
+        except:
+            pass
+class InputMonitor:
+    def __init__(self,mode_manager):
+        self.mode_manager=mode_manager
+        self.keyboard_listener=None
+        self.mouse_listener=None
+        self.available=mouse is not None and keyboard is not None
+        interval=self.mode_manager.config["动作"].get("循环间隔",0.2)
+        self.move_interval=max(0.05,float(interval))
+        self.last_move=0.0
+    def start(self):
+        if not self.available:
+            return
+        try:
+            self.keyboard_listener=keyboard.Listener(on_press=self.on_key_press,on_release=self.on_key_release)
+            self.keyboard_listener.start()
+            self.mouse_listener=mouse.Listener(on_click=self.on_click,on_scroll=self.on_scroll,on_move=self.on_move)
+            self.mouse_listener.start()
+        except:
+            self.available=False
+    def stop(self):
+        if self.keyboard_listener:
+            try:
+                self.keyboard_listener.stop()
+            except:
+                pass
+        if self.mouse_listener:
+            try:
+                self.mouse_listener.stop()
+            except:
+                pass
+    def on_key_press(self,key):
+        self.mode_manager.handle_user_event("键盘",{"key":str(key),"pressed":True})
+    def on_key_release(self,key):
+        self.mode_manager.handle_user_event("键盘",{"key":str(key),"pressed":False})
+    def on_click(self,x,y,button,pressed):
+        self.mode_manager.handle_user_event("鼠标",{"button":str(button),"pressed":pressed,"x":x,"y":y})
+    def on_scroll(self,x,y,dx,dy):
+        self.mode_manager.handle_user_event("鼠标滚轮",{"dx":dx,"dy":dy,"x":x,"y":y})
+    def on_move(self,x,y):
+        now=time.time()
+        if now-self.last_move>=self.move_interval:
+            self.last_move=now
+            self.mode_manager.handle_user_event("鼠标移动",{"x":x,"y":y})
+class ModeManager:
+    def __init__(self,shared,controller,recorder,config):
+        self.shared=shared
+        self.controller=controller
+        self.recorder=recorder
+        self.config=config
+        self.current_mode="学习"
+        mode_conf=config.get("模式",{})
+        self.idle_threshold=float(mode_conf.get("学习静默阈值",10.0))
+        self.learn_interval=float(mode_conf.get("学习采样间隔",0.4))
+        self.train_interval=float(mode_conf.get("训练采样间隔",0.2))
+        self.last_input=time.time()
+        self.last_frame=0.0
+        self.running=False
+        self.thread=None
+        self.controller.set_recorder(recorder)
+    def start(self):
+        if self.running:
+            return
+        with self.shared.lock:
+            self.shared.mode=self.current_mode
+        self.running=True
+        self.thread=threading.Thread(target=self.loop,daemon=True)
+        self.thread.start()
+    def stop(self):
+        self.running=False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+    def handle_user_event(self,event_type,data):
+        now=time.time()
+        self.last_input=now
+        payload={k:str(v) for k,v in data.items()}
+        self.recorder.record_input(self.current_mode,event_type,payload)
+        if event_type=="键盘" and payload.get("key") in ("Key.esc","esc","<esc>","\u001b"):
+            self.shared.terminate=True
+            self.controller.stop()
+            with self.shared.lock:
+                self.shared.mode="学习"
+                self.shared.running=False
+            self.current_mode="学习"
+            self.last_frame=0.0
+            return
+        if self.current_mode=="训练":
+            self.controller.stop()
+            with self.shared.lock:
+                self.shared.mode="学习"
+                self.shared.running=False
+            self.current_mode="学习"
+            self.last_frame=0.0
+    def switch_to_train(self):
+        if self.current_mode=="训练" or self.shared.terminate:
+            return
+        self.controller.start()
+        with self.shared.lock:
+            self.shared.mode="训练"
+        self.current_mode="训练"
+        self.last_frame=0.0
+    def force_learning(self):
+        self.controller.stop()
+        with self.shared.lock:
+            self.shared.mode="学习"
+            self.shared.running=False
+        self.current_mode="学习"
+        self.last_frame=0.0
+        self.last_input=time.time()
+    def loop(self):
+        while self.running and not self.shared.terminate:
+            now=time.time()
+            if self.current_mode=="学习" and now-self.last_input>=self.idle_threshold:
+                self.switch_to_train()
+            interval=self.learn_interval if self.current_mode=="学习" else self.train_interval
+            if now-self.last_frame>=interval:
+                frame=self.controller.game.get_screenshot() if self.current_mode=="学习" else self.controller.game.last_screenshot
+                if self.current_mode=="训练" and frame is None:
+                    frame=self.controller.game.get_screenshot()
+                if frame is not None:
+                    self.recorder.record_frame(self.current_mode,frame)
+                    metrics=self.controller.game.get_metrics(frame,update_prev=False)
+                    self.recorder.record_metrics(self.current_mode,metrics)
+                self.last_frame=now
+            time.sleep(max(0.1,interval*0.5))
 class GameInterface:
     def __init__(self,config,adb_path):
         self.config=config
@@ -567,8 +747,10 @@ class GameInterface:
         sx,sy=self.scaled_xy(cx,cy)
         exs,eys=self.scaled_xy(ex,ey)
         self.adb_swipe(sx,sy,exs,eys,int(self.config["动作"]["拖动耗时"]*1000))
-    def get_metrics(self):
-        img=self.get_screenshot()
+    def get_metrics(self,img=None,update_prev=True):
+        capture_needed=img is None
+        if capture_needed:
+            img=self.get_screenshot()
         if img is None:
             return self.prev_metrics
         v=self.vision
@@ -586,7 +768,8 @@ class GameInterface:
         item_img=crop_circle(self.circle_regions["active_item"])
         heal_img=crop_circle(self.circle_regions["heal"])
         metrics={"A":v.ocr_digits(A_img),"B":v.ocr_digits(B_img),"C":v.ocr_digits(C_img),"alive":v.alive_state(attack_img),"cd1":v.cooldown_ready("skill1",skill1_img),"cd2":v.cooldown_ready("skill2",skill2_img),"cd3":v.cooldown_ready("skill3",skill3_img),"cd_item":v.cooldown_ready("item",item_img),"cd_heal":v.cooldown_ready("heal",heal_img)}
-        self.prev_metrics=metrics
+        if update_prev or capture_needed:
+            self.prev_metrics=metrics
         return metrics
     def metrics_to_obs(self,m):
         obs=[]
@@ -642,6 +825,7 @@ class BotController:
         self.dnplayer_path=shared.config["路径"]["模拟器"]
         self.running_event=threading.Event()
         self.thread=None
+        self.recorder=None
     def update_paths(self,adb_path,dnplayer_path,aaa_path):
         if adb_path:
             self.adb_path=adb_path
@@ -666,6 +850,12 @@ class BotController:
         self.running_event.clear()
         with self.shared.lock:
             self.shared.running=False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+    def is_running(self):
+        return self.running_event.is_set()
+    def set_recorder(self,recorder):
+        self.recorder=recorder
     def loop(self):
         metrics_prev=self.game.get_metrics()
         obs_prev=self.game.metrics_to_obs(metrics_prev)
@@ -681,6 +871,9 @@ class BotController:
             done=metrics_curr.get("alive",0)==0
             self.agent.store(obs_prev,action,reward,obs_curr,done)
             self.agent.train_step()
+            if self.recorder and self.shared.mode=="训练" and self.game.last_screenshot is not None:
+                self.recorder.record_frame("训练",self.game.last_screenshot)
+                self.recorder.record_metrics("训练",metrics_curr)
             with self.shared.lock:
                 self.shared.A=metrics_curr["A"]
                 self.shared.B=metrics_curr["B"]
@@ -696,10 +889,11 @@ class BotController:
             metrics_prev=metrics_curr
             obs_prev=obs_curr
 class BotUI:
-    def __init__(self,shared,controller,config_manager):
+    def __init__(self,shared,controller,config_manager,mode_manager):
         self.shared=shared
         self.controller=controller
         self.config_manager=config_manager
+        self.mode_manager=mode_manager
         self.root=tk.Tk()
         self.root.title("AI强化学习深度学习控制面板")
         self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","epsilon","status","device","hw","adb","dn","aaa"]}
@@ -728,9 +922,9 @@ class BotUI:
         tk.Button(control_frame,text="应用路径",command=self.apply_paths).grid(row=4,column=0,columnspan=2,sticky="we")
     def start_bot(self):
         self.apply_paths()
-        self.controller.start()
+        self.mode_manager.switch_to_train()
     def stop_bot(self):
-        self.controller.stop()
+        self.mode_manager.force_learning()
     def apply_paths(self):
         adb_path=self.vars["adb"].get()
         dn_path=self.vars["dn"].get()
@@ -744,6 +938,10 @@ class BotUI:
             self.shared.config=self.config_manager.config
         self.controller.update_paths(adb_path,dn_path,aaa_path)
     def update_loop(self):
+        if self.shared.terminate:
+            self.controller.stop()
+            self.root.quit()
+            return
         with self.shared.lock:
             self.vars["A"].set(str(self.shared.A))
             self.vars["B"].set(str(self.shared.B))
@@ -755,7 +953,8 @@ class BotUI:
             self.vars["cd_item"].set("可用" if self.shared.cd_item==1 else "冷却")
             self.vars["cd_heal"].set("可用" if self.shared.cd_heal==1 else "冷却")
             self.vars["epsilon"].set("{:.3f}".format(self.shared.epsilon))
-            self.vars["status"].set("运行" if self.shared.running else "停止")
+            status_prefix="运行" if self.shared.running else "停止"
+            self.vars["status"].set(f"{status_prefix}-{self.shared.mode}")
             self.vars["device"].set(self.shared.device)
             hw_desc=""
             if "cpu_count" in self.shared.hw_profile:
@@ -852,7 +1051,18 @@ def main():
     agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir,weight_decay=params["weight_decay"],value_reg=params["value_reg"])
     model_manager=ModelManager(config,device,dtype)
     controller=BotController(shared,agent,model_manager,game)
-    ui=BotUI(shared,controller,config_manager)
-    ui.run()
+    recorder=ExperienceRecorder(config)
+    mode_manager=ModeManager(shared,controller,recorder,config)
+    input_monitor=InputMonitor(mode_manager)
+    mode_manager.start()
+    input_monitor.start()
+    ui=BotUI(shared,controller,config_manager,mode_manager)
+    try:
+        ui.run()
+    finally:
+        shared.terminate=True
+        controller.stop()
+        mode_manager.stop()
+        input_monitor.stop()
 if __name__=="__main__":
     main()
