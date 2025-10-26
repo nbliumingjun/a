@@ -1,4 +1,4 @@
-import os,subprocess,threading,time,random,math,platform,json,io,glob
+import os,subprocess,threading,time,random,math,platform,json,io,glob,re
 from collections import deque,namedtuple
 from dataclasses import dataclass
 try:
@@ -9,8 +9,16 @@ try:
     import GPUtil
 except:
     GPUtil=None
+try:
+    import mss
+except:
+    mss=None
 import numpy as np
 from PIL import Image
+try:
+    from PIL import ImageGrab
+except:
+    ImageGrab=None
 import pytesseract
 import cv2
 import torch
@@ -100,7 +108,7 @@ def default_config(base_dir):
     idle_switch=max(10.0,reward_window*base_interval*0.5)
     learn_sample=max(base_interval,base_interval*2.0)
     train_sample=max(base_interval,base_interval*1.5)
-    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":5.0,"C":3.0,"B":-4.0},"动作":{"循环间隔":base_interval,"拖动耗时":base_interval,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"模式":{"学习静默阈值":idle_switch,"学习采样间隔":learn_sample,"训练采样间隔":train_sample},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h,"捕获区域":{"左":1,"上":72,"右":2522,"下":1490}},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":5.0,"C":3.0,"B":-4.0},"动作":{"循环间隔":base_interval,"拖动耗时":base_interval,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"模式":{"学习静默阈值":idle_switch,"学习采样间隔":learn_sample,"训练采样间隔":train_sample},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -609,6 +617,8 @@ class ExperienceRecorder:
         self.paused=False
     def set_paused(self,value):
         self.paused=bool(value)
+    def _timestamp(self):
+        return time.time_ns()
     def _write_json(self,path,payload):
         try:
             with self.lock:
@@ -619,19 +629,19 @@ class ExperienceRecorder:
     def record_input(self,mode,event_type,data):
         if self.paused:
             return
-        payload={"t":time.time(),"mode":mode,"type":event_type,"data":data}
+        payload={"t":self._timestamp(),"mode":mode,"type":event_type,"data":data}
         self._write_json(self.input_path,payload)
     def record_metrics(self,mode,metrics):
         if self.paused:
             return
-        payload={"t":time.time(),"mode":mode,"metrics":metrics}
+        payload={"t":self._timestamp(),"mode":mode,"metrics":metrics}
         self._write_json(self.metric_path,payload)
     def record_frame(self,mode,image):
         if image is None:
             return
         if self.paused:
             return
-        ts="{:.3f}".format(time.time()).replace(".","_")
+        ts=self._timestamp()
         name=f"{mode}_{ts}_{len(self.frame_paths)}.png"
         path=os.path.join(self.frame_dir,name)
         try:
@@ -817,10 +827,19 @@ class GameInterface:
         self.adb_path=adb_path
         self.model_manager=model_manager
         self.scaler=RegionScaler(config)
+        self.capture_region=self.resolve_capture_region()
+        self.capture_left=self.capture_region["left"]
+        self.capture_top=self.capture_region["top"]
+        self.capture_right=self.capture_region["right"]
+        self.capture_bottom=self.capture_region["bottom"]
+        self.capture_width=self.capture_region["width"]
+        self.capture_height=self.capture_region["height"]
+        self.scaler.update(self.capture_width,self.capture_height)
         self.screen_w=self.scaler.screen_w
         self.screen_h=self.scaler.screen_h
         self.vision=VisionModule(config)
         self.last_screenshot=None
+        self.device_width,self.device_height=self.query_device_resolution()
         self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","recalling"]))
         self.metric_caps={k:float(v) for k,v in self.config.get("数值上限",{}).items()}
         self.binary_keys={k for k in self.obs_keys if k=="alive" or k.startswith("cd") or k=="recalling"}
@@ -847,6 +866,54 @@ class GameInterface:
         self.skill_path_file=os.path.join(self.experience_dir,"skill_paths.json")
         self.skill_paths=self.load_skill_paths()
         self.recall_monitor=RecallMonitor(self.config,self.vision)
+    def resolve_capture_region(self):
+        screen=self.config.get("屏幕",{})
+        area=screen.get("捕获区域",{})
+        def parse(key,default):
+            value=area.get(key,default)
+            try:
+                return int(float(value))
+            except:
+                try:
+                    return int(float(default))
+                except:
+                    return 0
+        left=parse("左",0)
+        top=parse("上",0)
+        right=parse("右",left+1)
+        bottom=parse("下",top+1)
+        if right<=left:
+            right=left+1
+        if bottom<=top:
+            bottom=top+1
+        width=right-left
+        height=bottom-top
+        return {"left":left,"top":top,"right":right,"bottom":bottom,"width":width,"height":height}
+    def query_device_resolution(self):
+        screen=self.config.get("屏幕",{})
+        try:
+            base_w=int(float(screen.get("基准宽度",self.capture_width)))
+        except:
+            base_w=int(self.capture_width)
+        try:
+            base_h=int(float(screen.get("基准高度",self.capture_height)))
+        except:
+            base_h=int(self.capture_height)
+        base_w=max(base_w,1)
+        base_h=max(base_h,1)
+        try:
+            output=subprocess.check_output([self.adb_path,"shell","wm","size"],timeout=5)
+            text=output.decode("utf-8","ignore")
+            match=re.search(r"Physical size:\s*(\d+)x(\d+)",text)
+            if not match:
+                match=re.search(r"Override size:\s*(\d+)x(\d+)",text)
+            if match:
+                dw=max(int(match.group(1)),1)
+                dh=max(int(match.group(2)),1)
+                return dw,dh
+        except:
+            pass
+        return base_w,base_h
     def refresh_regions(self):
         for alias,name in self.circle_map.items():
             self.circle_regions[alias]=self.scaler.circle(name)
@@ -896,7 +963,7 @@ class GameInterface:
         inv=max(radius,1.0)
         for pt in path[1:]:
             norm.append([(pt[0]-center[0])/inv,(pt[1]-center[1])/inv])
-        data={"points":norm,"cancel":1 if cancel else 0,"t":time.time()}
+        data={"points":norm,"cancel":1 if cancel else 0,"t":time.time_ns()}
         bucket=self.skill_paths.get(key,[])
         bucket=[d for d in bucket if isinstance(d,dict)]
         bucket.append(data)
@@ -916,42 +983,77 @@ class GameInterface:
         except:
             pass
     def get_screenshot(self):
+        left=self.capture_left
+        top=self.capture_top
+        width=max(1,self.capture_width)
+        height=max(1,self.capture_height)
+        right=left+width
+        bottom=top+height
         try:
-            png_bytes=subprocess.check_output([self.adb_path,"exec-out","screencap","-p"],timeout=5)
-            img=Image.open(io.BytesIO(png_bytes)).convert("RGB")
+            if mss is not None:
+                with mss.mss() as sct:
+                    grab=sct.grab({"left":left,"top":top,"width":width,"height":height})
+                    img=Image.frombytes("RGB",grab.size,grab.rgb)
+            elif ImageGrab is not None:
+                img=ImageGrab.grab(bbox=(left,top,right,bottom)).convert("RGB")
+            else:
+                return self.last_screenshot
             self.last_screenshot=img
-            self.scaler.update(*img.size)
+            self.capture_width=img.width
+            self.capture_height=img.height
+            self.scaler.update(img.width,img.height)
             self.refresh_regions()
             return img
         except:
+            if ImageGrab is not None:
+                try:
+                    img=ImageGrab.grab(bbox=(left,top,right,bottom)).convert("RGB")
+                    self.last_screenshot=img
+                    self.capture_width=img.width
+                    self.capture_height=img.height
+                    self.scaler.update(img.width,img.height)
+                    self.refresh_regions()
+                    return img
+                except:
+                    pass
             return self.last_screenshot
     def scaled_xy(self,x,y):
-        return int(x),int(y)
+        width=max(1.0,float(self.capture_width))
+        height=max(1.0,float(self.capture_height))
+        px=(float(x)-self.capture_left)/width
+        py=(float(y)-self.capture_top)/height
+        px=max(0.0,min(1.0,px))
+        py=max(0.0,min(1.0,py))
+        dx=int(px*self.device_width)
+        dy=int(py*self.device_height)
+        return dx,dy
     def circle_center(self,region):
         return region.x+region.d/2.0,region.y+region.d/2.0
     def tap_circle(self,region):
         cx,cy=self.circle_center(region)
         sx,sy=self.scaled_xy(cx,cy)
         self.adb_tap(sx,sy)
+        return {"pc":[float(cx),float(cy)],"device":[int(sx),int(sy)],"diameter":float(region.d)}
     def skill_executor(self,key):
         def runner(metrics):
-            self.cast_skill(key,metrics)
+            return self.cast_skill(key,metrics)
         return runner
     def act_idle(self,metrics):
-        return
+        return {"note":"idle"}
     def act_move(self,metrics):
-        self.joystick_move_random(metrics)
+        return self.joystick_move_random(metrics)
     def act_attack_minion(self,metrics):
-        self.basic_attack_minion()
+        return self.basic_attack_minion()
     def act_attack_tower(self,metrics):
-        self.basic_attack_tower()
+        return self.basic_attack_tower()
     def act_item(self,metrics):
-        self.use_item()
+        return self.use_item()
     def act_heal(self,metrics):
-        self.heal()
+        info=self.heal()
         time.sleep(self.config["动作冷却"]["恢复时长"])
+        return info
     def act_recall(self,metrics):
-        self.recall()
+        return self.recall()
     def act_flash(self,metrics):
         self.flash_forward()
     def joystick_move_random(self,metrics):
@@ -960,12 +1062,13 @@ class GameInterface:
         radius=max(region.d/2.0*self.joystick_ratio,1.0)
         obs=self.metrics_to_obs(metrics)
         seed=time.time()+random.random()
-        recorded,_=self.experience_path("joystick",(cx,cy),radius,seed)
+        recorded_path,_=self.experience_path("joystick",(cx,cy),radius,seed)
         base_speed=float(self.config["动作"].get("拖动耗时",0.2))*1000.0
         base_speed=max(base_speed,1.0)
-        if recorded:
-            path=list(recorded)
+        if recorded_path:
+            path=list(recorded_path)
             speed_scale=1.0
+            recorded_flag=1
         else:
             vec=None
             if self.model_manager:
@@ -1007,6 +1110,7 @@ class GameInterface:
                 py=cy+math.sin(angle)*radius
                 path.append((px,py))
             speed_scale=1.0-velocity*0.5
+            recorded_flag=0
         hold=int(max(1,base_speed*0.3))
         sx,sy=self.scaled_xy(cx,cy)
         self.adb_swipe(sx,sy,sx,sy,hold)
@@ -1020,21 +1124,24 @@ class GameInterface:
                 continue
             segments.append((x1,y1,x2,y2,dist))
             total+=dist
-        if not segments:
-            return
+        device_segments=[]
         for x1,y1,x2,y2,dist in segments:
             duration=int(max(1,base_speed*(dist/total)*speed_scale))
             sx1,sy1=self.scaled_xy(x1,y1)
             sx2,sy2=self.scaled_xy(x2,y2)
             self.adb_swipe(sx1,sy1,sx2,sy2,duration)
+            device_segments.append([int(sx1),int(sy1),int(sx2),int(sy2),int(duration)])
         lx,ly=self.scaled_xy(path[-1][0],path[-1][1])
         release=int(max(1,base_speed*0.25))
         self.adb_swipe(lx,ly,lx,ly,release)
         self.record_skill_path("joystick",path,False,(cx,cy),radius)
+        return {"recorded":recorded_flag,"hold":hold,"release":release,"speed":float(speed_scale),"path":[[float(p[0]),float(p[1])] for p in path],"device_path":device_segments}
     def basic_attack_minion(self):
-        self.tap_circle(self.circle_regions["attack_min"])
+        info=self.tap_circle(self.circle_regions["attack_min"])
+        return {"target":"minion","impact":info}
     def basic_attack_tower(self):
-        self.tap_circle(self.circle_regions["attack_tower"])
+        info=self.tap_circle(self.circle_regions["attack_tower"])
+        return {"target":"tower","impact":info}
     def model_direction(self,key,obs):
         name_map={"skill1":"一技能","skill2":"二技能","skill3":"三技能"}
         name=name_map.get(key)
@@ -1102,7 +1209,7 @@ class GameInterface:
         return path,cancel
     def drag_path(self,path):
         if not path or len(path)<2:
-            return
+            return []
         total=0.0
         segments=[]
         for i in range(len(path)-1):
@@ -1113,12 +1220,15 @@ class GameInterface:
             total+=dist
         base=self.config["动作"].get("拖动耗时",0.2)*1000.0
         base=max(base,1.0)
+        device_segments=[]
         for x1,y1,x2,y2,dist in segments:
             duration=int(base*(dist/total if total>0 else 1.0))
             duration=max(duration,1)
             sx,sy=self.scaled_xy(x1,y1)
             ex,ey=self.scaled_xy(x2,y2)
             self.adb_swipe(sx,sy,ex,ey,duration)
+            device_segments.append([int(sx),int(sy),int(ex),int(ey),int(duration)])
+        return device_segments
     def cast_skill(self,key,metrics):
         path,cancel=self.generate_drag_path(key,metrics)
         if cancel:
@@ -1126,18 +1236,21 @@ class GameInterface:
             cancel_center=self.circle_center(cancel_region)
             path=list(path)
             path.append(cancel_center)
-        self.drag_path(path)
+        device_path=self.drag_path(path)
         region=self.circle_regions[key]
         center=self.circle_center(region)
         self.record_skill_path(key,path,cancel,center,max(region.d/2.0,1.0))
+        return {"skill":key,"cancel":1 if cancel else 0,"path":[[float(p[0]),float(p[1])] for p in path],"device_path":device_path,"impact":{"pc":[float(center[0]),float(center[1])],"diameter":float(region.d)}}
     def use_item(self):
-        self.tap_circle(self.circle_regions["active_item"])
+        info=self.tap_circle(self.circle_regions["active_item"])
+        return {"item":"active","impact":info}
     def heal(self):
-        self.tap_circle(self.circle_regions["heal"])
+        info=self.tap_circle(self.circle_regions["heal"])
+        return {"item":"heal","impact":info}
     def recall(self):
         region=self.circle_regions["recall"]
         minimap_region=self.rect_regions["minimap"]
-        self.tap_circle(region)
+        impact=self.tap_circle(region)
         base_img=self.get_screenshot()
         if base_img is not None:
             recall_img=self.vision.crop_cv(base_img,region.x,region.y,region.d,region.d)
@@ -1166,6 +1279,7 @@ class GameInterface:
                 self.recall_monitor.cancel()
                 break
         self.prev_metrics["recalling"]=0
+        return {"item":"recall","impact":impact,"duration":time.time()-start,"status":self.recall_monitor.status}
     def flash_forward(self):
         region=self.circle_regions["flash"]
         cx,cy=self.circle_center(region)
@@ -1180,7 +1294,9 @@ class GameInterface:
             ey=cy+offset[1]
         sx,sy=self.scaled_xy(cx,cy)
         exs,eys=self.scaled_xy(ex,ey)
-        self.adb_swipe(sx,sy,exs,eys,int(self.config["动作"]["拖动耗时"]*1000))
+        duration=int(self.config["动作"]["拖动耗时"]*1000)
+        self.adb_swipe(sx,sy,exs,eys,duration)
+        return {"item":"flash","start":[float(cx),float(cy)],"end":[float(ex),float(ey)],"device_start":[int(sx),int(sy)],"device_end":[int(exs),int(eys)],"duration":duration}
     def get_metrics(self,img=None,update_prev=True):
         capture_needed=img is None
         if capture_needed:
@@ -1272,16 +1388,19 @@ class GameInterface:
         return reward
     def execute_action(self,action_idx,metrics_prev):
         if action_idx<0 or action_idx>=self.action_dim:
-            return
+            return None
         action_name=self.action_order[action_idx]
         condition=self.action_conditions.get(action_name)
         if condition and not condition(metrics_prev):
-            return
+            return None
         if self.recall_monitor.active and action_name!="recall":
-            return
+            return None
         executor=self.action_funcs.get(action_name)
         if executor:
-            executor(metrics_prev)
+            result=executor(metrics_prev)
+            params=result if isinstance(result,dict) else {}
+            return {"action":action_name,"params":params}
+        return {"action":action_name,"params":{}}
 class BotController:
     def __init__(self,shared,agent,model_manager,game):
         self.shared=shared
@@ -1330,7 +1449,10 @@ class BotController:
         obs_prev=self.game.metrics_to_obs(metrics_prev)
         while self.running_event.is_set():
             action,eps=self.agent.select_action(obs_prev)
-            self.game.execute_action(action,metrics_prev)
+            action_info=self.game.execute_action(action,metrics_prev)
+            if self.recorder and self.shared.mode=="训练" and action_info:
+                payload={"source":"AI","action":action_info.get("action",""),"params":json.dumps(action_info.get("params",{}),ensure_ascii=False)}
+                self.recorder.record_input("训练","AI_ACTION",{k:str(v) for k,v in payload.items()})
             base_interval=float(self.shared.config["动作"].get("循环间隔",0.2))
             interval=max(0.05,base_interval*(0.5+0.5*eps))
             time.sleep(interval)
