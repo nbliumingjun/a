@@ -1,5 +1,6 @@
 import os, subprocess, io, threading, time, random, math, platform
 from collections import deque, namedtuple
+from dataclasses import dataclass
 try:
     import psutil
 except:
@@ -32,6 +33,8 @@ class SharedState:
         self.epsilon=1.0
         self.device="cpu"
         self.hw_profile={}
+        self.adb_path="D:\\LDPlayer9\\adb.exe"
+        self.dnplayer_path="D:\\LDPlayer9\\dnplayer.exe"
 
 def hardware_profile():
     profile={}
@@ -63,16 +66,18 @@ class QNetwork(nn.Module):
     def __init__(self,input_dim,output_dim,hidden_dim):
         super().__init__()
         self.fc1=nn.Linear(input_dim,hidden_dim)
+        self.bn1=nn.LayerNorm(hidden_dim)
         self.fc2=nn.Linear(hidden_dim,hidden_dim)
+        self.bn2=nn.LayerNorm(hidden_dim)
         self.fc3=nn.Linear(hidden_dim,output_dim)
     def forward(self,x):
-        x=torch.relu(self.fc1(x))
-        x=torch.relu(self.fc2(x))
+        x=torch.relu(self.bn1(self.fc1(x)))
+        x=torch.relu(self.bn2(self.fc2(x)))
         x=self.fc3(x)
         return x
 
 class DeepRLAgent:
-    def __init__(self,device,hidden_dim=128,buffer_size=10000,batch_size=64,gamma=0.99,lr=1e-4,target_sync=1000):
+    def __init__(self,device,hidden_dim=128,buffer_size=10000,batch_size=64,gamma=0.99,lr=1e-4,target_sync=1000,epsilon_decay=50000):
         self.device=device
         self.obs_dim=8
         self.action_dim=11
@@ -89,7 +94,7 @@ class DeepRLAgent:
         self.Transition=namedtuple("Transition",("state","action","reward","next_state","done"))
         self.epsilon_start=1.0
         self.epsilon_end=0.1
-        self.epsilon_decay=50000
+        self.epsilon_decay=epsilon_decay
     def epsilon(self):
         return self.epsilon_end+(self.epsilon_start-self.epsilon_end)*math.exp(-1.0*self.step_count/self.epsilon_decay)
     def select_action(self,obs_vec):
@@ -126,9 +131,22 @@ class DeepRLAgent:
         if self.step_count%self.target_sync==0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
 
+@dataclass
+class CircleRegion:
+    x:int
+    y:int
+    d:int
+
+@dataclass
+class RectRegion:
+    x:int
+    y:int
+    w:int
+    h:int
+
 class VisionModule:
     def __init__(self):
-        pass
+        self.prev_ready={}
     def crop_cv(self,pil_img,x,y,w,h,scale_x,scale_y):
         sx=int(x*scale_x)
         sy=int(y*scale_y)
@@ -143,6 +161,25 @@ class VisionModule:
     def region_brightness(self,cv_img):
         gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
         return float(np.mean(gray))
+    def hsv_stats(self,cv_img):
+        hsv=cv2.cvtColor(cv_img,cv2.COLOR_BGR2HSV)
+        mean=np.mean(hsv[:,:,2])
+        sat=np.mean(hsv[:,:,1])
+        std=np.std(hsv[:,:,2])
+        return mean,sat,std
+    def cooldown_ready(self,key,cv_img):
+        mean,sat,std=self.hsv_stats(cv_img)
+        bright=mean>110
+        saturated=sat>60
+        stable=std<55
+        ready=1 if bright and saturated and stable else 0
+        if key in self.prev_ready:
+            ready=max(ready,self.prev_ready[key]*0.5)
+        self.prev_ready[key]=ready
+        return ready
+    def alive_state(self,cv_img):
+        mean,sat,std=self.hsv_stats(cv_img)
+        return 1 if mean>90 and sat>50 else 0
     def ocr_digits(self,cv_img):
         gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
         _,th=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -164,7 +201,23 @@ class GameInterface:
         self.screen_h=base_h
         self.vision=VisionModule()
         self.last_screenshot=None
-        self.coords={"joystick":(166,915,536),"recall":(1083,1263,162),"heal":(1271,1263,162),"flash":(1467,1263,162),"skill1":(1672,1220,195),"skill2":(1825,956,195),"skill3":(2088,803,195),"cancel":(2165,252,250),"attack_min":(1915,1296,123),"attack_tower":(2241,1014,123),"active_item":(2092,544,161),"kills_box":(1904,122,56,56),"deaths_box":(1996,122,56,56),"assists_box":(2087,122,56,56),"minimap_box":(0,72,453,453)}
+        self.coords={
+            "joystick":CircleRegion(166,915,536),
+            "recall":CircleRegion(1083,1263,162),
+            "heal":CircleRegion(1271,1263,162),
+            "flash":CircleRegion(1467,1263,162),
+            "skill1":CircleRegion(1672,1220,195),
+            "skill2":CircleRegion(1825,956,195),
+            "skill3":CircleRegion(2088,803,195),
+            "cancel":CircleRegion(2165,252,250),
+            "attack_min":CircleRegion(1915,1296,123),
+            "attack_tower":CircleRegion(2241,1014,123),
+            "active_item":CircleRegion(2092,544,161),
+            "kills_box":RectRegion(1904,122,56,56),
+            "deaths_box":RectRegion(1996,122,56,56),
+            "assists_box":RectRegion(2087,122,56,56),
+            "minimap_box":RectRegion(0,72,453,453)
+        }
         self.prev_metrics={"kills":0,"deaths":0,"assists":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0}
     def adb_tap(self,x,y):
         try:
@@ -196,9 +249,9 @@ class GameInterface:
         sx,sy=self.scaled_xy(cx,cy)
         self.adb_tap(sx,sy)
     def random_move(self):
-        tlx,tly,d=self.coords["joystick"]
-        cx,cy=self.circle_center(tlx,tly,d)
-        r=d/2.0*0.8
+        c=self.coords["joystick"]
+        cx,cy=self.circle_center(c.x,c.y,c.d)
+        r=c.d/2.0*0.8
         ang=random.random()*2.0*math.pi
         ex=cx+r*math.cos(ang)
         ey=cy+r*math.sin(ang)
@@ -206,26 +259,26 @@ class GameInterface:
         exs,eys=self.scaled_xy(ex,ey)
         self.adb_swipe(sx,sy,exs,eys,200)
     def attack_minion(self):
-        tlx,tly,d=self.coords["attack_min"]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords["attack_min"]
+        self.tap_circle(c.x,c.y,c.d)
     def attack_tower(self):
-        tlx,tly,d=self.coords["attack_tower"]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords["attack_tower"]
+        self.tap_circle(c.x,c.y,c.d)
     def cast_skill(self,key):
-        tlx,tly,d=self.coords[key]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords[key]
+        self.tap_circle(c.x,c.y,c.d)
     def use_item(self):
-        tlx,tly,d=self.coords["active_item"]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords["active_item"]
+        self.tap_circle(c.x,c.y,c.d)
     def heal(self):
-        tlx,tly,d=self.coords["heal"]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords["heal"]
+        self.tap_circle(c.x,c.y,c.d)
     def recall(self):
-        tlx,tly,d=self.coords["recall"]
-        self.tap_circle(tlx,tly,d)
+        c=self.coords["recall"]
+        self.tap_circle(c.x,c.y,c.d)
     def flash_forward(self):
-        tlx,tly,d=self.coords["flash"]
-        cx,cy=self.circle_center(tlx,tly,d)
+        c=self.coords["flash"]
+        cx,cy=self.circle_center(c.x,c.y,c.d)
         ex=cx+150.0
         ey=cy
         sx,sy=self.scaled_xy(cx,cy)
@@ -240,11 +293,11 @@ class GameInterface:
         scale_y=h/self.base_h
         v=self.vision
         def crop_circle_box(coord_key):
-            tlx,tly,d=self.coords[coord_key]
-            return v.crop_cv(img,tlx,tly,d,d,scale_x,scale_y)
+            c=self.coords[coord_key]
+            return v.crop_cv(img,c.x,c.y,c.d,c.d,scale_x,scale_y)
         def crop_rect_box(box_key):
-            tlx,tly,w_,h_=self.coords[box_key]
-            return v.crop_cv(img,tlx,tly,w_,h_,scale_x,scale_y)
+            r=self.coords[box_key]
+            return v.crop_cv(img,r.x,r.y,r.w,r.h,scale_x,scale_y)
         kills_img=crop_rect_box("kills_box")
         deaths_img=crop_rect_box("deaths_box")
         assists_img=crop_rect_box("assists_box")
@@ -256,18 +309,11 @@ class GameInterface:
         kills_val=v.ocr_digits(kills_img)
         deaths_val=v.ocr_digits(deaths_img)
         assists_val=v.ocr_digits(assists_img)
-        b1=v.region_brightness(skill1_img)
-        b2=v.region_brightness(skill2_img)
-        b3=v.region_brightness(skill3_img)
-        bitem=v.region_brightness(item_img)
-        balive=v.region_brightness(attack_img)
-        th_skill=80.0
-        th_alive=50.0
-        cd1=1 if b1>th_skill else 0
-        cd2=1 if b2>th_skill else 0
-        cd3=1 if b3>th_skill else 0
-        cd_item=1 if bitem>th_skill else 0
-        alive=1 if balive>th_alive else 0
+        cd1=v.cooldown_ready("skill1",skill1_img)
+        cd2=v.cooldown_ready("skill2",skill2_img)
+        cd3=v.cooldown_ready("skill3",skill3_img)
+        cd_item=v.cooldown_ready("item",item_img)
+        alive=v.alive_state(attack_img)
         metrics={"kills":kills_val,"deaths":deaths_val,"assists":assists_val,"alive":alive,"cd1":cd1,"cd2":cd2,"cd3":cd3,"cd_item":cd_item}
         self.prev_metrics=metrics
         return metrics
@@ -286,7 +332,7 @@ class GameInterface:
         dk=curr_metrics["kills"]-prev_metrics["kills"]
         da=curr_metrics["assists"]-prev_metrics["assists"]
         dd=curr_metrics["deaths"]-prev_metrics["deaths"]
-        r=2.0*dk+1.0*da-3.0*dd
+        r=3.0*dk+2.0*da-4.0*dd
         return float(r)
     def execute_action(self,action_idx,metrics_prev):
         if action_idx==0:
@@ -341,6 +387,10 @@ class BotController:
         self.game=GameInterface(self.adb_path)
         self.running_event=threading.Event()
         self.thread=None
+    def update_paths(self,adb_path,dnplayer_path):
+        self.adb_path=adb_path
+        self.dnplayer_path=dnplayer_path
+        self.game=GameInterface(self.adb_path)
     def start(self):
         if self.running_event.is_set():
             return
@@ -374,6 +424,8 @@ class BotController:
                 self.shared.cd_item=metrics_curr["cd_item"]
                 self.shared.epsilon=eps
                 self.shared.running=True
+                self.shared.adb_path=self.adb_path
+                self.shared.dnplayer_path=self.dnplayer_path
             metrics_prev=metrics_curr
             obs_prev=obs_curr
 
@@ -382,7 +434,7 @@ class BotUI:
         self.shared=shared
         self.controller=controller
         self.root=tk.Tk()
-        self.root.title("Honor of Kings Deep RL Bot")
+        self.root.title("AI 强化学习 深度学习 控制面板")
         self.vars={}
         self.vars["kills"]=tk.StringVar()
         self.vars["deaths"]=tk.StringVar()
@@ -396,6 +448,8 @@ class BotUI:
         self.vars["status"]=tk.StringVar()
         self.vars["device"]=tk.StringVar()
         self.vars["hw"]=tk.StringVar()
+        self.vars["adb"]=tk.StringVar(value=self.shared.adb_path)
+        self.vars["dnplayer"]=tk.StringVar(value=self.shared.dnplayer_path)
         frame_state=tk.Frame(self.root)
         frame_state.pack(side="top",fill="x")
         tk.Label(frame_state,text="Kills").grid(row=0,column=0,sticky="w")
@@ -422,6 +476,11 @@ class BotUI:
         control_frame.pack(side="top",fill="x")
         tk.Button(control_frame,text="Start AI",command=self.start_bot).grid(row=0,column=0,sticky="we")
         tk.Button(control_frame,text="Stop AI",command=self.stop_bot).grid(row=0,column=1,sticky="we")
+        tk.Label(control_frame,text="ADB").grid(row=1,column=0,sticky="w")
+        tk.Entry(control_frame,textvariable=self.vars["adb"],width=40).grid(row=1,column=1,sticky="we")
+        tk.Label(control_frame,text="dnplayer").grid(row=2,column=0,sticky="w")
+        tk.Entry(control_frame,textvariable=self.vars["dnplayer"],width=40).grid(row=2,column=1,sticky="we")
+        tk.Button(control_frame,text="Apply Paths",command=self.apply_paths).grid(row=3,column=0,columnspan=2,sticky="we")
         hw_frame=tk.Frame(self.root)
         hw_frame.pack(side="top",fill="x")
         tk.Label(hw_frame,text="Device").grid(row=0,column=0,sticky="w")
@@ -430,9 +489,18 @@ class BotUI:
         tk.Label(hw_frame,textvariable=self.vars["hw"]).grid(row=1,column=1,sticky="w")
         self.update_loop()
     def start_bot(self):
+        self.apply_paths()
         self.controller.start()
     def stop_bot(self):
         self.controller.stop()
+    def apply_paths(self):
+        adb_path=self.vars["adb"].get()
+        dnplayer_path=self.vars["dnplayer"].get()
+        if os.path.exists(adb_path):
+            self.controller.update_paths(adb_path,dnplayer_path)
+            with self.shared.lock:
+                self.shared.adb_path=adb_path
+                self.shared.dnplayer_path=dnplayer_path
     def update_loop(self):
         with self.shared.lock:
             self.vars["kills"].set(str(self.shared.kills))
@@ -458,15 +526,34 @@ class BotUI:
     def run(self):
         self.root.mainloop()
 
+def adaptive_hyperparams(hw,device):
+    cpu=hw.get("cpu_count",4) if isinstance(hw,dict) else 4
+    mem=hw.get("memory_gb",4) if isinstance(hw,dict) else 4
+    gpu_mem=hw.get("cuda_total_mem_mb",0) if isinstance(hw,dict) else 0
+    hidden=256 if gpu_mem and gpu_mem>6144 else (192 if cpu>=8 else 96)
+    batch=128 if gpu_mem and gpu_mem>8192 else (96 if cpu>=8 else 48)
+    buffer=30000 if mem and mem>12 else (20000 if mem and mem>8 else 12000)
+    lr=1e-4 if gpu_mem and gpu_mem>0 else 3e-4
+    target_sync=800 if device=="cuda" else 1200
+    epsilon_decay=80000 if gpu_mem and gpu_mem>0 else 60000
+    return {
+        "hidden_dim":hidden,
+        "batch_size":batch,
+        "buffer_size":buffer,
+        "lr":lr,
+        "target_sync":target_sync,
+        "epsilon_decay":epsilon_decay
+    }
+
 def main():
     shared=SharedState()
     hw=hardware_profile()
     device="cuda" if torch.cuda.is_available() else "cpu"
     shared.device=device
     shared.hw_profile=hw
-    hidden_dim=128 if device=="cuda" else 64
-    agent=DeepRLAgent(device,hidden_dim=hidden_dim)
-    controller=BotController(shared,agent)
+    params=adaptive_hyperparams(hw,device)
+    agent=DeepRLAgent(device,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"])
+    controller=BotController(shared,agent,shared.adb_path,shared.dnplayer_path)
     ui=BotUI(shared,controller)
     ui.run()
 
