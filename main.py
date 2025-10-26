@@ -819,6 +819,20 @@ class ModeManager:
                     self.recorder.record_frame(self.current_mode,frame)
                     metrics=self.controller.game.get_metrics(frame,update_prev=False)
                     self.recorder.record_metrics(self.current_mode,metrics)
+                    if metrics:
+                        with self.shared.lock:
+                            self.shared.A=metrics.get("A",self.shared.A)
+                            self.shared.B=metrics.get("B",self.shared.B)
+                            self.shared.C=metrics.get("C",self.shared.C)
+                            self.shared.alive=metrics.get("alive",self.shared.alive)
+                            self.shared.cd1=metrics.get("cd1",self.shared.cd1)
+                            self.shared.cd2=metrics.get("cd2",self.shared.cd2)
+                            self.shared.cd3=metrics.get("cd3",self.shared.cd3)
+                            self.shared.cd_item=metrics.get("cd_item",self.shared.cd_item)
+                            self.shared.cd_heal=metrics.get("cd_heal",self.shared.cd_heal)
+                            self.shared.cd_flash=metrics.get("cd_flash",self.shared.cd_flash)
+                            self.shared.recalling=metrics.get("recalling",self.shared.recalling)
+                            self.shared.running=self.current_mode=="训练"
                 self.last_frame=now
             time.sleep(max(0.1,interval*0.5))
 class GameInterface:
@@ -1539,6 +1553,7 @@ class BotUI:
         self.vars["aaa"].set(self.shared.config["路径"]["AAA"])
         self.vars["opt"].set(self.shared.optimize_text)
         self.progress_var=tk.DoubleVar(value=0.0)
+        self.progress_text=tk.StringVar(value="0.0%")
         self.build_ui()
         self.update_loop()
     def build_ui(self):
@@ -1559,7 +1574,8 @@ class BotUI:
         tk.Entry(control_frame,textvariable=self.vars["dn"],width=48).grid(row=2,column=1,columnspan=2,sticky="we")
         tk.Label(control_frame,text="AAA").grid(row=3,column=0,sticky="w")
         tk.Entry(control_frame,textvariable=self.vars["aaa"],width=48).grid(row=3,column=1,columnspan=2,sticky="we")
-        ttk.Progressbar(control_frame,variable=self.progress_var,maximum=100.0,length=240).grid(row=4,column=0,columnspan=3,sticky="we")
+        ttk.Progressbar(control_frame,variable=self.progress_var,maximum=100.0,length=240).grid(row=4,column=0,columnspan=2,sticky="we")
+        tk.Label(control_frame,textvariable=self.progress_text,width=8,anchor="e").grid(row=4,column=2,sticky="e")
         tk.Button(control_frame,text="应用路径",command=self.apply_paths).grid(row=5,column=0,columnspan=3,sticky="we")
     def start_bot(self):
         self.apply_paths()
@@ -1582,6 +1598,7 @@ class BotUI:
             self.shared.optimize_progress=0.0
         self.vars["opt"].set(self.shared.optimize_text)
         self.progress_var.set(0.0)
+        self.progress_text.set("0.0%")
     def apply_paths(self):
         adb_path=self.vars["adb"].get()
         dn_path=self.vars["dn"].get()
@@ -1625,6 +1642,7 @@ class BotUI:
             self.vars["hw"].set(hw_desc)
             self.vars["opt"].set(self.shared.optimize_text)
             self.progress_var.set(self.shared.optimize_progress*100.0)
+            self.progress_text.set("{:.1f}%".format(self.shared.optimize_progress*100.0))
         self.root.after(500,self.update_loop)
     def run(self):
         self.root.mainloop()
