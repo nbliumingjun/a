@@ -1128,9 +1128,9 @@ class BotController:
                 self.shared.cd_item=metrics_curr["cd_item"]
                 self.shared.cd_heal=metrics_curr["cd_heal"]
                 self.shared.cd_flash=metrics_curr["cd_flash"]
-            self.shared.cd_recall=metrics_curr["cd_recall"]
-            self.shared.epsilon=eps
-            self.shared.running=True
+                self.shared.cd_recall=metrics_curr["cd_recall"]
+                self.shared.epsilon=eps
+                self.shared.running=True
         metrics_prev=metrics_curr
         obs_prev=obs_curr
 class OptimizationManager:
@@ -1184,7 +1184,7 @@ class BotUI:
         self.mode_manager=mode_manager
         self.optimizer=optimizer
         self.root=tk.Tk()
-        self.root.title("AI强化学习深度学习控制面板")
+        self.root.title("AI强化学习深度学习自适应类脑智能正则化控制面板")
         self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall","epsilon","status","device","hw","adb","dn","aaa","opt"]}
         self.vars["adb"].set(self.shared.config["路径"]["ADB"])
         self.vars["dn"].set(self.shared.config["路径"]["模拟器"])
