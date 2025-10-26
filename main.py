@@ -1,5 +1,5 @@
-import os, subprocess, io, threading, time, random, math, platform
-from collections import deque, namedtuple
+import os,subprocess,io,threading,time,random,math,platform,json
+from collections import deque,namedtuple
 from dataclasses import dataclass
 try:
     import psutil
@@ -17,13 +17,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import tkinter as tk
-
 class SharedState:
     def __init__(self):
         self.lock=threading.Lock()
-        self.kills=0
-        self.deaths=0
-        self.assists=0
+        self.A=0
+        self.B=0
+        self.C=0
         self.alive=0
         self.cd1=0
         self.cd2=0
@@ -35,54 +34,93 @@ class SharedState:
         self.hw_profile={}
         self.adb_path="D:\\LDPlayer9\\adb.exe"
         self.dnplayer_path="D:\\LDPlayer9\\dnplayer.exe"
-
-def hardware_profile():
-    profile={}
-    profile["platform"]=platform.platform()
-    if 'psutil' in globals() and psutil:
-        profile["cpu_count"]=psutil.cpu_count(logical=True)
-        profile["memory_gb"]=round(psutil.virtual_memory().total/(1024**3),2)
-    else:
-        profile["cpu_count"]=os.cpu_count()
-        profile["memory_gb"]=None
-    gpus=[]
-    if 'GPUtil' in globals() and GPUtil:
+        self.aaa_dir=os.path.join(os.path.expanduser("~"),"Desktop","AAA")
+        self.reward_weights={"kills":3.0,"assists":2.0,"deaths":-4.0}
+        self.base_dir=""
+class AIModelHub:
+    def __init__(self,aaa_dir,device,dtype):
+        self.aaa_dir=aaa_dir
+        self.device=device
+        self.dtype=dtype
+        self.skill1_model=None
+        self.skill2_model=None
+        self.skill3_model=None
+        self.move_model=None
+        self.attack_model=None
+        self.recall_model=None
+        self.vision_model=None
+        self.models_raw={}
+        self.load_models()
+    def safe_load(self,path):
         try:
-            g_list=GPUtil.getGPUs()
-            for g in g_list:
-                gpus.append({"name":g.name,"memory_total_mb":g.memoryTotal})
+            obj=torch.load(path,map_location=self.device)
+            if isinstance(obj,nn.Module):
+                try:
+                    obj.to(self.device)
+                    try:
+                        obj.to(self.dtype)
+                    except:
+                        pass
+                    obj.eval()
+                except:
+                    pass
+            return obj
         except:
-            gpus=[]
-    profile["gpus"]=gpus
-    if torch.cuda.is_available():
-        profile["cuda_gpu"]=torch.cuda.get_device_name(0)
-        profile["cuda_total_mem_mb"]=round(torch.cuda.get_device_properties(0).total_memory/(1024**2),2)
-    else:
-        profile["cuda_gpu"]=None
-        profile["cuda_total_mem_mb"]=None
-    return profile
+            return None
+    def load_models(self):
+        if not os.path.isdir(self.aaa_dir):
+            return
+        m1=os.path.join(self.aaa_dir,"skill1_model.pt")
+        m2=os.path.join(self.aaa_dir,"skill2_model.pt")
+        m3=os.path.join(self.aaa_dir,"skill3_model.pt")
+        mm=os.path.join(self.aaa_dir,"move_model.pt")
+        ma=os.path.join(self.aaa_dir,"attack_model.pt")
+        mr=os.path.join(self.aaa_dir,"recall_model.pt")
+        mv=os.path.join(self.aaa_dir,"vision_model.pt")
+        if os.path.isfile(m1):
+            self.skill1_model=self.safe_load(m1)
+        if os.path.isfile(m2):
+            self.skill2_model=self.safe_load(m2)
+        if os.path.isfile(m3):
+            self.skill3_model=self.safe_load(m3)
+        if os.path.isfile(mm):
+            self.move_model=self.safe_load(mm)
+        if os.path.isfile(ma):
+            self.attack_model=self.safe_load(ma)
+        if os.path.isfile(mr):
+            self.recall_model=self.safe_load(mr)
+        if os.path.isfile(mv):
+            self.vision_model=self.safe_load(mv)
+        for f in glob.glob(os.path.join(self.aaa_dir,"*.pt"))+glob.glob(os.path.join(self.aaa_dir,"*.pth")):
+            k=os.path.basename(f)
+            if k not in self.models_raw:
+                self.models_raw[k]=self.safe_load(f)
 
 class QNetwork(nn.Module):
-    def __init__(self,input_dim,output_dim,hidden_dim):
+    def __init__(self,input_dim,output_dim,hidden_dim,dtype):
         super().__init__()
         self.fc1=nn.Linear(input_dim,hidden_dim)
         self.bn1=nn.LayerNorm(hidden_dim)
         self.fc2=nn.Linear(hidden_dim,hidden_dim)
         self.bn2=nn.LayerNorm(hidden_dim)
         self.fc3=nn.Linear(hidden_dim,output_dim)
+        self.dtype_used=dtype
+        self.to(dtype)
     def forward(self,x):
+        x=x.to(self.dtype_used)
         x=torch.relu(self.bn1(self.fc1(x)))
         x=torch.relu(self.bn2(self.fc2(x)))
         x=self.fc3(x)
         return x
 
 class DeepRLAgent:
-    def __init__(self,device,hidden_dim=128,buffer_size=10000,batch_size=64,gamma=0.99,lr=1e-4,target_sync=1000,epsilon_decay=50000):
+    def __init__(self,device,dtype,hidden_dim=128,buffer_size=10000,batch_size=64,gamma=0.99,lr=1e-4,target_sync=1000,epsilon_decay=50000,experience_dir=None):
         self.device=device
+        self.dtype=dtype
         self.obs_dim=8
         self.action_dim=11
-        self.policy_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim).to(self.device)
-        self.target_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim).to(self.device)
+        self.policy_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim,self.dtype).to(self.device)
+        self.target_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim,self.dtype).to(self.device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
         self.optimizer=optim.Adam(self.policy_net.parameters(),lr=lr)
@@ -95,6 +133,9 @@ class DeepRLAgent:
         self.epsilon_start=1.0
         self.epsilon_end=0.1
         self.epsilon_decay=epsilon_decay
+        self.experience_dir=experience_dir
+        self.last_save_step=0
+        self.load_experience()
     def epsilon(self):
         return self.epsilon_end+(self.epsilon_start-self.epsilon_end)*math.exp(-1.0*self.step_count/self.epsilon_decay)
     def select_action(self,obs_vec):
@@ -110,6 +151,7 @@ class DeepRLAgent:
         self.replay_buffer.append(self.Transition(state,action,reward,next_state,done))
     def train_step(self):
         if len(self.replay_buffer)<self.batch_size:
+            self.step_count+=1
             return
         batch=random.sample(self.replay_buffer,self.batch_size)
         state_batch=torch.tensor([b.state for b in batch],dtype=torch.float32,device=self.device)
@@ -122,7 +164,7 @@ class DeepRLAgent:
             next_actions=torch.argmax(self.policy_net(next_state_batch),dim=1,keepdim=True)
             next_q=self.target_net(next_state_batch).gather(1,next_actions)
             target_q=reward_batch+self.gamma*(1.0-done_batch)*next_q
-        loss=nn.functional.smooth_l1_loss(q_values,target_q)
+        loss=nn.functional.smooth_l1_loss(q_values.to(target_q.dtype),target_q)
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.policy_net.parameters(),10.0)
@@ -130,6 +172,52 @@ class DeepRLAgent:
         self.step_count+=1
         if self.step_count%self.target_sync==0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
+        if self.experience_dir is not None and self.step_count-self.last_save_step>=500:
+            self.save_experience()
+            self.last_save_step=self.step_count
+    def save_experience(self):
+        try:
+            if not os.path.isdir(self.experience_dir):
+                os.makedirs(self.experience_dir,exist_ok=True)
+            buf_states=[]
+            buf_actions=[]
+            buf_rewards=[]
+            buf_next=[]
+            buf_done=[]
+            for t in self.replay_buffer:
+                buf_states.append(t.state)
+                buf_actions.append(t.action)
+                buf_rewards.append(t.reward)
+                buf_next.append(t.next_state)
+                buf_done.append(t.done)
+            data={"state":np.array(buf_states,dtype=np.float32),"action":np.array(buf_actions,dtype=np.int64),"reward":np.array(buf_rewards,dtype=np.float32),"next_state":np.array(buf_next,dtype=np.float32),"done":np.array(buf_done,dtype=np.int8),"step":self.step_count}
+            path=os.path.join(self.experience_dir,"buffer.npz")
+            np.savez_compressed(path,**data)
+            weights_path=os.path.join(self.experience_dir,"policy.pt")
+            torch.save(self.policy_net.state_dict(),weights_path)
+        except:
+            pass
+    def load_experience(self):
+        try:
+            if self.experience_dir is None:
+                return
+            path=os.path.join(self.experience_dir,"buffer.npz")
+            if os.path.isfile(path):
+                loaded=np.load(path,allow_pickle=True)
+                st=loaded["state"]
+                ac=loaded["action"]
+                rw=loaded["reward"]
+                ns=loaded["next_state"]
+                dn=loaded["done"]
+                for i in range(len(st)):
+                    self.replay_buffer.append(self.Transition(st[i].tolist(),int(ac[i]),float(rw[i]),ns[i].tolist(),bool(dn[i])))
+            weights_path=os.path.join(self.experience_dir,"policy.pt")
+            if os.path.isfile(weights_path):
+                sd=torch.load(weights_path,map_location=self.device)
+                self.policy_net.load_state_dict(sd,strict=False)
+                self.target_net.load_state_dict(self.policy_net.state_dict())
+        except:
+            pass
 
 @dataclass
 class CircleRegion:
@@ -145,8 +233,9 @@ class RectRegion:
     h:int
 
 class VisionModule:
-    def __init__(self):
+    def __init__(self,aihub):
         self.prev_ready={}
+        self.aihub=aihub
     def crop_cv(self,pil_img,x,y,w,h,scale_x,scale_y):
         sx=int(x*scale_x)
         sy=int(y*scale_y)
@@ -158,28 +247,25 @@ class VisionModule:
         ey=min(pil_img.height,sy+sh)
         crop_pil=pil_img.crop((sx,sy,ex,ey))
         return cv2.cvtColor(np.array(crop_pil),cv2.COLOR_RGB2BGR)
-    def region_brightness(self,cv_img):
-        gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
-        return float(np.mean(gray))
-    def hsv_stats(self,cv_img):
+    def region_stats(self,cv_img):
         hsv=cv2.cvtColor(cv_img,cv2.COLOR_BGR2HSV)
-        mean=np.mean(hsv[:,:,2])
-        sat=np.mean(hsv[:,:,1])
-        std=np.std(hsv[:,:,2])
-        return mean,sat,std
+        mean_v=float(np.mean(hsv[:,:,2]))
+        mean_s=float(np.mean(hsv[:,:,1]))
+        std_v=float(np.std(hsv[:,:,2]))
+        return mean_v,mean_s,std_v
     def cooldown_ready(self,key,cv_img):
-        mean,sat,std=self.hsv_stats(cv_img)
-        bright=mean>110
-        saturated=sat>60
-        stable=std<55
-        ready=1 if bright and saturated and stable else 0
+        mean_v,mean_s,std_v=self.region_stats(cv_img)
+        bright=mean_v>110
+        saturated=mean_s>60
+        stable=std_v<55
+        ready=1 if (bright and saturated and stable) else 0
         if key in self.prev_ready:
             ready=max(ready,self.prev_ready[key]*0.5)
         self.prev_ready[key]=ready
         return ready
     def alive_state(self,cv_img):
-        mean,sat,std=self.hsv_stats(cv_img)
-        return 1 if mean>90 and sat>50 else 0
+        mean_v,mean_s,std_v=self.region_stats(cv_img)
+        return 1 if (mean_v>90 and mean_s>50) else 0
     def ocr_digits(self,cv_img):
         gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
         _,th=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -193,13 +279,13 @@ class VisionModule:
             return 0
 
 class GameInterface:
-    def __init__(self,adb_path,base_w=2560,base_h=1600):
+    def __init__(self,adb_path,base_w=2560,base_h=1600,aihub=None):
         self.adb_path=adb_path
         self.base_w=base_w
         self.base_h=base_h
         self.screen_w=base_w
         self.screen_h=base_h
-        self.vision=VisionModule()
+        self.vision=VisionModule(aihub)
         self.last_screenshot=None
         self.coords={
             "joystick":CircleRegion(166,915,536),
@@ -213,12 +299,12 @@ class GameInterface:
             "attack_min":CircleRegion(1915,1296,123),
             "attack_tower":CircleRegion(2241,1014,123),
             "active_item":CircleRegion(2092,544,161),
-            "kills_box":RectRegion(1904,122,56,56),
-            "deaths_box":RectRegion(1996,122,56,56),
-            "assists_box":RectRegion(2087,122,56,56),
+            "A_box":RectRegion(1904,122,56,56),
+            "B_box":RectRegion(1996,122,56,56),
+            "C_box":RectRegion(2087,122,56,56),
             "minimap_box":RectRegion(0,72,453,453)
         }
-        self.prev_metrics={"kills":0,"deaths":0,"assists":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0}
+        self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0}
     def adb_tap(self,x,y):
         try:
             subprocess.call([self.adb_path,"shell","input","tap",str(int(x)),str(int(y))])
@@ -248,7 +334,7 @@ class GameInterface:
         cx,cy=self.circle_center(tlx,tly,d)
         sx,sy=self.scaled_xy(cx,cy)
         self.adb_tap(sx,sy)
-    def random_move(self):
+    def joystick_move_random(self):
         c=self.coords["joystick"]
         cx,cy=self.circle_center(c.x,c.y,c.d)
         r=c.d/2.0*0.8
@@ -258,10 +344,10 @@ class GameInterface:
         sx,sy=self.scaled_xy(cx,cy)
         exs,eys=self.scaled_xy(ex,ey)
         self.adb_swipe(sx,sy,exs,eys,200)
-    def attack_minion(self):
+    def basic_attack_minion(self):
         c=self.coords["attack_min"]
         self.tap_circle(c.x,c.y,c.d)
-    def attack_tower(self):
+    def basic_attack_tower(self):
         c=self.coords["attack_tower"]
         self.tap_circle(c.x,c.y,c.d)
     def cast_skill(self,key):
@@ -276,6 +362,7 @@ class GameInterface:
     def recall(self):
         c=self.coords["recall"]
         self.tap_circle(c.x,c.y,c.d)
+        time.sleep(8.0)
     def flash_forward(self):
         c=self.coords["flash"]
         cx,cy=self.circle_center(c.x,c.y,c.d)
@@ -298,56 +385,56 @@ class GameInterface:
         def crop_rect_box(box_key):
             r=self.coords[box_key]
             return v.crop_cv(img,r.x,r.y,r.w,r.h,scale_x,scale_y)
-        kills_img=crop_rect_box("kills_box")
-        deaths_img=crop_rect_box("deaths_box")
-        assists_img=crop_rect_box("assists_box")
+        A_img=crop_rect_box("A_box")
+        B_img=crop_rect_box("B_box")
+        C_img=crop_rect_box("C_box")
         skill1_img=crop_circle_box("skill1")
         skill2_img=crop_circle_box("skill2")
         skill3_img=crop_circle_box("skill3")
         item_img=crop_circle_box("active_item")
         attack_img=crop_circle_box("attack_min")
-        kills_val=v.ocr_digits(kills_img)
-        deaths_val=v.ocr_digits(deaths_img)
-        assists_val=v.ocr_digits(assists_img)
+        A_val=v.ocr_digits(A_img)
+        B_val=v.ocr_digits(B_img)
+        C_val=v.ocr_digits(C_img)
         cd1=v.cooldown_ready("skill1",skill1_img)
         cd2=v.cooldown_ready("skill2",skill2_img)
         cd3=v.cooldown_ready("skill3",skill3_img)
         cd_item=v.cooldown_ready("item",item_img)
         alive=v.alive_state(attack_img)
-        metrics={"kills":kills_val,"deaths":deaths_val,"assists":assists_val,"alive":alive,"cd1":cd1,"cd2":cd2,"cd3":cd3,"cd_item":cd_item}
+        metrics={"A":A_val,"B":B_val,"C":C_val,"alive":alive,"cd1":cd1,"cd2":cd2,"cd3":cd3,"cd_item":cd_item}
         self.prev_metrics=metrics
         return metrics
     def metrics_to_obs(self,m):
-        kills=min(m["kills"],20)/20.0
-        deaths=min(m["deaths"],20)/20.0
-        assists=min(m["assists"],20)/20.0
+        A_norm=min(m["A"],20)/20.0
+        B_norm=min(m["B"],20)/20.0
+        C_norm=min(m["C"],20)/20.0
         alive=float(m["alive"])
         cd1=float(m["cd1"])
         cd2=float(m["cd2"])
         cd3=float(m["cd3"])
         cd_item=float(m["cd_item"])
-        obs=[kills,deaths,assists,alive,cd1,cd2,cd3,cd_item]
+        obs=[A_norm,B_norm,C_norm,alive,cd1,cd2,cd3,cd_item]
         return obs
     def compute_reward(self,prev_metrics,curr_metrics):
-        dk=curr_metrics["kills"]-prev_metrics["kills"]
-        da=curr_metrics["assists"]-prev_metrics["assists"]
-        dd=curr_metrics["deaths"]-prev_metrics["deaths"]
-        r=3.0*dk+2.0*da-4.0*dd
+        dA=curr_metrics["A"]-prev_metrics["A"]
+        dC=curr_metrics["C"]-prev_metrics["C"]
+        dB=curr_metrics["B"]-prev_metrics["B"]
+        r=3.0*dA+2.0*dC-4.0*dB
         return float(r)
     def execute_action(self,action_idx,metrics_prev):
         if action_idx==0:
             return
         if action_idx==1:
             if metrics_prev["alive"]==1:
-                self.random_move()
+                self.joystick_move_random()
             return
         if action_idx==2:
             if metrics_prev["alive"]==1:
-                self.attack_minion()
+                self.basic_attack_minion()
             return
         if action_idx==3:
             if metrics_prev["alive"]==1:
-                self.attack_tower()
+                self.basic_attack_tower()
             return
         if action_idx==4:
             if metrics_prev["alive"]==1 and metrics_prev["cd1"]==1:
@@ -379,18 +466,19 @@ class GameInterface:
             return
 
 class BotController:
-    def __init__(self,shared,agent,adb_path="D:\\LDPlayer9\\adb.exe",dnplayer_path="D:\\LDPlayer9\\dnplayer.exe"):
+    def __init__(self,shared,agent,aihub):
         self.shared=shared
         self.agent=agent
-        self.adb_path=adb_path
-        self.dnplayer_path=dnplayer_path
-        self.game=GameInterface(self.adb_path)
+        self.aihub=aihub
+        self.adb_path=shared.adb_path
+        self.dnplayer_path=shared.dnplayer_path
+        self.game=GameInterface(self.adb_path,aihub=self.aihub)
         self.running_event=threading.Event()
         self.thread=None
     def update_paths(self,adb_path,dnplayer_path):
         self.adb_path=adb_path
         self.dnplayer_path=dnplayer_path
-        self.game=GameInterface(self.adb_path)
+        self.game=GameInterface(self.adb_path,aihub=self.aihub)
     def start(self):
         if self.running_event.is_set():
             return
@@ -414,9 +502,9 @@ class BotController:
             self.agent.store(obs_prev,action,reward,obs_curr,False)
             self.agent.train_step()
             with self.shared.lock:
-                self.shared.kills=metrics_curr["kills"]
-                self.shared.deaths=metrics_curr["deaths"]
-                self.shared.assists=metrics_curr["assists"]
+                self.shared.A=metrics_curr["A"]
+                self.shared.B=metrics_curr["B"]
+                self.shared.C=metrics_curr["C"]
                 self.shared.alive=metrics_curr["alive"]
                 self.shared.cd1=metrics_curr["cd1"]
                 self.shared.cd2=metrics_curr["cd2"]
@@ -436,9 +524,9 @@ class BotUI:
         self.root=tk.Tk()
         self.root.title("AI 强化学习 深度学习 控制面板")
         self.vars={}
-        self.vars["kills"]=tk.StringVar()
-        self.vars["deaths"]=tk.StringVar()
-        self.vars["assists"]=tk.StringVar()
+        self.vars["A"]=tk.StringVar()
+        self.vars["B"]=tk.StringVar()
+        self.vars["C"]=tk.StringVar()
         self.vars["alive"]=tk.StringVar()
         self.vars["cd1"]=tk.StringVar()
         self.vars["cd2"]=tk.StringVar()
@@ -450,23 +538,24 @@ class BotUI:
         self.vars["hw"]=tk.StringVar()
         self.vars["adb"]=tk.StringVar(value=self.shared.adb_path)
         self.vars["dnplayer"]=tk.StringVar(value=self.shared.dnplayer_path)
+        self.vars["aaa"]=tk.StringVar(value=self.shared.aaa_dir)
         frame_state=tk.Frame(self.root)
         frame_state.pack(side="top",fill="x")
-        tk.Label(frame_state,text="Kills").grid(row=0,column=0,sticky="w")
-        tk.Label(frame_state,textvariable=self.vars["kills"]).grid(row=0,column=1,sticky="w")
-        tk.Label(frame_state,text="Deaths").grid(row=1,column=0,sticky="w")
-        tk.Label(frame_state,textvariable=self.vars["deaths"]).grid(row=1,column=1,sticky="w")
-        tk.Label(frame_state,text="Assists").grid(row=2,column=0,sticky="w")
-        tk.Label(frame_state,textvariable=self.vars["assists"]).grid(row=2,column=1,sticky="w")
+        tk.Label(frame_state,text="A").grid(row=0,column=0,sticky="w")
+        tk.Label(frame_state,textvariable=self.vars["A"]).grid(row=0,column=1,sticky="w")
+        tk.Label(frame_state,text="B").grid(row=1,column=0,sticky="w")
+        tk.Label(frame_state,textvariable=self.vars["B"]).grid(row=1,column=1,sticky="w")
+        tk.Label(frame_state,text="C").grid(row=2,column=0,sticky="w")
+        tk.Label(frame_state,textvariable=self.vars["C"]).grid(row=2,column=1,sticky="w")
         tk.Label(frame_state,text="Alive").grid(row=3,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["alive"]).grid(row=3,column=1,sticky="w")
-        tk.Label(frame_state,text="Skill1 Ready").grid(row=4,column=0,sticky="w")
+        tk.Label(frame_state,text="Skill1").grid(row=4,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["cd1"]).grid(row=4,column=1,sticky="w")
-        tk.Label(frame_state,text="Skill2 Ready").grid(row=5,column=0,sticky="w")
+        tk.Label(frame_state,text="Skill2").grid(row=5,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["cd2"]).grid(row=5,column=1,sticky="w")
-        tk.Label(frame_state,text="Skill3 Ready").grid(row=6,column=0,sticky="w")
+        tk.Label(frame_state,text="Skill3").grid(row=6,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["cd3"]).grid(row=6,column=1,sticky="w")
-        tk.Label(frame_state,text="Item Ready").grid(row=7,column=0,sticky="w")
+        tk.Label(frame_state,text="Item").grid(row=7,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["cd_item"]).grid(row=7,column=1,sticky="w")
         tk.Label(frame_state,text="ε").grid(row=8,column=0,sticky="w")
         tk.Label(frame_state,textvariable=self.vars["epsilon"]).grid(row=8,column=1,sticky="w")
@@ -477,10 +566,12 @@ class BotUI:
         tk.Button(control_frame,text="Start AI",command=self.start_bot).grid(row=0,column=0,sticky="we")
         tk.Button(control_frame,text="Stop AI",command=self.stop_bot).grid(row=0,column=1,sticky="we")
         tk.Label(control_frame,text="ADB").grid(row=1,column=0,sticky="w")
-        tk.Entry(control_frame,textvariable=self.vars["adb"],width=40).grid(row=1,column=1,sticky="we")
+        tk.Entry(control_frame,textvariable=self.vars["adb"],width=48).grid(row=1,column=1,sticky="we")
         tk.Label(control_frame,text="dnplayer").grid(row=2,column=0,sticky="w")
-        tk.Entry(control_frame,textvariable=self.vars["dnplayer"],width=40).grid(row=2,column=1,sticky="we")
-        tk.Button(control_frame,text="Apply Paths",command=self.apply_paths).grid(row=3,column=0,columnspan=2,sticky="we")
+        tk.Entry(control_frame,textvariable=self.vars["dnplayer"],width=48).grid(row=2,column=1,sticky="we")
+        tk.Label(control_frame,text="AAA").grid(row=3,column=0,sticky="w")
+        tk.Entry(control_frame,textvariable=self.vars["aaa"],width=48).grid(row=3,column=1,sticky="we")
+        tk.Button(control_frame,text="Apply Paths",command=self.apply_paths).grid(row=4,column=0,columnspan=2,sticky="we")
         hw_frame=tk.Frame(self.root)
         hw_frame.pack(side="top",fill="x")
         tk.Label(hw_frame,text="Device").grid(row=0,column=0,sticky="w")
@@ -496,16 +587,20 @@ class BotUI:
     def apply_paths(self):
         adb_path=self.vars["adb"].get()
         dnplayer_path=self.vars["dnplayer"].get()
+        aaa_path=self.vars["aaa"].get()
         if os.path.exists(adb_path):
             self.controller.update_paths(adb_path,dnplayer_path)
             with self.shared.lock:
                 self.shared.adb_path=adb_path
                 self.shared.dnplayer_path=dnplayer_path
+        if os.path.isdir(aaa_path):
+            with self.shared.lock:
+                self.shared.aaa_dir=aaa_path
     def update_loop(self):
         with self.shared.lock:
-            self.vars["kills"].set(str(self.shared.kills))
-            self.vars["deaths"].set(str(self.shared.deaths))
-            self.vars["assists"].set(str(self.shared.assists))
+            self.vars["A"].set(str(self.shared.A))
+            self.vars["B"].set(str(self.shared.B))
+            self.vars["C"].set(str(self.shared.C))
             self.vars["alive"].set("Yes" if self.shared.alive==1 else "No")
             self.vars["cd1"].set("Ready" if self.shared.cd1==1 else "CD")
             self.vars["cd2"].set("Ready" if self.shared.cd2==1 else "CD")
@@ -516,11 +611,11 @@ class BotUI:
             self.vars["device"].set(self.shared.device)
             hw_text=""
             if "cpu_count" in self.shared.hw_profile:
-                hw_text+="CPU:"+str(self.shared.hw_profile["cpu_count"])+" "
+                hw_text+=f"CPU:{self.shared.hw_profile['cpu_count']} "
             if "memory_gb" in self.shared.hw_profile and self.shared.hw_profile["memory_gb"] is not None:
-                hw_text+="RAM:"+str(self.shared.hw_profile["memory_gb"])+"GB "
+                hw_text+=f"RAM:{self.shared.hw_profile['memory_gb']}GB "
             if "cuda_gpu" in self.shared.hw_profile and self.shared.hw_profile["cuda_gpu"]:
-                hw_text+="GPU:"+self.shared.hw_profile["cuda_gpu"]
+                hw_text+=f"GPU:{self.shared.hw_profile['cuda_gpu']}"
             self.vars["hw"].set(hw_text)
         self.root.after(500,self.update_loop)
     def run(self):
@@ -536,24 +631,24 @@ def adaptive_hyperparams(hw,device):
     lr=1e-4 if gpu_mem and gpu_mem>0 else 3e-4
     target_sync=800 if device=="cuda" else 1200
     epsilon_decay=80000 if gpu_mem and gpu_mem>0 else 60000
-    return {
-        "hidden_dim":hidden,
-        "batch_size":batch,
-        "buffer_size":buffer,
-        "lr":lr,
-        "target_sync":target_sync,
-        "epsilon_decay":epsilon_decay
-    }
+    return {"hidden_dim":hidden,"batch_size":batch,"buffer_size":buffer,"lr":lr,"target_sync":target_sync,"epsilon_decay":epsilon_decay}
 
 def main():
     shared=SharedState()
     hw=hardware_profile()
     device="cuda" if torch.cuda.is_available() else "cpu"
+    gpu_mem=None
+    if hw.get("cuda_total_mem_mb",None) is not None:
+        gpu_mem=hw["cuda_total_mem_mb"]
+    dtype=torch.float16 if device=="cuda" and gpu_mem and gpu_mem>8192 else torch.float32
     shared.device=device
     shared.hw_profile=hw
     params=adaptive_hyperparams(hw,device)
-    agent=DeepRLAgent(device,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"])
-    controller=BotController(shared,agent,shared.adb_path,shared.dnplayer_path)
+    aaa_dir=shared.aaa_dir
+    experience_dir=os.path.join(aaa_dir,"experience")
+    agent=DeepRLAgent(device,dtype,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir)
+    aihub=AIModelHub(aaa_dir,device,dtype)
+    controller=BotController(shared,agent,aihub)
     ui=BotUI(shared,controller)
     ui.run()
 
