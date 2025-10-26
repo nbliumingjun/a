@@ -100,7 +100,7 @@ def default_config(base_dir):
     idle_switch=max(10.0,reward_window*base_interval*0.5)
     learn_sample=max(base_interval,base_interval*2.0)
     train_sample=max(base_interval,base_interval*1.5)
-    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":base_interval,"拖动耗时":base_interval,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"模式":{"学习静默阈值":idle_switch,"学习采样间隔":learn_sample,"训练采样间隔":train_sample},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":5.0,"C":3.0,"B":-4.0},"动作":{"循环间隔":base_interval,"拖动耗时":base_interval,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":lr,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000,"权重衰减":lr*0.1,"奖励平滑窗口":reward_window,"奖励调节":reward_gain,"价值正则":value_reg},"模式":{"学习静默阈值":idle_switch,"学习采样间隔":learn_sample,"训练采样间隔":train_sample},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -1248,6 +1248,15 @@ class GameInterface:
         boost_A=max(dA,0.0)*weights["A"]*(1.0+gain*np.clip(trend_A,-1.0,1.0))
         boost_C=max(dC,0.0)*weights["C"]*(1.0+gain*np.clip(trend_C,-1.0,1.0))
         penalty=max(dB,0.0)*abs(weights["B"])*(1.0+gain*np.clip(max(0.0,trend_B),0.0,1.5))
+        priority_scale=1.0+max(0.0,trend_A)
+        boost_A*=priority_scale
+        c_scale=0.6+0.4*max(0.0,trend_C)
+        boost_C*=c_scale
+        penalty_scale=0.8+0.2*max(0.0,trend_B)
+        penalty*=penalty_scale
+        if boost_A>0.0:
+            dominance=max(1.0,abs(weights["A"])/(abs(weights["B"])+1e-6))
+            penalty=min(penalty,boost_A*dominance)
         reward=boost_A+boost_C-penalty
         if curr_metrics.get("alive",0)==0 and prev_metrics.get("alive",1)==1:
             reward-=abs(weights["B"])*(1.0+gain)
