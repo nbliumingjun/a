@@ -609,26 +609,23 @@ class ExperienceRecorder:
         self.paused=False
     def set_paused(self,value):
         self.paused=bool(value)
+    def _write_json(self,path,payload):
+        try:
+            with self.lock:
+                with open(path,"a",encoding="utf-8") as f:
+                    f.write(json.dumps(payload,ensure_ascii=False)+"\n")
+        except:
+            pass
     def record_input(self,mode,event_type,data):
         if self.paused:
             return
         payload={"t":time.time(),"mode":mode,"type":event_type,"data":data}
-        try:
-            with self.lock:
-                with open(self.input_path,"a",encoding="utf-8") as f:
-                    f.write(json.dumps(payload,ensure_ascii=False)+"\n")
-        except:
-            pass
+        self._write_json(self.input_path,payload)
     def record_metrics(self,mode,metrics):
         if self.paused:
             return
         payload={"t":time.time(),"mode":mode,"metrics":metrics}
-        try:
-            with self.lock:
-                with open(self.metric_path,"a",encoding="utf-8") as f:
-                    f.write(json.dumps(payload,ensure_ascii=False)+"\n")
-        except:
-            pass
+        self._write_json(self.metric_path,payload)
     def record_frame(self,mode,image):
         if image is None:
             return
