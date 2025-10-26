@@ -90,7 +90,7 @@ def default_config(base_dir):
     rect_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"尺寸":[float(w),float(h)],"尺寸比例":[float(w)/base_w,float(h)/base_h]} for k,(x,y,w,h) in rect_raw.items()}
     flash_offset=[150.0,0.0]
     flash_ratio=[flash_offset[0]/base_w,flash_offset[1]/base_h]
-    obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall"]
+    obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","recalling"]
     action_names=["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]
     lr=0.0003
     reward_window=max(12,len(action_names)*6)
@@ -218,7 +218,7 @@ class SharedState:
         self.cd_item=0
         self.cd_heal=0
         self.cd_flash=0
-        self.cd_recall=0
+        self.recalling=0
         self.running=False
         self.epsilon=1.0
         self.device="cpu"
@@ -452,6 +452,8 @@ class VisionModule:
     def __init__(self,config):
         self.config=config
         self.prev_ready={}
+        self.recall_ref=None
+        self.recall_trace=0.0
     def crop_cv(self,pil_img,x,y,w,h):
         sx=max(0,int(x))
         sy=max(0,int(y))
@@ -491,6 +493,106 @@ class VisionModule:
             return int(digits)
         except:
             return 0
+    def recall_signature(self,cv_img):
+        if cv_img is None or cv_img.size==0:
+            return 0.0,0.0,0.0,0.0
+        mean_v,mean_s,std_v=self.region_stats(cv_img)
+        gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
+        lap=cv2.Laplacian(gray,cv2.CV_32F)
+        energy=float(np.mean(np.abs(lap)))
+        return mean_v,mean_s,std_v,energy
+    def set_recall_baseline(self,cv_img):
+        self.recall_ref=self.recall_signature(cv_img)
+        return self.recall_ref
+    def recall_activity(self,cv_img):
+        sig=self.recall_signature(cv_img)
+        if self.recall_ref is None:
+            self.recall_ref=sig
+        base_v,base_s,base_std,base_eng=self.recall_ref
+        dv=max(0.0,base_v-sig[0])
+        ds=max(0.0,sig[1]-base_s)
+        dst=max(0.0,sig[2]-base_std)
+        de=max(0.0,sig[3]-base_eng)
+        scale=max(base_v+base_s+base_std+base_eng,1.0)
+        energy=dv*0.45+ds*0.2+dst*0.2+de*0.15
+        progress=float(np.clip(energy/(scale+energy),0.0,1.0))
+        threshold=max(0.05,0.08*(base_std+1.0)/scale)
+        active=1 if energy>scale*threshold else 0
+        if active==1:
+            self.recall_trace=self.recall_trace*0.6+progress*0.4
+        else:
+            decay=0.85
+            self.recall_ref=(base_v*decay+sig[0]*(1.0-decay),base_s*decay+sig[1]*(1.0-decay),base_std*decay+sig[2]*(1.0-decay),base_eng*decay+sig[3]*(1.0-decay))
+            self.recall_trace=self.recall_trace*0.4
+        completed=1 if active==0 and self.recall_trace>0.9 else 0
+        return active,self.recall_trace if active==1 else progress,completed
+    def hero_home(self,minimap_img):
+        if minimap_img is None or getattr(minimap_img,"size",0)==0:
+            return 0
+        h=minimap_img.shape[0]
+        w=minimap_img.shape[1]
+        size=max(6,int(min(h,w)*0.18))
+        y0=max(0,h-size)
+        x0=max(0,w-size)
+        region=minimap_img[y0:h,x0:w]
+        if region.size==0:
+            return 0
+        hsv=cv2.cvtColor(region,cv2.COLOR_BGR2HSV)
+        lower=np.array([90,40,40],dtype=np.uint8)
+        upper=np.array([140,255,255],dtype=np.uint8)
+        mask=cv2.inRange(hsv,lower,upper)
+        ratio=float(np.sum(mask>0))/mask.size
+        energy=float(np.mean(hsv[:,:,2]))/255.0
+        return 1 if ratio>0.12 and energy>0.35 else 0
+class RecallMonitor:
+    def __init__(self,config,vision):
+        self.config=config
+        self.vision=vision
+        self.active=False
+        self.start_time=0.0
+        self.status="idle"
+        self.progress=0.0
+        self.timeout=float(self.config["动作冷却"].get("回城等待",8.0))
+    def begin(self,button_img,minimap_img):
+        self.timeout=float(self.config["动作冷却"].get("回城等待",8.0))
+        self.active=True
+        self.start_time=time.time()
+        self.status="active"
+        self.progress=0.0
+        if button_img is not None:
+            self.vision.set_recall_baseline(button_img)
+        if minimap_img is not None:
+            self.last_home=self.vision.hero_home(minimap_img)
+        else:
+            self.last_home=0
+    def update(self,button_img,minimap_img):
+        if not self.active:
+            return False
+        active,progress,completed=self.vision.recall_activity(button_img)
+        home=self.vision.hero_home(minimap_img) if minimap_img is not None else 0
+        now=time.time()
+        if home==1 or completed==1:
+            self.active=False
+            self.status="completed"
+            self.progress=1.0
+            return False
+        if now-self.start_time>=self.timeout:
+            self.active=False
+            self.status="timeout"
+            self.progress=max(self.progress,progress)
+            return False
+        if active==0 and progress<0.25 and now-self.start_time>0.8:
+            self.active=False
+            self.status="interrupted"
+            self.progress=max(self.progress,progress)
+            return False
+        self.progress=max(self.progress,progress)
+        self.status="active" if active==1 else "stabilizing"
+        return True
+    def cancel(self):
+        self.active=False
+        self.status="cancelled"
+        self.progress=0.0
 class ExperienceRecorder:
     def __init__(self,config):
         self.base_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
@@ -720,9 +822,9 @@ class GameInterface:
         self.screen_h=self.scaler.screen_h
         self.vision=VisionModule(config)
         self.last_screenshot=None
-        self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall"]))
+        self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","recalling"]))
         self.metric_caps={k:float(v) for k,v in self.config.get("数值上限",{}).items()}
-        self.binary_keys={k for k in self.obs_keys if k=="alive" or k.startswith("cd")}
+        self.binary_keys={k for k in self.obs_keys if k=="alive" or k.startswith("cd") or k=="recalling"}
         self.action_order=list(self.config.get("动作名称",["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]))
         self.obs_dim=len(self.obs_keys)
         self.action_dim=len(self.action_order)
@@ -732,9 +834,9 @@ class GameInterface:
         self.circle_regions={}
         self.rect_regions={}
         self.refresh_regions()
-        self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1 and m.get("cd_recall",0)==1,"flash":lambda m:m.get("alive",0)==1 and m.get("cd_flash",0)==1}
+        self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0,"attack_minion":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0,"attack_tower":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0,"skill1":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0,"flash":lambda m:m.get("alive",0)==1 and m.get("recalling",0)==0 and m.get("cd_flash",0)==1}
         self.action_funcs={"idle":self.act_idle,"move":self.act_move,"attack_minion":self.act_attack_minion,"attack_tower":self.act_attack_tower,"skill1":self.skill_executor("skill1"),"skill2":self.skill_executor("skill2"),"skill3":self.skill_executor("skill3"),"item":self.act_item,"heal":self.act_heal,"recall":self.act_recall,"flash":self.act_flash}
-        self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0,"cd_flash":0,"cd_recall":0}
+        self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0,"cd_flash":0,"recalling":0}
         learn_conf=self.config.get("学习",{})
         window=int(max(8,learn_conf.get("奖励平滑窗口",len(self.action_order)*6)))
         self.reward_memory=deque(maxlen=window)
@@ -744,6 +846,7 @@ class GameInterface:
         os.makedirs(self.experience_dir,exist_ok=True)
         self.skill_path_file=os.path.join(self.experience_dir,"skill_paths.json")
         self.skill_paths=self.load_skill_paths()
+        self.recall_monitor=RecallMonitor(self.config,self.vision)
     def refresh_regions(self):
         for alias,name in self.circle_map.items():
             self.circle_regions[alias]=self.scaler.circle(name)
@@ -837,7 +940,7 @@ class GameInterface:
     def act_idle(self,metrics):
         return
     def act_move(self,metrics):
-        self.joystick_move_random()
+        self.joystick_move_random(metrics)
     def act_attack_minion(self,metrics):
         self.basic_attack_minion()
     def act_attack_tower(self,metrics):
@@ -851,16 +954,83 @@ class GameInterface:
         self.recall()
     def act_flash(self,metrics):
         self.flash_forward()
-    def joystick_move_random(self):
+    def joystick_move_random(self,metrics):
         region=self.circle_regions["joystick"]
         cx,cy=self.circle_center(region)
-        radius=region.d/2.0*self.joystick_ratio
-        ang=random.random()*2.0*math.pi
-        ex=cx+radius*math.cos(ang)
-        ey=cy+radius*math.sin(ang)
+        radius=max(region.d/2.0*self.joystick_ratio,1.0)
+        obs=self.metrics_to_obs(metrics)
+        seed=time.time()+random.random()
+        recorded,_=self.experience_path("joystick",(cx,cy),radius,seed)
+        base_speed=float(self.config["动作"].get("拖动耗时",0.2))*1000.0
+        base_speed=max(base_speed,1.0)
+        if recorded:
+            path=list(recorded)
+            speed_scale=1.0
+        else:
+            vec=None
+            if self.model_manager:
+                vec=self.model_manager.infer("移动轮盘",obs)
+                if vec is not None:
+                    try:
+                        vec=np.array(vec,dtype=np.float32).flatten()
+                    except:
+                        vec=None
+            if vec is not None and vec.size>=2:
+                dir_x=float(vec[0])
+                dir_y=float(vec[1])
+            else:
+                ang=(seed*math.tau) if hasattr(math,"tau") else seed*2.0*math.pi
+                dir_x=math.cos(ang)
+                dir_y=math.sin(ang)
+            norm=math.hypot(dir_x,dir_y)
+            if norm<=np.finfo(np.float32).eps:
+                dir_x=0.0
+                dir_y=1.0
+                norm=1.0
+            dir_x/=norm
+            dir_y/=norm
+            rotation_bias=float(vec[2]) if vec is not None and vec.size>=3 else random.uniform(-1.0,1.0)
+            spin=1 if rotation_bias>=0 else -1
+            velocity=float(vec[3]) if vec is not None and vec.size>=4 else random.uniform(0.35,0.9)
+            velocity=max(0.25,min(0.95,abs(velocity)))
+            arc_hint=float(vec[4]) if vec is not None and vec.size>=5 else random.uniform(math.pi/3.0,math.pi*1.2)
+            arc=abs(arc_hint)
+            tau=math.tau if hasattr(math,"tau") else math.pi*2.0
+            arc=max(math.pi/6.0,min(tau/2.0,arc))
+            start_angle=math.atan2(dir_y,dir_x)
+            edge=(cx+dir_x*radius,cy+dir_y*radius)
+            steps=max(6,int(arc/(math.pi/18.0)))
+            path=[(cx,cy),edge]
+            for i in range(1,steps+1):
+                angle=start_angle+spin*arc*(i/steps)
+                px=cx+math.cos(angle)*radius
+                py=cy+math.sin(angle)*radius
+                path.append((px,py))
+            speed_scale=1.0-velocity*0.5
+        hold=int(max(1,base_speed*0.3))
         sx,sy=self.scaled_xy(cx,cy)
-        exs,eys=self.scaled_xy(ex,ey)
-        self.adb_swipe(sx,sy,exs,eys,int(self.config["动作"]["拖动耗时"]*1000))
+        self.adb_swipe(sx,sy,sx,sy,hold)
+        total=0.0
+        segments=[]
+        for i in range(len(path)-1):
+            x1,y1=path[i]
+            x2,y2=path[i+1]
+            dist=math.hypot(x2-x1,y2-y1)
+            if dist<=0.0:
+                continue
+            segments.append((x1,y1,x2,y2,dist))
+            total+=dist
+        if not segments:
+            return
+        for x1,y1,x2,y2,dist in segments:
+            duration=int(max(1,base_speed*(dist/total)*speed_scale))
+            sx1,sy1=self.scaled_xy(x1,y1)
+            sx2,sy2=self.scaled_xy(x2,y2)
+            self.adb_swipe(sx1,sy1,sx2,sy2,duration)
+        lx,ly=self.scaled_xy(path[-1][0],path[-1][1])
+        release=int(max(1,base_speed*0.25))
+        self.adb_swipe(lx,ly,lx,ly,release)
+        self.record_skill_path("joystick",path,False,(cx,cy),radius)
     def basic_attack_minion(self):
         self.tap_circle(self.circle_regions["attack_min"])
     def basic_attack_tower(self):
@@ -965,8 +1135,37 @@ class GameInterface:
     def heal(self):
         self.tap_circle(self.circle_regions["heal"])
     def recall(self):
-        self.tap_circle(self.circle_regions["recall"])
-        time.sleep(self.config["动作冷却"]["回城等待"])
+        region=self.circle_regions["recall"]
+        minimap_region=self.rect_regions["minimap"]
+        self.tap_circle(region)
+        base_img=self.get_screenshot()
+        if base_img is not None:
+            recall_img=self.vision.crop_cv(base_img,region.x,region.y,region.d,region.d)
+            minimap_img=self.vision.crop_cv(base_img,minimap_region.x,minimap_region.y,minimap_region.w,minimap_region.h)
+        else:
+            recall_img=None
+            minimap_img=None
+        self.recall_monitor.begin(recall_img,minimap_img)
+        self.prev_metrics["recalling"]=1
+        timeout=float(self.config["动作冷却"].get("回城等待",8.0))
+        interval=max(0.1,float(self.config["动作"].get("循环间隔",0.2))*0.5)
+        start=time.time()
+        while self.recall_monitor.active:
+            time.sleep(interval)
+            img=self.get_screenshot()
+            if img is None:
+                if time.time()-start>timeout:
+                    self.recall_monitor.cancel()
+                    break
+                continue
+            recall_img=self.vision.crop_cv(img,region.x,region.y,region.d,region.d)
+            minimap_img=self.vision.crop_cv(img,minimap_region.x,minimap_region.y,minimap_region.w,minimap_region.h)
+            if not self.recall_monitor.update(recall_img,minimap_img):
+                break
+            if time.time()-start>timeout:
+                self.recall_monitor.cancel()
+                break
+        self.prev_metrics["recalling"]=0
     def flash_forward(self):
         region=self.circle_regions["flash"]
         cx,cy=self.circle_center(region)
@@ -996,6 +1195,7 @@ class GameInterface:
         A_img=crop_rect(self.rect_regions["A"])
         B_img=crop_rect(self.rect_regions["B"])
         C_img=crop_rect(self.rect_regions["C"])
+        minimap_img=crop_rect(self.rect_regions["minimap"])
         attack_img=crop_circle(self.circle_regions["attack_min"])
         skill1_img=crop_circle(self.circle_regions["skill1"])
         skill2_img=crop_circle(self.circle_regions["skill2"])
@@ -1004,7 +1204,19 @@ class GameInterface:
         heal_img=crop_circle(self.circle_regions["heal"])
         flash_img=crop_circle(self.circle_regions["flash"])
         recall_img=crop_circle(self.circle_regions["recall"])
-        metrics={"A":v.ocr_digits(A_img),"B":v.ocr_digits(B_img),"C":v.ocr_digits(C_img),"alive":v.alive_state(attack_img),"cd1":v.cooldown_ready("skill1",skill1_img),"cd2":v.cooldown_ready("skill2",skill2_img),"cd3":v.cooldown_ready("skill3",skill3_img),"cd_item":v.cooldown_ready("item",item_img),"cd_heal":v.cooldown_ready("heal",heal_img),"cd_flash":v.cooldown_ready("flash",flash_img),"cd_recall":v.cooldown_ready("recall",recall_img)}
+        recall_active,recall_trace,recall_completed=v.recall_activity(recall_img)
+        home_flag=v.hero_home(minimap_img)
+        if self.recall_monitor.active:
+            self.recall_monitor.progress=max(self.recall_monitor.progress,recall_trace)
+        metrics={"A":v.ocr_digits(A_img),"B":v.ocr_digits(B_img),"C":v.ocr_digits(C_img),"alive":v.alive_state(attack_img),"cd1":v.cooldown_ready("skill1",skill1_img),"cd2":v.cooldown_ready("skill2",skill2_img),"cd3":v.cooldown_ready("skill3",skill3_img),"cd_item":v.cooldown_ready("item",item_img),"cd_heal":v.cooldown_ready("heal",heal_img),"cd_flash":v.cooldown_ready("flash",flash_img),"recalling":1 if (recall_active==1 or self.recall_monitor.active) and home_flag==0 else 0}
+        if recall_completed==1 and not self.recall_monitor.active:
+            metrics["recalling"]=0
+        if home_flag==1 and self.recall_monitor.active:
+            self.recall_monitor.active=False
+            self.recall_monitor.status="completed"
+            self.recall_monitor.progress=1.0
+        if home_flag==1 and metrics["recalling"]==1:
+            metrics["recalling"]=0
         if update_prev or capture_needed:
             self.prev_metrics=metrics
         return metrics
@@ -1038,9 +1250,9 @@ class GameInterface:
         if curr_metrics.get("alive",0)==0 and prev_metrics.get("alive",1)==1:
             reward-=abs(weights["B"])*(1.0+gain)
         flash_delta=curr_metrics.get("cd_flash",0)-prev_metrics.get("cd_flash",0)
-        recall_delta=curr_metrics.get("cd_recall",0)-prev_metrics.get("cd_recall",0)
         readiness_scale=(abs(weights["A"])+abs(weights["C"]))/(abs(weights["B"])+1.0)
-        reward+=readiness_scale*(flash_delta+recall_delta/(len(self.obs_keys)+1))
+        recall_block=1.0 if curr_metrics.get("recalling",0)==1 else 0.0
+        reward+=readiness_scale*(flash_delta-recall_block/(len(self.obs_keys)+1))
         self.reward_memory.append(reward)
         if self.reward_memory:
             smooth=float(np.clip(np.mean(self.reward_memory),-gain,gain))
@@ -1052,6 +1264,8 @@ class GameInterface:
         action_name=self.action_order[action_idx]
         condition=self.action_conditions.get(action_name)
         if condition and not condition(metrics_prev):
+            return
+        if self.recall_monitor.active and action_name!="recall":
             return
         executor=self.action_funcs.get(action_name)
         if executor:
@@ -1128,7 +1342,7 @@ class BotController:
                 self.shared.cd_item=metrics_curr["cd_item"]
                 self.shared.cd_heal=metrics_curr["cd_heal"]
                 self.shared.cd_flash=metrics_curr["cd_flash"]
-                self.shared.cd_recall=metrics_curr["cd_recall"]
+                self.shared.recalling=metrics_curr["recalling"]
                 self.shared.epsilon=eps
                 self.shared.running=True
         metrics_prev=metrics_curr
@@ -1185,7 +1399,7 @@ class BotUI:
         self.optimizer=optimizer
         self.root=tk.Tk()
         self.root.title("AI强化学习深度学习自适应类脑智能正则化控制面板")
-        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","cd_recall","epsilon","status","device","hw","adb","dn","aaa","opt"]}
+        self.vars={k:tk.StringVar() for k in ["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal","cd_flash","recalling","epsilon","status","device","hw","adb","dn","aaa","opt"]}
         self.vars["adb"].set(self.shared.config["路径"]["ADB"])
         self.vars["dn"].set(self.shared.config["路径"]["模拟器"])
         self.vars["aaa"].set(self.shared.config["路径"]["AAA"])
@@ -1196,7 +1410,7 @@ class BotUI:
     def build_ui(self):
         frame_state=tk.Frame(self.root)
         frame_state.pack(side="top",fill="x")
-        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("闪现","cd_flash"),("回城","cd_recall"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw"),("优化","opt")]
+        labels=[("A","A"),("B","B"),("C","C"),("存活","alive"),("一技能","cd1"),("二技能","cd2"),("三技能","cd3"),("主动装备","cd_item"),("恢复","cd_heal"),("闪现","cd_flash"),("回城状态","recalling"),("ε","epsilon"),("状态","status"),("设备","device"),("硬件","hw"),("优化","opt")]
         for idx,(text,key) in enumerate(labels):
             tk.Label(frame_state,text=text).grid(row=idx,column=0,sticky="w")
             tk.Label(frame_state,textvariable=self.vars[key]).grid(row=idx,column=1,sticky="w")
@@ -1262,7 +1476,7 @@ class BotUI:
             self.vars["cd_item"].set("可用" if self.shared.cd_item==1 else "冷却")
             self.vars["cd_heal"].set("可用" if self.shared.cd_heal==1 else "冷却")
             self.vars["cd_flash"].set("可用" if self.shared.cd_flash==1 else "冷却")
-            self.vars["cd_recall"].set("可用" if self.shared.cd_recall==1 else "冷却")
+            self.vars["recalling"].set("回城中" if self.shared.recalling==1 else "空闲")
             self.vars["epsilon"].set("{:.3f}".format(self.shared.epsilon))
             status_prefix="运行" if self.shared.running else "停止"
             self.vars["status"].set(f"{status_prefix}-{self.shared.mode}")
