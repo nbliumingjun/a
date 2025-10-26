@@ -38,7 +38,9 @@ def default_config(base_dir):
     rect_conf={k:{"左上角":[float(x),float(y)],"左上角比例":[float(x)/base_w,float(y)/base_h],"尺寸":[float(w),float(h)],"尺寸比例":[float(w)/base_w,float(h)/base_h]} for k,(x,y,w,h) in rect_raw.items()}
     flash_offset=[150.0,0.0]
     flash_ratio=[flash_offset[0]/base_w,flash_offset[1]/base_h]
-    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55},"学习":{"折扣":0.99,"学习率":0.0003,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000}}
+    obs_keys=["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]
+    action_names=["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]
+    return {"屏幕":{"基准宽度":base_w,"基准高度":base_h},"路径":{"ADB":"D:\\LDPlayer9\\adb.exe","模拟器":"D:\\LDPlayer9\\dnplayer.exe","AAA":base_dir},"经验目录":"experience","模型文件":model_names,"识别":rect_conf,"圆形区域":circle_conf,"奖励":{"A":3.0,"C":2.0,"B":-4.0},"动作":{"循环间隔":0.2,"拖动耗时":0.2,"摇杆幅度":0.8},"动作冷却":{"回城等待":8.0,"恢复时长":5.0,"闪现位移":flash_offset,"闪现位移比例":flash_ratio},"OCR":{"亮度阈值":110,"饱和阈值":60,"波动阈值":55,"存活亮度比":0.8,"存活饱和比":0.6},"学习":{"折扣":0.99,"学习率":0.0003,"缓冲大小":20000,"批次":64,"隐藏单元":128,"同步步数":1000,"ε衰减":60000},"观测键":obs_keys,"动作名称":action_names,"数值上限":{"A":99.0,"B":99.0,"C":99.0}}
 class ConfigManager:
     def __init__(self):
         self.home=os.path.expanduser("~")
@@ -48,6 +50,18 @@ class ConfigManager:
         self.load()
     def ensure_dir(self,path):
         os.makedirs(path,exist_ok=True)
+    def merge_dict(self,base,override):
+        if not isinstance(base,dict):
+            return override if override is not None else base
+        result=dict(base)
+        if not isinstance(override,dict):
+            return result
+        for k,v in override.items():
+            if k in result and isinstance(result[k],dict) and isinstance(v,dict):
+                result[k]=self.merge_dict(result[k],v)
+            elif v is not None:
+                result[k]=v
+        return result
     def load(self):
         self.ensure_dir(self.default_aaa)
         self.config_path=os.path.join(self.default_aaa,"配置.json")
@@ -71,6 +85,8 @@ class ConfigManager:
                 except:
                     data=default_config(aaa_dir)
                     self.save_config(data)
+        defaults=default_config(aaa_dir)
+        data=self.merge_dict(defaults,data)
         self.config=data
         self.ensure_region_ratios()
         self.ensure_dir(os.path.join(self.config["路径"]["AAA"],self.config["经验目录"]))
@@ -82,8 +98,10 @@ class ConfigManager:
         with open(path,"w",encoding="utf-8") as f:
             json.dump(target,f,ensure_ascii=False,indent=2)
     def update_paths(self,adb_path,dn_path,aaa_dir):
-        self.config["路径"]["ADB"]=adb_path
-        self.config["路径"]["模拟器"]=dn_path
+        if adb_path:
+            self.config["路径"]["ADB"]=adb_path
+        if dn_path:
+            self.config["路径"]["模拟器"]=dn_path
         if aaa_dir and aaa_dir!=self.config["路径"]["AAA"]:
             self.ensure_dir(aaa_dir)
             self.config["路径"]["AAA"]=aaa_dir
@@ -204,15 +222,15 @@ class QNetwork(nn.Module):
         x=self.fc3(x)
         return x
 class DeepRLAgent:
-    def __init__(self,device,dtype,config,hidden_dim,buffer_size,batch_size,gamma,lr,target_sync,epsilon_decay,experience_dir):
+    def __init__(self,device,dtype,config,obs_dim,action_dim,hidden_dim,buffer_size,batch_size,gamma,lr,target_sync,epsilon_decay,experience_dir):
         self.device=device
         self.dtype=dtype
-        self.obs_dim=9
-        self.action_dim=11
-        self.policy_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim,self.dtype).to(self.device)
-        self.target_net=QNetwork(self.obs_dim,self.action_dim,hidden_dim,self.dtype).to(self.device)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
-        self.target_net.eval()
+        self.hidden_dim=hidden_dim
+        self.buffer_size=buffer_size
+        self.lr=lr
+        self.obs_dim=obs_dim
+        self.action_dim=action_dim
+        self.build_networks()
         self.optimizer=optim.Adam(self.policy_net.parameters(),lr=lr)
         self.replay_buffer=deque(maxlen=buffer_size)
         self.batch_size=batch_size
@@ -227,6 +245,23 @@ class DeepRLAgent:
         self.last_save_step=0
         self.config=config
         self.load_experience()
+    def build_networks(self):
+        self.policy_net=QNetwork(self.obs_dim,self.action_dim,self.hidden_dim,self.dtype).to(self.device)
+        self.target_net=QNetwork(self.obs_dim,self.action_dim,self.hidden_dim,self.dtype).to(self.device)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+    def rebuild(self,obs_dim,action_dim,lr=None):
+        if obs_dim==self.obs_dim and action_dim==self.action_dim:
+            return
+        self.obs_dim=obs_dim
+        self.action_dim=action_dim
+        self.build_networks()
+        if lr is not None:
+            self.lr=lr
+        self.optimizer=optim.Adam(self.policy_net.parameters(),lr=self.lr)
+        self.replay_buffer=deque(maxlen=self.buffer_size)
+        self.step_count=0
+        self.last_save_step=0
     def epsilon(self):
         return self.epsilon_end+(self.epsilon_start-self.epsilon_end)*math.exp(-1.0*self.step_count/max(1.0,self.epsilon_decay))
     def select_action(self,obs_vec):
@@ -326,7 +361,9 @@ class VisionModule:
         return ready
     def alive_state(self,cv_img):
         mean_v,mean_s,_=self.region_stats(cv_img)
-        return 1 if mean_v>self.config["OCR"]["亮度阈值"]*0.8 and mean_s>self.config["OCR"]["饱和阈值"]*0.6 else 0
+        bright_ratio=self.config["OCR"].get("存活亮度比",0.8)
+        sat_ratio=self.config["OCR"].get("存活饱和比",0.6)
+        return 1 if mean_v>self.config["OCR"]["亮度阈值"]*bright_ratio and mean_s>self.config["OCR"]["饱和阈值"]*sat_ratio else 0
     def ocr_digits(self,cv_img):
         gray=cv2.cvtColor(cv_img,cv2.COLOR_BGR2GRAY)
         _,th=cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
@@ -348,6 +385,13 @@ class GameInterface:
         self.screen_h=self.base_h
         self.vision=VisionModule(config)
         self.last_screenshot=None
+        self.obs_keys=list(self.config.get("观测键",["A","B","C","alive","cd1","cd2","cd3","cd_item","cd_heal"]))
+        self.metric_caps={k:float(v) for k,v in self.config.get("数值上限",{}).items()}
+        self.binary_keys={k for k in self.obs_keys if k=="alive" or k.startswith("cd")}
+        self.action_order=list(self.config.get("动作名称",["idle","move","attack_minion","attack_tower","skill1","skill2","skill3","item","heal","recall","flash"]))
+        self.obs_dim=len(self.obs_keys)
+        self.action_dim=len(self.action_order)
+        self.joystick_ratio=float(self.config["动作"].get("摇杆幅度",0.8))
         circle_conf=self.config["圆形区域"]
         rect_conf=self.config["识别"]
         self.circle_regions={
@@ -369,6 +413,8 @@ class GameInterface:
             "C":self._rect(rect_conf.get("C")),
             "minimap":self._rect(rect_conf.get("小地图"))
         }
+        self.action_conditions={"idle":lambda m:True,"move":lambda m:m.get("alive",0)==1,"attack_minion":lambda m:m.get("alive",0)==1,"attack_tower":lambda m:m.get("alive",0)==1,"skill1":lambda m:m.get("alive",0)==1 and m.get("cd1",0)==1,"skill2":lambda m:m.get("alive",0)==1 and m.get("cd2",0)==1,"skill3":lambda m:m.get("alive",0)==1 and m.get("cd3",0)==1,"item":lambda m:m.get("alive",0)==1 and m.get("cd_item",0)==1,"heal":lambda m:m.get("alive",0)==1 and m.get("cd_heal",0)==1,"recall":lambda m:m.get("alive",0)==1,"flash":lambda m:m.get("alive",0)==1}
+        self.action_funcs={"idle":self.act_idle,"move":self.act_move,"attack_minion":self.act_attack_minion,"attack_tower":self.act_attack_tower,"skill1":self.skill_executor("skill1"),"skill2":self.skill_executor("skill2"),"skill3":self.skill_executor("skill3"),"item":self.act_item,"heal":self.act_heal,"recall":self.act_recall,"flash":self.act_flash}
         self.prev_metrics={"A":0,"B":0,"C":0,"alive":0,"cd1":0,"cd2":0,"cd3":0,"cd_item":0,"cd_heal":0}
         self.reward_memory=deque(maxlen=64)
     def _circle(self,data):
@@ -411,10 +457,31 @@ class GameInterface:
         cx,cy=self.circle_center(region)
         sx,sy=self.scaled_xy(cx,cy)
         self.adb_tap(sx,sy)
+    def skill_executor(self,key):
+        def runner(metrics):
+            self.cast_skill(key)
+        return runner
+    def act_idle(self,metrics):
+        return
+    def act_move(self,metrics):
+        self.joystick_move_random()
+    def act_attack_minion(self,metrics):
+        self.basic_attack_minion()
+    def act_attack_tower(self,metrics):
+        self.basic_attack_tower()
+    def act_item(self,metrics):
+        self.use_item()
+    def act_heal(self,metrics):
+        self.heal()
+        time.sleep(self.config["动作冷却"]["恢复时长"])
+    def act_recall(self,metrics):
+        self.recall()
+    def act_flash(self,metrics):
+        self.flash_forward()
     def joystick_move_random(self):
         region=self.circle_regions["joystick"]
         cx,cy=self.circle_center(region)
-        radius=region.d/2.0*0.8
+        radius=region.d/2.0*self.joystick_ratio
         ang=random.random()*2.0*math.pi
         ex=cx+radius*math.cos(ang)
         ey=cy+radius*math.sin(ang)
@@ -474,7 +541,17 @@ class GameInterface:
         self.prev_metrics=metrics
         return metrics
     def metrics_to_obs(self,m):
-        return [min(m["A"],99)/99.0,min(m["B"],99)/99.0,min(m["C"],99)/99.0,float(m["alive"]),float(m["cd1"]),float(m["cd2"]),float(m["cd3"]),float(m["cd_item"]),float(m["cd_heal"])]
+        obs=[]
+        for key in self.obs_keys:
+            value=float(m.get(key,0))
+            if key in self.metric_caps:
+                cap=max(1.0,self.metric_caps[key])
+                obs.append(min(value,cap)/cap)
+            elif key in self.binary_keys:
+                obs.append(1.0 if value>=1.0 else 0.0)
+            else:
+                obs.append(value)
+        return obs
     def compute_reward(self,prev_metrics,curr_metrics):
         dA=curr_metrics["A"]-prev_metrics["A"]
         dC=curr_metrics["C"]-prev_metrics["C"]
@@ -489,47 +566,23 @@ class GameInterface:
             reward*=1.0+adjust
         return reward
     def execute_action(self,action_idx,metrics_prev):
-        if action_idx==0:
+        if action_idx<0 or action_idx>=self.action_dim:
             return
-        if action_idx==1 and metrics_prev["alive"]==1:
-            self.joystick_move_random()
+        action_name=self.action_order[action_idx]
+        condition=self.action_conditions.get(action_name)
+        if condition and not condition(metrics_prev):
             return
-        if action_idx==2 and metrics_prev["alive"]==1:
-            self.basic_attack_minion()
-            return
-        if action_idx==3 and metrics_prev["alive"]==1:
-            self.basic_attack_tower()
-            return
-        if action_idx==4 and metrics_prev["alive"]==1 and metrics_prev["cd1"]==1:
-            self.cast_skill("skill1")
-            return
-        if action_idx==5 and metrics_prev["alive"]==1 and metrics_prev["cd2"]==1:
-            self.cast_skill("skill2")
-            return
-        if action_idx==6 and metrics_prev["alive"]==1 and metrics_prev["cd3"]==1:
-            self.cast_skill("skill3")
-            return
-        if action_idx==7 and metrics_prev["alive"]==1 and metrics_prev["cd_item"]==1:
-            self.use_item()
-            return
-        if action_idx==8 and metrics_prev["alive"]==1 and metrics_prev["cd_heal"]==1:
-            self.heal()
-            time.sleep(self.config["动作冷却"]["恢复时长"])
-            return
-        if action_idx==9 and metrics_prev["alive"]==1:
-            self.recall()
-            return
-        if action_idx==10 and metrics_prev["alive"]==1:
-            self.flash_forward()
-            return
+        executor=self.action_funcs.get(action_name)
+        if executor:
+            executor(metrics_prev)
 class BotController:
-    def __init__(self,shared,agent,model_manager):
+    def __init__(self,shared,agent,model_manager,game):
         self.shared=shared
         self.agent=agent
         self.model_manager=model_manager
-        self.adb_path=shared.config["路径"]["ADB"]
+        self.game=game
+        self.adb_path=self.game.adb_path
         self.dnplayer_path=shared.config["路径"]["模拟器"]
-        self.game=GameInterface(shared.config,self.adb_path)
         self.running_event=threading.Event()
         self.thread=None
     def update_paths(self,adb_path,dnplayer_path,aaa_path):
@@ -541,8 +594,11 @@ class BotController:
         target_aaa=aaa_path if aaa_path else cm.config["路径"]["AAA"]
         cm.update_paths(self.adb_path,self.dnplayer_path,target_aaa)
         self.shared.config=cm.config
+        new_game=GameInterface(cm.config,self.adb_path)
+        if new_game.obs_dim!=self.game.obs_dim or new_game.action_dim!=self.game.action_dim:
+            self.agent.rebuild(new_game.obs_dim,new_game.action_dim)
         self.model_manager=ModelManager(cm.config,self.agent.device,self.agent.dtype)
-        self.game=GameInterface(cm.config,self.adb_path)
+        self.game=new_game
     def start(self):
         if self.running_event.is_set():
             return
@@ -556,10 +612,10 @@ class BotController:
     def loop(self):
         metrics_prev=self.game.get_metrics()
         obs_prev=self.game.metrics_to_obs(metrics_prev)
-        interval=self.shared.config["动作"]["循环间隔"]
         while self.running_event.is_set():
             action,eps=self.agent.select_action(obs_prev)
             self.game.execute_action(action,metrics_prev)
+            interval=self.shared.config["动作"].get("循环间隔",0.2)
             time.sleep(interval)
             metrics_curr=self.game.get_metrics()
             obs_curr=self.game.metrics_to_obs(metrics_curr)
@@ -578,8 +634,8 @@ class BotController:
                 self.shared.cd_heal=metrics_curr["cd_heal"]
                 self.shared.epsilon=eps
                 self.shared.running=True
-        metrics_prev=metrics_curr
-        obs_prev=obs_curr
+            metrics_prev=metrics_curr
+            obs_prev=obs_curr
 class BotUI:
     def __init__(self,shared,controller,config_manager):
         self.shared=shared
@@ -725,9 +781,10 @@ def main():
     shared.hw_profile=hw
     params=adaptive_hyperparams(hw,config,device)
     experience_dir=os.path.join(config["路径"]["AAA"],config["经验目录"])
-    agent=DeepRLAgent(device,dtype,config,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir)
+    game=GameInterface(config,config["路径"]["ADB"])
+    agent=DeepRLAgent(device,dtype,config,game.obs_dim,game.action_dim,hidden_dim=params["hidden_dim"],buffer_size=params["buffer_size"],batch_size=params["batch_size"],gamma=params["gamma"],lr=params["lr"],target_sync=params["target_sync"],epsilon_decay=params["epsilon_decay"],experience_dir=experience_dir)
     model_manager=ModelManager(config,device,dtype)
-    controller=BotController(shared,agent,model_manager)
+    controller=BotController(shared,agent,model_manager,game)
     ui=BotUI(shared,controller,config_manager)
     ui.run()
 if __name__=="__main__":
