@@ -102,6 +102,16 @@ class ResourceMonitor:
    return sum(ratios)/len(ratios) if ratios else 30.0
   except Exception:
    return 30.0
+ def snapshot(self):
+  try:
+   cpu_count=psutil.cpu_count() or 0
+  except Exception:
+   cpu_count=0
+  try:
+   memory=psutil.virtual_memory().total
+  except Exception:
+   memory=0
+  return {"cpu_count":cpu_count,"memory":memory,"gpu_load":self._gpu_load(),"vram_usage":self._vram_ratio(),"frequency":max(1,min(120,self.frequency))}
 class ExperiencePool:
  def __init__(self,folder):
   self.folder=folder
@@ -196,6 +206,19 @@ class ExperiencePool:
    history.append({"time":time.time(),"A":data["A"],"B":data["B"],"C":data["C"]})
    data["history"]=history[-200:]
    self.metrics_path.write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
+ def validate(self):
+  with self.lock:
+   self.ensure_structure()
+   paths=[self.exp_folder,self.frames_folder,self.left_model,self.right_model,self.vision_model,self.metrics_path,self.config_manager.path]
+   for path in paths:
+    if isinstance(path,Path) and path.is_dir():
+     if not path.exists():
+      return False
+    else:
+     target=path if isinstance(path,Path) else Path(path)
+     if not target.exists() or (target.is_file() and target.stat().st_size<=0):
+      return False
+   return True
 class ReinforcementAnalyzer:
  def __init__(self):
   self.reinforcement_weight=1.0
@@ -620,12 +643,30 @@ class MainApp:
  def check_environment(self):
   adb=Path(self.pool.config_manager.data.get("adb_path"))
   emulator=Path(self.pool.config_manager.data.get("emulator_path"))
-  models_ready=self.pool.left_model.exists() and self.pool.right_model.exists() and self.pool.vision_model.exists()
-  if adb.exists() and emulator.exists() and models_ready:
+  models_ready=self.pool.validate()
+  hardware_ready=self.hardware_ready()
+  if adb.exists() and emulator.exists() and models_ready and hardware_ready:
    self.set_mode(Mode.LEARNING)
    self.start_learning()
   else:
-   self.status_var.set("依赖缺失")
+   status=[]
+   if not adb.exists():
+    status.append("缺少ADB")
+   if not emulator.exists():
+    status.append("缺少模拟器")
+   if not models_ready:
+    status.append("AAA文件夹异常")
+   if not hardware_ready:
+    status.append("硬件资源不足")
+   self.status_var.set("，".join(status) if status else "依赖缺失")
+ def hardware_ready(self):
+  snapshot=self.resource_monitor.snapshot()
+  cpu_ok=snapshot["cpu_count"]>0
+  memory_ok=snapshot["memory"]>0
+  gpu_ok=snapshot["gpu_load"]>=0
+  vram_ok=snapshot["vram_usage"]>=0
+  freq_ok=1<=snapshot["frequency"]<=120
+  return cpu_ok and memory_ok and gpu_ok and vram_ok and freq_ok
  def monitor_input(self):
   while not self.stop_event.is_set():
    time.sleep(0.5)
