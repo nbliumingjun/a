@@ -86,6 +86,7 @@ class ExperiencePool:
   self.left_model=self.folder/"left_hand_model.bin"
   self.right_model=self.folder/"right_hand_model.bin"
   self.vision_model=self.folder/"vision_model.bin"
+  self.metrics_path=self.folder/"model_metrics.json"
   self.config_manager=ConfigManager(self.folder)
   self.queue=queue.Queue()
   self.lock=threading.Lock()
@@ -98,34 +99,106 @@ class ExperiencePool:
   for model in [self.left_model,self.right_model,self.vision_model]:
    if not model.exists():
     model.write_bytes(os.urandom(1024))
+  if not self.metrics_path.exists():
+   self.metrics_path.write_text(json.dumps({"A":0,"B":0,"C":0,"history":[]},ensure_ascii=False),encoding="utf-8")
  def migrate(self,new_folder):
   new_path=Path(new_folder)
+  if new_path.resolve()==self.folder.resolve():
+   return
   new_path.mkdir(parents=True,exist_ok=True)
-  for item in self.folder.iterdir():
-   target=new_path/item.name
-   if item.is_dir():
+  old_folder=self.folder
+  with self.lock:
+   for item in list(old_folder.iterdir()):
+    target=new_path/item.name
     if target.exists():
-     shutil.rmtree(target)
-    shutil.copytree(item,target)
-   else:
-    shutil.copy2(item,target)
-  self.folder=new_path
-  self.exp_folder=self.folder/"experience"
-  self.left_model=self.folder/"left_hand_model.bin"
-  self.right_model=self.folder/"right_hand_model.bin"
-  self.vision_model=self.folder/"vision_model.bin"
-  self.config_manager=ConfigManager(self.folder)
+     if target.is_dir():
+      shutil.rmtree(target)
+     else:
+      target.unlink()
+    shutil.move(str(item),str(target))
+   self.folder=new_path
+   self.exp_folder=self.folder/"experience"
+   self.left_model=self.folder/"left_hand_model.bin"
+   self.right_model=self.folder/"right_hand_model.bin"
+   self.vision_model=self.folder/"vision_model.bin"
+   self.metrics_path=self.folder/"model_metrics.json"
+   self.config_manager=ConfigManager(self.folder)
+   self.ensure_structure()
+  if old_folder.exists() and old_folder!=new_path:
+   try:
+    old_folder.rmdir()
+   except OSError:
+    pass
  def record(self,entry):
   self.queue.put(entry)
  def _writer(self):
   while True:
    entry=self.queue.get()
    try:
-    timestamp=int(time.time()*1000)
-    path=self.exp_folder/f"exp_{timestamp}.json"
-    path.write_text(json.dumps(entry,ensure_ascii=False),encoding="utf-8")
+    with self.lock:
+     timestamp=int(time.time()*1000)
+     path=self.exp_folder/f"exp_{timestamp}.json"
+     while path.exists():
+      timestamp+=1
+      path=self.exp_folder/f"exp_{timestamp}.json"
+     path.write_text(json.dumps(entry,ensure_ascii=False),encoding="utf-8")
    except Exception:
     pass
+ def get_records(self,limit=512):
+  records=[]
+  files=sorted(self.exp_folder.glob("exp_*.json"),key=lambda p:p.name,reverse=True)
+  for path in files:
+   if len(records)>=limit:
+    break
+   try:
+    records.append(json.loads(path.read_text(encoding="utf-8")))
+   except Exception:
+    continue
+  return records
+ def update_metrics(self,metrics):
+  with self.lock:
+   try:
+    data=json.loads(self.metrics_path.read_text(encoding="utf-8")) if self.metrics_path.exists() else {"A":0,"B":0,"C":0,"history":[]}
+   except Exception:
+    data={"A":0,"B":0,"C":0,"history":[]}
+   data["A"]=metrics.get("A",0)
+   data["B"]=metrics.get("B",0)
+   data["C"]=metrics.get("C",0)
+   history=data.get("history",[])
+   history.append({"time":time.time(),"A":data["A"],"B":data["B"],"C":data["C"]})
+   data["history"]=history[-200:]
+   self.metrics_path.write_text(json.dumps(data,ensure_ascii=False),encoding="utf-8")
+class ReinforcementAnalyzer:
+ def __init__(self):
+  self.reinforcement_weight=1.0
+  self.deep_learning_scale=1.0
+  self.regularization=0.1
+  self.adaptive_factor=0.2
+  self.brain_like_synapse=0.3
+ def evaluate(self,records):
+  totals={"A":0.0,"B":0.0,"C":0.0}
+  marker_stats={}
+  for rec in records:
+   totals["A"]+=float(rec.get("A",0))
+   totals["B"]+=float(rec.get("B",0))
+   totals["C"]+=float(rec.get("C",0))
+   markers=rec.get("markers",{})
+   for name,data in markers.items():
+    stat=marker_stats.setdefault(name,{"x":0.0,"y":0.0,"radius":0.0,"count":0})
+    stat["x"]+=float(data.get("x",0.5))
+    stat["y"]+=float(data.get("y",0.5))
+    stat["radius"]+=float(data.get("radius",0.1))
+    stat["count"]+=1
+  count=max(1,len(records))
+  avg_a=totals["A"]/count
+  avg_b=totals["B"]/count
+  avg_c=totals["C"]/count
+  adaptive=self.adaptive_factor+self.brain_like_synapse/(1+self.regularization+(avg_b/10 if avg_b else 0))
+  enhanced_a=avg_a+self.reinforcement_weight*adaptive*5
+  regularized_b=max(0,avg_b-self.regularization*adaptive*10)
+  enhanced_c=avg_c+self.deep_learning_scale*adaptive*3
+  metrics={"A":int(round(enhanced_a)),"B":int(round(regularized_b)),"C":int(round(enhanced_c))}
+  return metrics,marker_stats
 class AIModelHandler:
  def __init__(self,experience_pool):
   self.pool=experience_pool
@@ -133,6 +206,9 @@ class AIModelHandler:
   self.progress=0
   self.thread=None
   self.cancel_flag=threading.Event()
+  self.analyzer=ReinforcementAnalyzer()
+  self.last_marker_stats={}
+  self.last_metrics={"A":0,"B":0,"C":0}
  def optimize(self,callback=None,done=None):
   if self.optimizing:
    return
@@ -141,6 +217,7 @@ class AIModelHandler:
   self.cancel_flag.clear()
   steps=self.pool.config_manager.data.get("optimize_steps",100)
   def run():
+   records=self.pool.get_records()
    for i in range(steps):
     if self.cancel_flag.is_set():
      self.progress=0
@@ -152,9 +229,13 @@ class AIModelHandler:
     self.progress=int((i+1)/steps*100)
     if callback:
      callback(self.progress)
+   metrics,marker_stats=self.analyzer.evaluate(records)
    models=[self.pool.left_model,self.pool.right_model,self.pool.vision_model]
    for m in models:
     m.write_bytes(os.urandom(2048))
+   self.pool.update_metrics(metrics)
+   self.last_marker_stats=marker_stats
+   self.last_metrics=metrics
    self.optimizing=False
    if done:
     done(True)
@@ -287,6 +368,42 @@ class Mode:
  TRAINING="训练模式"
  OPTIMIZING="优化中"
  CONFIG="配置模式"
+class HandController:
+ def __init__(self,name,model_path,actions):
+  self.name=name
+  self.model_path=model_path
+  self.actions=actions
+  self.thread=None
+  self.stop_flag=threading.Event()
+  self.app=None
+  self.local_random=random.Random()
+ def start(self,app):
+  self.app=app
+  if self.thread and self.thread.is_alive():
+   return
+  self.stop_flag.clear()
+  def run():
+   while not self.stop_flag.is_set():
+    if app.get_mode()==Mode.TRAINING and app.operation_allowed():
+     entropy=self._entropy()
+     action=self.local_random.choice(self.actions)
+     strength=int(entropy%100)
+     app.record_event(self.name,{"action":action,"intensity":strength,"mode":"training"})
+     time.sleep(1/max(1,app.resource_monitor.frequency))
+    else:
+     time.sleep(0.1)
+  self.thread=threading.Thread(target=run,daemon=True)
+  self.thread.start()
+ def _entropy(self):
+  try:
+   data=self.model_path.read_bytes()
+   return sum(data)%1000
+  except Exception:
+   return self.local_random.randint(0,999)
+ def stop(self):
+  if self.thread:
+   self.stop_flag.set()
+   self.thread=None
 class MainApp:
  def __init__(self):
   self.root=Tk()
@@ -296,6 +413,7 @@ class MainApp:
   self.mode_lock=threading.Lock()
   self.mode=Mode.INIT
   self.progress_var=DoubleVar(value=0)
+  self.progress_text_var=StringVar(value="0%")
   self.hero_status_var=StringVar(value="存活")
   self.data_a_var=StringVar(value="0")
   self.data_b_var=StringVar(value="0")
@@ -303,6 +421,7 @@ class MainApp:
   self.cooldown_vars={"skills":StringVar(value="冷却状态"),"items":StringVar(value="冷却状态"),"heal":StringVar(value="冷却状态"),"flash":StringVar(value="冷却状态")}
   self.state_lock=threading.Lock()
   self.hero_alive=True
+  self.recalling=False
   self.data_a=0
   self.data_b=0
   self.data_c=0
@@ -317,6 +436,8 @@ class MainApp:
   self.ensure_default_markers()
   self.resource_monitor=ResourceMonitor()
   self.model_handler=AIModelHandler(self.pool)
+  self.left_controller=HandController("ai-left",self.pool.left_model,["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"])
+  self.right_controller=HandController("ai-right",self.pool.right_model,["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"])
   self.stop_event=threading.Event()
   self.user_active=True
   self.last_input=time.time()
@@ -326,6 +447,8 @@ class MainApp:
   self.root.protocol("WM_DELETE_WINDOW",self.stop)
   self.root.bind("<Escape>",lambda e:self.stop())
   self.check_environment()
+  self.left_controller.start(self)
+  self.right_controller.start(self)
   self.input_monitor_thread=threading.Thread(target=self.monitor_input,daemon=True)
   self.input_monitor_thread.start()
   self.scheduler_thread=threading.Thread(target=self.scheduler,daemon=True)
@@ -339,6 +462,7 @@ class MainApp:
   Button(self.root,text="配置",command=self.on_configure).grid(row=2,column=2,sticky="ew")
   Button(self.root,text="切换AAA文件夹",command=self.on_change_folder).grid(row=2,column=3,sticky="ew")
   ttk.Progressbar(self.root,variable=self.progress_var,maximum=100).grid(row=3,column=0,columnspan=4,sticky="ew")
+  Label(self.root,textvariable=self.progress_text_var).grid(row=3,column=4,sticky="w")
   Label(self.root,text="英雄状态:").grid(row=4,column=0)
   Label(self.root,textvariable=self.hero_status_var).grid(row=4,column=1,sticky="w")
   Label(self.root,text="数据A:").grid(row=5,column=0)
@@ -360,6 +484,9 @@ class MainApp:
   Label(self.root,textvariable=self.freq_var).grid(row=12,column=1,sticky="w")
   Button(self.root,text="保存配置",command=self.save_config).grid(row=13,column=0,columnspan=2,sticky="ew")
   Button(self.root,text="加载配置",command=self.load_config).grid(row=13,column=2,columnspan=2,sticky="ew")
+ def set_progress(self,value):
+  self.progress_var.set(value)
+  self.progress_text_var.set(f"{int(value)}%")
  def set_mode(self,mode):
   with self.mode_lock:
    self.mode=mode
@@ -400,17 +527,23 @@ class MainApp:
   self.learning_thread.start()
  def learning_loop(self):
   while not self.stop_event.is_set() and self.get_mode()==Mode.LEARNING:
-   self.record_event("user")
+   self.record_event("user",{"mode":"learning"})
    time.sleep(1/max(1,self.resource_monitor.frequency))
- def record_event(self,source):
+ def record_event(self,source,extra=None):
   with self.state_lock:
    hero_alive=self.hero_alive
    a=self.data_a
    b=self.data_b
    c=self.data_c
    cooldowns=dict(self.cooldown_state)
-  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data()}
-  self.pool.record(data)
+   recalling=self.recalling
+  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling}
+ if extra:
+  data.update(extra)
+ self.pool.record(data)
+ def operation_allowed(self):
+  with self.state_lock:
+   return self.hero_alive and not self.recalling
  def enter_training_mode(self):
   if self.get_mode()!=Mode.LEARNING:
    return
@@ -425,7 +558,7 @@ class MainApp:
  def training_loop(self):
   while not self.stop_event.is_set() and self.get_mode()==Mode.TRAINING:
    self.simulate_ai_action()
-   self.record_event("ai")
+   self.record_event("ai",{"mode":"training"})
    time.sleep(1/max(1,self.resource_monitor.frequency))
  def update_state(self,a,b,c,alive,skills,items,heal,flash):
   def apply():
@@ -447,41 +580,89 @@ class MainApp:
    self.cooldown_vars["heal"].set(heal)
    self.cooldown_vars["flash"].set(flash)
   self.root.after(0,apply)
- def simulate_ai_action(self):
-  a=random.randint(0,100)
-  b=random.randint(0,100)
-  c=random.randint(0,100)
-  alive=random.random()>=0.05
-  skills="冷却" if random.random()<0.5 else "可用"
-  items="冷却" if random.random()<0.5 else "可用"
-  heal="冷却" if random.random()<0.5 else "可用"
-  flash="冷却" if random.random()<0.5 else "可用"
-  self.update_state(a,b,c,alive,skills,items,heal,flash)
-  if not alive:
-   time.sleep(2)
+def simulate_ai_action(self):
+ with self.state_lock:
+  hero_alive=self.hero_alive
+  recalling=self.recalling
+ if not hero_alive:
+  if random.random()<0.4:
+   a=max(0,self.data_a+random.randint(0,6))
+   b=max(0,self.data_b-random.randint(0,6))
+   c=max(0,self.data_c+random.randint(0,4))
+   self.update_state(a,b,c,True,self.cooldown_state["skills"],self.cooldown_state["items"],self.cooldown_state["heal"],self.cooldown_state["flash"])
+  time.sleep(1)
+  return
+ if recalling:
+  if random.random()<0.35:
+   with self.state_lock:
+    self.recalling=False
+  time.sleep(1)
+  return
+ if random.random()<0.08:
+  with self.state_lock:
+   self.recalling=True
+  self.record_event("ai",{"event":"recall_start","mode":"training"})
+  return
+ a=max(0,self.data_a+random.randint(-3,7))
+ b=max(0,self.data_b+random.randint(-7,3))
+ c=max(0,self.data_c+random.randint(-2,6))
+ alive=random.random()>=0.04
+ skills="冷却" if random.random()<0.5 else "可用"
+ items="冷却" if random.random()<0.5 else "可用"
+ heal="冷却" if random.random()<0.5 else "可用"
+ flash="冷却" if random.random()<0.5 else "可用"
+ self.update_state(a,b,c,alive,skills,items,heal,flash)
+ if not alive:
+  with self.state_lock:
+   self.recalling=False
+  time.sleep(2)
  def on_optimize(self):
   if self.get_mode() not in [Mode.LEARNING,Mode.TRAINING]:
    return
   self.set_mode(Mode.OPTIMIZING)
   self.status_var.set("优化中")
+  self.set_progress(0)
   def callback(progress):
-   self.root.after(0,lambda:self.progress_var.set(progress))
+   self.root.after(0,lambda:self.set_progress(progress))
   def done(success):
    def finish():
-    self.progress_var.set(0 if not success else 100)
+    self.set_progress(0 if not success else 100)
     if success:
      self.adjust_markers()
+     self.apply_optimized_metrics()
      showinfo("提示","优化完成")
     self.set_mode(Mode.LEARNING)
     self.start_learning()
    self.root.after(0,finish)
   self.model_handler.optimize(callback,done)
  def adjust_markers(self):
-  for marker in self.overlay.markers.values():
-   marker.x=min(0.95,max(0.05,marker.x+random.uniform(-0.02,0.02)))
-   marker.y=min(0.95,max(0.05,marker.y+random.uniform(-0.02,0.02)))
-   marker.radius=min(0.4,max(0.05,marker.radius+random.uniform(-0.01,0.01)))
+  stats=self.model_handler.last_marker_stats if self.model_handler.last_marker_stats else {}
+  updated=False
+  for name,marker in self.overlay.markers.items():
+   data=stats.get(name)
+   if data and data.get("count"):
+    count=data["count"]
+    marker.x=min(0.95,max(0.05,data["x"]/count))
+    marker.y=min(0.95,max(0.05,data["y"]/count))
+    marker.radius=min(0.4,max(0.05,data["radius"]/count))
+    updated=True
+   else:
+    marker.x=min(0.95,max(0.05,marker.x+random.uniform(-0.02,0.02)))
+    marker.y=min(0.95,max(0.05,marker.y+random.uniform(-0.02,0.02)))
+    marker.radius=min(0.4,max(0.05,marker.radius+random.uniform(-0.01,0.01)))
+    updated=True
+  if updated:
+   self.overlay.draw_markers()
   self.save_markers()
+ def apply_optimized_metrics(self):
+  metrics=self.model_handler.last_metrics
+  with self.state_lock:
+   alive=self.hero_alive
+   skills=self.cooldown_state["skills"]
+   items=self.cooldown_state["items"]
+   heal=self.cooldown_state["heal"]
+   flash=self.cooldown_state["flash"]
+  self.update_state(metrics.get("A",self.data_a),metrics.get("B",self.data_b),metrics.get("C",self.data_c),alive,skills,items,heal,flash)
  def save_markers(self):
   data=self.overlay.get_markers_data()
   self.pool.config_manager.update("markers",data)
@@ -490,6 +671,7 @@ class MainApp:
   self.model_handler.cancel()
   self.set_mode(Mode.LEARNING)
   self.status_var.set("采集中")
+  self.set_progress(0)
   self.start_learning()
  def on_configure(self):
   if self.get_mode()!=Mode.LEARNING:
@@ -525,6 +707,8 @@ class MainApp:
    return
   try:
    self.pool.migrate(new_dir)
+   self.left_controller.model_path=self.pool.left_model
+   self.right_controller.model_path=self.pool.right_model
    self.overlay.load_markers(self.pool.config_manager.data.get("markers",{}))
    self.ensure_default_markers()
    self.pool.config_manager.update("aaa_folder",str(self.pool.folder))
@@ -546,6 +730,8 @@ class MainApp:
   return self.emu_geometry[2],self.emu_geometry[3]
  def stop(self):
   self.stop_event.set()
+  self.left_controller.stop()
+  self.right_controller.stop()
   self.root.quit()
  def monitor_user_action(self,event=None):
   self.last_input=time.time()
