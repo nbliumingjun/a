@@ -538,9 +538,9 @@ class MainApp:
    cooldowns=dict(self.cooldown_state)
    recalling=self.recalling
   data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling}
- if extra:
-  data.update(extra)
- self.pool.record(data)
+  if extra:
+   data.update(extra)
+  self.pool.record(data)
  def operation_allowed(self):
   with self.state_lock:
    return self.hero_alive and not self.recalling
@@ -580,42 +580,42 @@ class MainApp:
    self.cooldown_vars["heal"].set(heal)
    self.cooldown_vars["flash"].set(flash)
   self.root.after(0,apply)
-def simulate_ai_action(self):
- with self.state_lock:
-  hero_alive=self.hero_alive
-  recalling=self.recalling
- if not hero_alive:
-  if random.random()<0.4:
-   a=max(0,self.data_a+random.randint(0,6))
-   b=max(0,self.data_b-random.randint(0,6))
-   c=max(0,self.data_c+random.randint(0,4))
-   self.update_state(a,b,c,True,self.cooldown_state["skills"],self.cooldown_state["items"],self.cooldown_state["heal"],self.cooldown_state["flash"])
-  time.sleep(1)
-  return
- if recalling:
-  if random.random()<0.35:
+ def simulate_ai_action(self):
+  with self.state_lock:
+   hero_alive=self.hero_alive
+   recalling=self.recalling
+  if not hero_alive:
+   if random.random()<0.4:
+    a=max(0,self.data_a+random.randint(0,6))
+    b=max(0,self.data_b-random.randint(0,6))
+    c=max(0,self.data_c+random.randint(0,4))
+    self.update_state(a,b,c,True,self.cooldown_state["skills"],self.cooldown_state["items"],self.cooldown_state["heal"],self.cooldown_state["flash"])
+   time.sleep(1)
+   return
+  if recalling:
+   if random.random()<0.35:
+    with self.state_lock:
+     self.recalling=False
+   time.sleep(1)
+   return
+  if random.random()<0.08:
+   with self.state_lock:
+    self.recalling=True
+   self.record_event("ai",{"event":"recall_start","mode":"training"})
+   return
+  a=max(0,self.data_a+random.randint(-3,7))
+  b=max(0,self.data_b+random.randint(-7,3))
+  c=max(0,self.data_c+random.randint(-2,6))
+  alive=random.random()>=0.04
+  skills="冷却" if random.random()<0.5 else "可用"
+  items="冷却" if random.random()<0.5 else "可用"
+  heal="冷却" if random.random()<0.5 else "可用"
+  flash="冷却" if random.random()<0.5 else "可用"
+  self.update_state(a,b,c,alive,skills,items,heal,flash)
+  if not alive:
    with self.state_lock:
     self.recalling=False
-  time.sleep(1)
-  return
- if random.random()<0.08:
-  with self.state_lock:
-   self.recalling=True
-  self.record_event("ai",{"event":"recall_start","mode":"training"})
-  return
- a=max(0,self.data_a+random.randint(-3,7))
- b=max(0,self.data_b+random.randint(-7,3))
- c=max(0,self.data_c+random.randint(-2,6))
- alive=random.random()>=0.04
- skills="冷却" if random.random()<0.5 else "可用"
- items="冷却" if random.random()<0.5 else "可用"
- heal="冷却" if random.random()<0.5 else "可用"
- flash="冷却" if random.random()<0.5 else "可用"
- self.update_state(a,b,c,alive,skills,items,heal,flash)
- if not alive:
-  with self.state_lock:
-   self.recalling=False
-  time.sleep(2)
+   time.sleep(2)
  def on_optimize(self):
   if self.get_mode() not in [Mode.LEARNING,Mode.TRAINING]:
    return
@@ -642,6 +642,8 @@ def simulate_ai_action(self):
    data=stats.get(name)
    if data and data.get("count"):
     count=data["count"]
+EOF
+)
     marker.x=min(0.95,max(0.05,data["x"]/count))
     marker.y=min(0.95,max(0.05,data["y"]/count))
     marker.radius=min(0.4,max(0.05,data["radius"]/count))
