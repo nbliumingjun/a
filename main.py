@@ -7,6 +7,8 @@ import shutil
 import queue
 import random
 import subprocess
+import ctypes
+from ctypes import wintypes
 from pathlib import Path
 import platform
 from importlib import util
@@ -433,6 +435,9 @@ class OverlayManager:
   self.dragging=False
   self.resizing=False
   self.last_pos=None
+  self.hwnd=None
+  self.click_through=None
+  self.cursor_job=None
  def open(self):
   if self.window:
    return
@@ -449,14 +454,132 @@ class OverlayManager:
   self.canvas.bind("<Button-1>",self.on_click)
   self.canvas.bind("<B1-Motion>",self.on_drag)
   self.canvas.bind("<ButtonRelease-1>",self.on_release)
+  self.canvas.bind("<Motion>",self.on_motion)
+  self.canvas.bind("<Leave>",self.on_leave)
+  self._setup_window_styles()
   self.draw_markers()
   self.update_geometry(x,y,width,height,self.app.emu_visible)
+ def _setup_window_styles(self):
+  self.hwnd=None
+  if not self.window:
+   return
+  if platform.system()=="Windows" and win32gui and win32con:
+   try:
+    self.window.update_idletasks()
+    self.hwnd=self.window.winfo_id()
+   except Exception:
+    self.hwnd=None
+   if self.hwnd:
+    self._set_click_through(True)
+    try:
+     alpha=max(1,int(255*0.01))
+     win32gui.SetLayeredWindowAttributes(self.hwnd,0,alpha,win32con.LWA_ALPHA)
+    except Exception:
+     pass
+    self._start_cursor_monitor()
+  else:
+   self._set_click_through(True)
+ def _start_cursor_monitor(self):
+  if platform.system()!="Windows" or not self.window or not self.canvas or not win32gui or not win32con:
+   return
+  if self.cursor_job:
+   try:
+    self.window.after_cancel(self.cursor_job)
+   except Exception:
+    pass
+   self.cursor_job=None
+  self._cursor_monitor()
+ def _cursor_monitor(self):
+  if not self.window or not self.canvas:
+   self.cursor_job=None
+   return
+  pos=self._get_cursor_pos()
+  capture=False
+  if pos:
+   try:
+    wx=self.window.winfo_rootx()
+    wy=self.window.winfo_rooty()
+    width=self.canvas.winfo_width() or self.window.winfo_width()
+    height=self.canvas.winfo_height() or self.window.winfo_height()
+    rel_x=pos[0]-wx
+    rel_y=pos[1]-wy
+    if 0<=rel_x<=width and 0<=rel_y<=height:
+     capture=self._hit_test(rel_x,rel_y)
+   except Exception:
+    capture=False
+  if self.dragging or self.resizing:
+   capture=True
+  self._set_click_through(not capture)
+  if self.window:
+   try:
+    self.cursor_job=self.window.after(16,self._cursor_monitor)
+   except Exception:
+    self.cursor_job=None
+ def _get_cursor_pos(self):
+  if platform.system()!="Windows":
+   return None
+  try:
+   point=wintypes.POINT()
+   if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+    return point.x,point.y
+  except Exception:
+   return None
+  return None
+ def _set_click_through(self,enable):
+  if self.click_through==enable:
+   return
+  self.click_through=enable
+  if platform.system()=="Windows" and self.hwnd and win32gui and win32con:
+   try:
+    style=win32gui.GetWindowLong(self.hwnd,win32con.GWL_EXSTYLE)
+    if enable:
+     style|=win32con.WS_EX_LAYERED|win32con.WS_EX_TRANSPARENT
+    else:
+     style|=win32con.WS_EX_LAYERED
+     style&=~win32con.WS_EX_TRANSPARENT
+    win32gui.SetWindowLong(self.hwnd,win32con.GWL_EXSTYLE,style)
+   except Exception:
+    pass
+ def _hit_test(self,x,y):
+  if not self.canvas or not self.window:
+   return False
+  width=self.canvas.winfo_width() or self.window.winfo_width()
+  height=self.canvas.winfo_height() or self.window.winfo_height()
+  if width<=0 or height<=0:
+   return False
+  for marker in self.markers.values():
+   mx=marker.x*width
+   my=marker.y*height
+   r=marker.radius*min(width,height)
+   if r<=0:
+    continue
+   margin=max(4,r*0.1)
+   if (x-mx)**2+(y-my)**2<=(r+margin)**2:
+    return True
+  return False
+ def _update_click_through(self,x=None,y=None):
+  capture=self.dragging or self.resizing
+  if not capture and x is not None and y is not None:
+   capture=self._hit_test(x,y)
+  self._set_click_through(not capture)
+ def on_motion(self,event):
+  self._update_click_through(event.x,event.y)
+ def on_leave(self,event):
+  self._update_click_through()
  def close(self):
   if self.window:
+   if self.cursor_job:
+    try:
+     self.window.after_cancel(self.cursor_job)
+    except Exception:
+     pass
+    self.cursor_job=None
    self.window.destroy()
    self.window=None
    self.canvas=None
    self.selected=None
+   self.hwnd=None
+   self.click_through=None
  def load_markers(self,markers):
   self.markers={name:self._marker_from_data(name,data) for name,data in markers.items()}
  def get_markers_data(self):
@@ -494,6 +617,8 @@ class OverlayManager:
    y=marker.y*height
    r=marker.radius*min(width,height)
    self.canvas.create_oval(x-r,y-r,x+r,y+r,outline=marker.color,width=3,fill=self._fill_color(marker))
+   if self.selected==marker:
+    self.canvas.create_oval(x-r-4,y-r-4,x+r+4,y+r+4,outline="yellow",width=2)
    self.canvas.create_text(x,y,text=name,fill="white")
  def update_geometry(self,x,y,width,height,visible):
   if not self.window:
@@ -515,15 +640,15 @@ class OverlayManager:
    self.canvas.config(width=w,height=h)
   self.window.update_idletasks()
   self.draw_markers()
+  self._update_click_through()
  def _fill_color(self,marker):
-  if self.selected==marker:
-   return "#40ffffff"
   return "#80ffffff"
  def on_click(self,event):
   width=self.canvas.winfo_width()
   height=self.canvas.winfo_height()
   click_x=event.x
   click_y=event.y
+  self.resizing=False
   for marker in self.markers.values():
    x=marker.x*width
    y=marker.y*height
@@ -535,9 +660,13 @@ class OverlayManager:
     boundary=abs((click_x-x)**2+(click_y-y)**2-r**2)
     if boundary<r:
      self.resizing=True
+    self._update_click_through(click_x,click_y)
     return
   self.selected=None
   self.dragging=False
+  self.resizing=False
+  self.last_pos=None
+  self._update_click_through()
  def on_drag(self,event):
   if not self.selected or not self.dragging:
    return
@@ -554,12 +683,17 @@ class OverlayManager:
    y=self.selected.y*height+dy
    self.selected.x=max(0,min(1,x/width))
    self.selected.y=max(0,min(1,y/height))
+  self._update_click_through(event.x,event.y)
   self.last_pos=(event.x,event.y)
   self.draw_markers()
  def on_release(self,event):
   self.dragging=False
   self.resizing=False
   self.last_pos=None
+  if event is not None:
+   self._update_click_through(event.x,event.y)
+  else:
+   self._update_click_through()
 class Mode:
  INIT="初始化"
  LEARNING="学习模式"
