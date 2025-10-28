@@ -8,6 +8,8 @@ import queue
 import random
 import subprocess
 from pathlib import Path
+import platform
+from importlib import util
 try:
  import psutil
 except ImportError:
@@ -44,6 +46,20 @@ except ImportError:
  Canvas=tkinter.Canvas
  Scale=tkinter.Scale
  HORIZONTAL=tkinter.HORIZONTAL
+win32gui=None
+win32con=None
+win32process=None
+win32api=None
+if platform.system()=="Windows":
+ if util.find_spec("win32gui") and util.find_spec("win32con") and util.find_spec("win32process") and util.find_spec("win32api"):
+  import win32gui as _win32gui
+  import win32con as _win32con
+  import win32process as _win32process
+  import win32api as _win32api
+  win32gui=_win32gui
+  win32con=_win32con
+  win32process=_win32process
+  win32api=_win32api
 class ConfigManager:
  def __init__(self,folder):
   self.folder=folder
@@ -305,6 +321,103 @@ class Marker:
   self.radius=0.1
   self.interaction="click"
   self.cooldown=False
+class EmulatorWindowTracker:
+ def __init__(self,app):
+  self.app=app
+  self.handle=None
+  self.stop_flag=threading.Event()
+  self.available=platform.system()=="Windows" and win32gui is not None and win32con is not None and win32process is not None and win32api is not None
+  self.last_geometry=None
+  self.last_visible=None
+  self.thread=threading.Thread(target=self.run,daemon=True)
+  self.thread.start()
+ def stop(self):
+  self.stop_flag.set()
+  if self.thread and self.thread.is_alive():
+   self.thread.join(timeout=0.5)
+ def run(self):
+  while not self.stop_flag.is_set() and not self.app.stop_event.is_set():
+   if self.available:
+    handle=self._locate_window()
+    rect=self._get_rect(handle)
+    visible=self._is_visible(handle)
+    if rect:
+     x,y,r,b=rect
+     width=max(0,r-x)
+     height=max(0,b-y)
+    else:
+     x,y,width,height=self.app.emu_geometry
+     visible=False
+   else:
+    handle=None
+    x,y,width,height=self.app.emu_geometry
+    visible=True
+   self.handle=handle if self.available else None
+   geometry=(int(x),int(y),int(width),int(height))
+   if self.last_geometry!=geometry or self.last_visible!=visible:
+    self.last_geometry=geometry
+    self.last_visible=visible
+    self.app.root.after(0,lambda g=geometry,v=visible:self.app.update_emulator_geometry(g[0],g[1],g[2],g[3],v))
+   time.sleep(0.2)
+ def _locate_window(self):
+  if not self.available:
+   return None
+  target=self.app.pool.config_manager.data.get("emulator_path","")
+  target=target.lower() if isinstance(target,str) else ""
+  if self.handle and self._match_window(self.handle,target):
+   return self.handle
+  candidates=[]
+  def callback(hwnd,param):
+   if self._match_window(hwnd,target):
+    param.append(hwnd)
+  win32gui.EnumWindows(callback,candidates)
+  return candidates[0] if candidates else None
+ def _match_window(self,hwnd,target):
+  if not win32gui or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+   return False
+  if win32gui.IsIconic(hwnd):
+   return False
+  try:
+   title=win32gui.GetWindowText(hwnd)
+  except Exception:
+   title=""
+  if not title:
+   return False
+  exe=""
+  try:
+   _,pid=win32process.GetWindowThreadProcessId(hwnd)
+   exe=psutil.Process(pid).exe().lower()
+  except Exception:
+   exe=""
+  if target and target in exe:
+   return True
+  lower=title.lower()
+  if "ldplayer" in lower or "dnplayer" in lower or "android" in lower:
+   return True
+  return False
+ def _get_rect(self,hwnd):
+  if not hwnd or not win32gui or not win32gui.IsWindow(hwnd):
+   return None
+  try:
+   return win32gui.GetWindowRect(hwnd)
+  except Exception:
+   return None
+ def _is_visible(self,hwnd):
+  if not hwnd or not win32gui:
+   return False
+  if not win32gui.IsWindowVisible(hwnd):
+   return False
+  if win32gui.IsIconic(hwnd):
+   return False
+  placement=None
+  try:
+   placement=win32gui.GetWindowPlacement(hwnd)
+  except Exception:
+   placement=None
+  if placement and len(placement)>1 and win32con:
+   if placement[1]==win32con.SW_SHOWMINIMIZED or placement[1]==win32con.SW_HIDE:
+    return False
+  return True
 class OverlayManager:
  def __init__(self,app):
   self.app=app
@@ -321,8 +434,10 @@ class OverlayManager:
   self.window=Toplevel(self.app.root)
   self.window.overrideredirect(True)
   self.window.attributes("-topmost",True)
-  width,height=self.app.get_emulator_geometry()
-  self.window.geometry(f"{width}x{height}+{self.app.emu_geometry[0]}+{self.app.emu_geometry[1]}")
+  x,y,width,height=self.app.emu_geometry
+  width=max(1,int(width))
+  height=max(1,int(height))
+  self.window.geometry(f"{width}x{height}+{int(x)}+{int(y)}")
   self.window.attributes("-alpha",0.01)
   self.canvas=Canvas(self.window,bg="",highlightthickness=0)
   self.canvas.pack(fill="both",expand=True)
@@ -330,6 +445,7 @@ class OverlayManager:
   self.canvas.bind("<B1-Motion>",self.on_drag)
   self.canvas.bind("<ButtonRelease-1>",self.on_release)
   self.draw_markers()
+  self.update_geometry(x,y,width,height,self.app.emu_visible)
  def close(self):
   if self.window:
    self.window.destroy()
@@ -374,6 +490,26 @@ class OverlayManager:
    r=marker.radius*min(width,height)
    self.canvas.create_oval(x-r,y-r,x+r,y+r,outline=marker.color,width=3,fill=self._fill_color(marker))
    self.canvas.create_text(x,y,text=name,fill="white")
+ def update_geometry(self,x,y,width,height,visible):
+  if not self.window:
+   return
+  w=max(1,int(width))
+  h=max(1,int(height))
+  if not visible or width<=0 or height<=0:
+   try:
+    self.window.withdraw()
+   except Exception:
+    pass
+   return
+  try:
+   self.window.deiconify()
+  except Exception:
+   pass
+  self.window.geometry(f"{w}x{h}+{int(x)}+{int(y)}")
+  if self.canvas:
+   self.canvas.config(width=w,height=h)
+  self.window.update_idletasks()
+  self.draw_markers()
  def _fill_color(self,marker):
   if self.selected==marker:
    return "#40ffffff"
@@ -470,7 +606,7 @@ class FrameCapture:
  def run(self):
   while not self.stop_flag.is_set():
    freq=max(1,min(120,self.app.resource_monitor.frequency))
-   if self.app.get_mode() in [Mode.LEARNING,Mode.TRAINING]:
+   if self.app.get_mode() in [Mode.LEARNING,Mode.TRAINING] and self.app.emu_visible:
     path=self._generate_frame()
     if path:
      self.app.last_frame=str(path)
@@ -575,6 +711,7 @@ class MainApp:
   self.cooldown_state={"skills":"冷却状态","items":"冷却状态","heal":"冷却状态","flash":"冷却状态"}
   self.optimize_button_state=BooleanVar(value=False)
   self.emu_geometry=(0,0,1280,720)
+  self.emu_visible=True
   self.overlay=OverlayManager(self)
   self.default_folder=Path(os.path.expanduser("~"))/"Desktop"/"AAA"
   self.pool=ExperiencePool(self.default_folder)
@@ -593,6 +730,7 @@ class MainApp:
   self.left_controller=HandController("ai-left",self.pool.left_model,["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"])
   self.right_controller=HandController("ai-right",self.pool.right_model,["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"])
   self.mouse_monitor=MouseMonitor(self)
+  self.window_tracker=EmulatorWindowTracker(self)
   self.create_ui()
   self.root.protocol("WM_DELETE_WINDOW",self.stop)
   self.root.bind("<Escape>",lambda e:self.stop())
@@ -721,7 +859,7 @@ class MainApp:
    c=self.data_c
    cooldowns=dict(self.cooldown_state)
    recalling=self.recalling
-  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling,"frame":self.last_frame,"mode_context":self.get_mode()}
+  data={"timestamp":time.time(),"source":source,"hero_alive":hero_alive,"A":a,"B":b,"C":c,"cooldowns":cooldowns,"geometry":self.emu_geometry,"markers":self.overlay.get_markers_data(),"recalling":recalling,"frame":self.last_frame,"mode_context":self.get_mode(),"window_visible":self.emu_visible}
   if extra:
    data.update(extra)
   self.pool.record(data)
@@ -1011,6 +1149,13 @@ class MainApp:
   self.overlay.load_markers(self.pool.config_manager.data.get('markers',{}))
   self.ensure_default_markers()
   self.status_var.set('配置已加载')
+ def update_emulator_geometry(self,x,y,width,height,visible):
+  geometry=(int(x),int(y),max(0,int(width)),max(0,int(height)))
+  changed=geometry!=self.emu_geometry or visible!=self.emu_visible
+  self.emu_geometry=geometry
+  self.emu_visible=visible
+  if changed:
+   self.overlay.update_geometry(geometry[0],geometry[1],geometry[2],geometry[3],visible)
  def get_emulator_geometry(self):
   return self.emu_geometry[2],self.emu_geometry[3]
  def stop(self):
@@ -1019,6 +1164,7 @@ class MainApp:
   self.right_controller.stop()
   self.frame_capture.stop()
   self.mouse_monitor.stop()
+  self.window_tracker.stop()
   self.root.quit()
  def monitor_user_action(self,event=None):
   self.last_input=time.time()
