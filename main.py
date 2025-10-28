@@ -525,8 +525,11 @@ class MouseMonitor:
    except queue.Empty:
     continue
    self.app.last_input=time.time()
-   if self.app.get_mode()==Mode.LEARNING:
-    payload={"mode":"learning","event":event.get("type"),"position":[event.get("x",0),event.get("y",0)],"event_time":event.get("time",time.time())}
+   mode=self.app.get_mode()
+   if mode==Mode.TRAINING:
+    self.app.request_training_interrupt()
+   if mode in [Mode.LEARNING,Mode.TRAINING]:
+    payload={"mode":"learning" if mode==Mode.LEARNING else "training-user","event":event.get("type"),"position":[event.get("x",0),event.get("y",0)],"event_time":event.get("time",time.time())}
     if event.get("type")=="click":
      payload["button"]=event.get("button","")
      payload["pressed"]=event.get("pressed",False)
@@ -636,6 +639,11 @@ class MainApp:
  def get_mode(self):
   with self.mode_lock:
    return self.mode
+ def request_training_interrupt(self):
+  self.root.after(0,self.handle_training_interrupt)
+ def handle_training_interrupt(self):
+  if self.get_mode()==Mode.TRAINING:
+   self.start_learning()
  def ensure_default_markers(self):
   specs=[("移动轮盘","red","drag",False),("回城","orange","click",False),("闪现","yellow","drag",True),("恢复","green","click",True),("普攻","blue","click",False),("一技能","indigo","mixed",True),("二技能","indigo","mixed",True),("三技能","indigo","mixed",True),("四技能","indigo","mixed",True),("取消施法","black","drag_in",False),("主动装备","purple","click",True),("数据A","white","observe",False),("数据B","white","observe",False),("数据C","white","observe",False)]
   for name,color,interaction,cooldown in specs:
@@ -720,6 +728,7 @@ class MainApp:
    self.simulate_ai_action()
    self.record_event("ai",{"mode":"training"})
    time.sleep(1/max(1,self.resource_monitor.frequency))
+  self.training_thread=None
  def update_state(self,a,b,c,alive,skills,items,heal,flash):
   def apply():
    with self.state_lock:
@@ -909,12 +918,10 @@ class MainApp:
   self.root.quit()
  def monitor_user_action(self,event=None):
   self.last_input=time.time()
-  mode=self.get_mode()
-  if mode==Mode.TRAINING:
-   self.set_mode(Mode.LEARNING)
-   self.status_var.set('采集中')
+  if self.get_mode()==Mode.TRAINING:
    self.start_learning()
-  if mode==Mode.LEARNING and event is not None:
+   return
+  if self.get_mode()==Mode.LEARNING and event is not None and not hasattr(event,'keysym'):
    payload={'mode':'learning','event':'ui','position':[getattr(event,'x',0),getattr(event,'y',0)],'widget':str(getattr(event,'widget',''))}
    self.record_event('user-ui',payload)
  def scheduler_event_bindings(self):
