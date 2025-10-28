@@ -638,6 +638,15 @@ class MainApp:
  def set_progress(self,value):
   self.progress_var.set(value)
   self.progress_text_var.set(f"{int(value)}%")
+ def wait_thread(self,attr):
+  thread=getattr(self,attr)
+  if thread and thread.is_alive():
+   for _ in range(200):
+    thread.join(timeout=0.01)
+    if not thread.is_alive():
+     break
+  if not thread or not thread.is_alive():
+   setattr(self,attr,None)
  def set_mode(self,mode):
   with self.mode_lock:
    self.mode=mode
@@ -693,9 +702,10 @@ class MainApp:
    freq=str(self.resource_monitor.frequency)
    self.root.after(0,lambda value=freq:self.freq_var.set(value))
  def start_learning(self):
+  self.set_mode(Mode.LEARNING)
+  self.wait_thread('training_thread')
   if self.learning_thread and self.learning_thread.is_alive():
    return
-  self.set_mode(Mode.LEARNING)
   self.status_var.set("采集中")
   self.learning_thread=threading.Thread(target=self.learning_loop,daemon=True)
   self.learning_thread.start()
@@ -723,8 +733,7 @@ class MainApp:
    return
   self.set_mode(Mode.TRAINING)
   self.status_var.set("AI执行中")
-  if self.learning_thread and self.learning_thread.is_alive():
-   self.learning_thread=None
+  self.wait_thread('learning_thread')
   if self.training_thread and self.training_thread.is_alive():
    return
   self.training_thread=threading.Thread(target=self.training_loop,daemon=True)
@@ -792,9 +801,11 @@ class MainApp:
     self.recalling=False
    time.sleep(2)
  def on_optimize(self):
-  if self.get_mode() not in [Mode.LEARNING,Mode.TRAINING]:
+  if self.get_mode()!=Mode.LEARNING:
    return
   self.set_mode(Mode.OPTIMIZING)
+  self.wait_thread('learning_thread')
+  self.wait_thread('training_thread')
   self.status_var.set('优化中')
   self.set_progress(0)
   def callback(progress):
@@ -855,6 +866,7 @@ class MainApp:
   if self.get_mode()!=Mode.LEARNING:
    return
   self.set_mode(Mode.CONFIG)
+  self.wait_thread('learning_thread')
   self.status_var.set('配置中')
   self.overlay.open()
   config_window=Toplevel(self.root)
