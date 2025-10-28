@@ -24,12 +24,13 @@ except ImportError:
  subprocess.check_call([sys.executable,"-m","pip","install","pynput"])
  from pynput import mouse
 try:
- from tkinter import Tk,Toplevel,Label,Button,StringVar,DoubleVar,BooleanVar,Canvas,Scale,HORIZONTAL
+ from tkinter import Tk,Toplevel,Label,Button,StringVar,DoubleVar,BooleanVar,Canvas,Listbox,Scale,HORIZONTAL
  from tkinter import ttk
  from tkinter.filedialog import askdirectory
  from tkinter.messagebox import showinfo,askyesno
 except ImportError:
  import tkinter
+ Listbox=tkinter.Listbox
  from tkinter import ttk
  from tkinter.filedialog import askdirectory
  from tkinter.messagebox import showinfo,askyesno
@@ -342,6 +343,11 @@ class OverlayManager:
   for name,marker in self.markers.items():
    result[name]={"color":marker.color,"x":marker.x,"y":marker.y,"radius":marker.radius,"interaction":marker.interaction,"cooldown":marker.cooldown}
   return result
+ def select_marker(self,name):
+  marker=self.markers.get(name)
+  if marker:
+   self.selected=marker
+   self.draw_markers()
  def _marker_from_data(self,name,data):
   marker=Marker(name,data.get("color","white"))
   marker.x=data.get("x",0.5)
@@ -853,20 +859,106 @@ class MainApp:
   self.overlay.open()
   config_window=Toplevel(self.root)
   config_window.title('标志管理')
-  list_var=StringVar(value='')
-  def refresh_list():
-   list_var.set('\n'.join(self.overlay.markers.keys()))
-  Label(config_window,textvariable=list_var,justify='left').pack()
+  listbox=Listbox(config_window,exportselection=False)
+  listbox.pack(fill='both',expand=True)
+  name_var=StringVar(value='')
+  entry=ttk.Entry(config_window,textvariable=name_var)
+  entry.pack(fill='x')
+  def current_selection():
+   sel=listbox.curselection()
+   if not sel:
+    return None
+   try:
+    return listbox.get(sel[0])
+   except Exception:
+    return None
+  def refresh_list(selected=None):
+   listbox.delete(0,'end')
+   for key in self.overlay.markers.keys():
+    listbox.insert('end',key)
+   if selected and selected in self.overlay.markers:
+    keys=list(self.overlay.markers.keys())
+    idx=keys.index(selected)
+    listbox.selection_set(idx)
+    listbox.activate(idx)
+    name_var.set(selected)
+   elif self.overlay.selected:
+    for idx,key in enumerate(self.overlay.markers.keys()):
+     if self.overlay.markers[key]==self.overlay.selected:
+      listbox.selection_set(idx)
+      listbox.activate(idx)
+      name_var.set(key)
+      break
+   elif not self.overlay.markers:
+    name_var.set('')
+   else:
+    name_var.set('')
+  def on_select(event):
+   name=current_selection()
+   if not name:
+    name_var.set('')
+    self.overlay.selected=None
+    self.overlay.draw_markers()
+    return
+   marker=self.overlay.markers.get(name)
+   if marker:
+    self.overlay.selected=marker
+    name_var.set(name)
+    self.overlay.draw_markers()
+  listbox.bind('<<ListboxSelect>>',on_select)
   def add_marker():
    name=f'标志{len(self.overlay.markers)+1}'
+   base=name
+   counter=1
+   while name in self.overlay.markers:
+    counter+=1
+    name=f'{base}_{counter}'
    marker=Marker(name,'white')
    marker.x=0.5
    marker.y=0.5
    marker.radius=0.1
    self.overlay.markers[name]=marker
+   self.overlay.selected=marker
    self.overlay.draw_markers()
-   refresh_list()
+   refresh_list(name)
+  def rename_marker():
+   old=current_selection()
+   new=name_var.get().strip()
+   if not old or not new or new==old:
+    return
+   if new in self.overlay.markers:
+    showinfo('提示','名称已存在')
+    refresh_list(old)
+    return
+   items=list(self.overlay.markers.items())
+   new_dict={}
+   marker=None
+   for key,value in items:
+    if key==old:
+     marker=value
+     marker.name=new
+     new_dict[new]=marker
+    else:
+     new_dict[key]=value
+   if not marker:
+    return
+   self.overlay.markers=new_dict
+   self.overlay.selected=marker
+   self.overlay.draw_markers()
+   refresh_list(new)
+  def delete_marker():
+   name=current_selection()
+   if not name:
+    return
+   marker=self.overlay.markers.pop(name,None)
+   if marker:
+    if self.overlay.selected==marker:
+     self.overlay.selected=None
+    self.overlay.draw_markers()
+    refresh_list()
   Button(config_window,text='添加标志',command=add_marker).pack(fill='x')
+  Button(config_window,text='重命名',command=rename_marker).pack(fill='x')
+  Button(config_window,text='删除标志',command=delete_marker).pack(fill='x')
   def save_and_close():
    self.save_markers()
    showinfo('提示','配置已保存')
