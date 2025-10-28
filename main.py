@@ -26,6 +26,11 @@ except ImportError:
  subprocess.check_call([sys.executable,"-m","pip","install","pynput"])
  from pynput import mouse
 try:
+ import mss
+except ImportError:
+ subprocess.check_call([sys.executable,"-m","pip","install","mss"])
+ import mss
+try:
  from tkinter import Tk,Toplevel,Label,Button,StringVar,DoubleVar,BooleanVar,Canvas,Listbox,Scale,HORIZONTAL
  from tkinter import ttk
  from tkinter.filedialog import askdirectory
@@ -614,9 +619,25 @@ class FrameCapture:
  def _generate_frame(self):
   try:
    width,height=self.app.get_emulator_geometry()
-   width=max(10,int(width))
-   height=max(10,int(height))
-   image=Image.new("RGB",(width,height),(random.randint(0,255),random.randint(0,255),random.randint(0,255)))
+   width=max(1,int(width))
+   height=max(1,int(height))
+   image=None
+   if platform.system()=="Windows" and width>0 and height>0:
+    left=int(self.app.emu_geometry[0])
+    top=int(self.app.emu_geometry[1])
+    if hasattr(self.app,"emulator_tracker") and self.app.emulator_tracker.handle and win32gui:
+     rect=self.app.emulator_tracker._get_rect(self.app.emulator_tracker.handle)
+     if rect:
+      left=int(rect[0])
+      top=int(rect[1])
+      width=max(1,int(rect[2]-rect[0]))
+      height=max(1,int(rect[3]-rect[1]))
+    with mss.mss() as sct:
+     monitor={"left":left,"top":top,"width":width,"height":height}
+     shot=sct.grab(monitor)
+     image=Image.frombytes("RGB",shot.size,shot.rgb)
+   if image is None:
+    image=Image.new("RGB",(width,height),(random.randint(0,255),random.randint(0,255),random.randint(0,255)))
    timestamp=int(time.time()*1000)
    self.app.pool.frames_folder.mkdir(exist_ok=True)
    path=self.app.pool.frames_folder/f"frame_{timestamp}.png"
