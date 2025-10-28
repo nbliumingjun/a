@@ -33,6 +33,11 @@ except ImportError:
  subprocess.check_call([sys.executable,"-m","pip","install","mss"])
  import mss
 try:
+ import numpy as np
+except ImportError:
+ subprocess.check_call([sys.executable,"-m","pip","install","numpy"])
+ import numpy as np
+try:
  from tkinter import Tk,Toplevel,Label,Button,StringVar,DoubleVar,BooleanVar,Canvas,Listbox,Scale,HORIZONTAL
  from tkinter import ttk
  from tkinter.filedialog import askdirectory
@@ -274,6 +279,232 @@ class ReinforcementAnalyzer:
   enhanced_c=avg_c+self.deep_learning_scale*adaptive*3
   metrics={"A":int(round(enhanced_a)),"B":int(round(regularized_b)),"C":int(round(enhanced_c))}
   return metrics,marker_stats
+class OptimizationCancelled(Exception):
+ pass
+class RLNetwork:
+ def __init__(self,input_size,output_size,hidden,regularization,adaptive_rate,neuroplasticity):
+  self.input_size=input_size
+  self.output_size=output_size
+  self.hidden=hidden
+  self.regularization=regularization
+  self.adaptive_rate=adaptive_rate
+  self.neuroplasticity=neuroplasticity
+  self._init_weights()
+ def _init_weights(self):
+  rng=np.random.default_rng()
+  self.w1=np.asarray(rng.normal(scale=0.05,size=(self.input_size,self.hidden)),dtype=np.float32)
+  self.b1=np.zeros(self.hidden,dtype=np.float32)
+  self.w2=np.asarray(rng.normal(scale=0.05,size=(self.hidden,self.output_size)),dtype=np.float32)
+  self.b2=np.zeros(self.output_size,dtype=np.float32)
+ def load(self,path):
+  try:
+   expected=(self.input_size*self.hidden+self.hidden+self.hidden*self.output_size+self.output_size)
+   data=path.read_bytes()
+   if len(data)==expected*4:
+    array=np.frombuffer(data,dtype=np.float32)
+    idx=0
+    size=self.input_size*self.hidden
+    self.w1=array[idx:idx+size].reshape(self.input_size,self.hidden)
+    idx+=size
+    self.b1=array[idx:idx+self.hidden]
+    idx+=self.hidden
+    size=self.hidden*self.output_size
+    self.w2=array[idx:idx+size].reshape(self.hidden,self.output_size)
+    idx+=size
+    self.b2=array[idx:idx+self.output_size]
+  except Exception:
+   self._init_weights()
+ def _forward(self,states):
+  z1=np.matmul(states,self.w1)+self.b1
+  hidden=np.tanh(z1)
+  output=np.matmul(hidden,self.w2)+self.b2
+  return output,hidden
+ def forward(self,states):
+  return self._forward(states)[0]
+ def train_dqn(self,transitions,epochs,batch_size,base_lr,gamma):
+  if not transitions:
+   return 0.0
+  total=0.0
+  transitions=list(transitions)
+  for epoch in range(max(1,epochs)):
+   if len(transitions)>1:
+    random.shuffle(transitions)
+   lr=base_lr/(1.0+epoch*self.adaptive_rate)
+   lr=max(lr*self.neuroplasticity,1e-5)
+   for start in range(0,len(transitions),batch_size):
+    batch=transitions[start:start+batch_size]
+    states=np.asarray([t[0] for t in batch],dtype=np.float32)
+    actions=np.asarray([t[1] for t in batch],dtype=np.int64)
+    rewards=np.asarray([t[2] for t in batch],dtype=np.float32)
+    next_states=np.asarray([t[3] for t in batch],dtype=np.float32)
+    dones=np.asarray([t[4] for t in batch],dtype=np.float32)
+    q,hidden=self._forward(states)
+    next_q=self.forward(next_states)
+    targets=q.copy()
+    max_next=np.max(next_q,axis=1)
+    targets[np.arange(len(batch)),actions]=rewards+(1.0-dones)*gamma*max_next
+    error=q-targets
+    mask=np.zeros_like(error)
+    mask[np.arange(len(batch)),actions]=1.0
+    filtered=error*mask
+    loss=np.mean((filtered[np.arange(len(batch)),actions])**2)*0.5 if len(batch)>0 else 0.0
+    total+=loss
+    grad_output=filtered/max(1,len(batch))
+    grad_w2=np.matmul(hidden.T,grad_output)+self.regularization*self.w2
+    grad_b2=np.sum(grad_output,axis=0)
+    delta_hidden=np.matmul(grad_output,self.w2.T)*(1.0-hidden**2)
+    grad_w1=np.matmul(states.T,delta_hidden)+self.regularization*self.w1
+    grad_b1=np.sum(delta_hidden,axis=0)
+    self.w2-=lr*grad_w2
+    self.b2-=lr*grad_b2
+    self.w1-=lr*grad_w1
+    self.b1-=lr*grad_b1
+  return total
+ def train_supervised(self,samples,epochs,batch_size,base_lr):
+  if not samples:
+   return 0.0
+  total=0.0
+  samples=list(samples)
+  for epoch in range(max(1,epochs)):
+   if len(samples)>1:
+    random.shuffle(samples)
+   lr=base_lr/(1.0+epoch*self.adaptive_rate)
+   lr=max(lr*self.neuroplasticity,1e-5)
+   for start in range(0,len(samples),batch_size):
+    batch=samples[start:start+batch_size]
+    states=np.asarray([s[0] for s in batch],dtype=np.float32)
+    targets=np.asarray([s[1] for s in batch],dtype=np.float32)
+    outputs,hidden=self._forward(states)
+    error=outputs-targets
+    loss=np.mean(error**2)*0.5 if len(batch)>0 else 0.0
+    total+=loss
+    grad_output=error/max(1,len(batch))
+    grad_w2=np.matmul(hidden.T,grad_output)+self.regularization*self.w2
+    grad_b2=np.sum(grad_output,axis=0)
+    delta_hidden=np.matmul(grad_output,self.w2.T)*(1.0-hidden**2)
+    grad_w1=np.matmul(states.T,delta_hidden)+self.regularization*self.w1
+    grad_b1=np.sum(delta_hidden,axis=0)
+    self.w2-=lr*grad_w2
+    self.b2-=lr*grad_b2
+    self.w1-=lr*grad_w1
+    self.b1-=lr*grad_b1
+  return total
+ def serialize(self):
+  data=np.concatenate([self.w1.reshape(-1),self.b1,self.w2.reshape(-1),self.b2]).astype(np.float32)
+  return data.tobytes()
+class RLTrainer:
+ def __init__(self,pool,analyzer,records,progress_callback,cancel_flag):
+  self.pool=pool
+  self.analyzer=analyzer
+  self.records=records
+  self.progress_callback=progress_callback
+  self.cancel_flag=cancel_flag
+  self.left_actions=["移动轮盘拖动","移动轮盘旋转","移动轮盘校准"]
+  self.right_actions=["普攻","施放技能","回城","恢复","闪现","主动装备","取消施法"]
+  self.frame_cache={}
+  self.state_dim=0
+  self.vision_dim=0
+ def _check_cancel(self):
+  if self.cancel_flag.is_set():
+   raise OptimizationCancelled()
+ def _notify(self,value):
+  if self.progress_callback:
+   self.progress_callback(max(0,min(100,int(value))))
+ def _frame_vector(self,path):
+  if not path or not os.path.exists(path):
+   return [0.0]*144
+  if path in self.frame_cache:
+   return self.frame_cache[path]
+  try:
+   with Image.open(path) as img:
+    arr=np.asarray(img.convert("L").resize((16,9)),dtype=np.float32)/255.0
+  except Exception:
+   arr=np.zeros((9,16),dtype=np.float32)
+  flat=arr.reshape(-1).astype(np.float32)
+  self.frame_cache[path]=flat.tolist()
+  return self.frame_cache[path]
+ def _state_vector(self,record):
+  geometry=record.get("geometry",[0,0,1,1])
+  width=float(geometry[2]) if len(geometry)>2 else 1.0
+  height=float(geometry[3]) if len(geometry)>3 else 1.0
+  cooldowns=record.get("cooldowns",{})
+  features=[float(record.get("A",0))/100.0,float(record.get("B",0))/100.0,float(record.get("C",0))/100.0,1.0 if record.get("hero_alive",True) else 0.0,1.0 if record.get("recalling",False) else 0.0,width/1920.0,height/1080.0]
+  skills=cooldowns.get("skills","可用")
+  items=cooldowns.get("items","可用")
+  heal=cooldowns.get("heal","可用")
+  flash=cooldowns.get("flash","可用")
+  for value in [skills,items,heal,flash]:
+   features.append(0.0 if value=="可用" else 1.0)
+  frame_vec=self._frame_vector(record.get("frame",""))
+  features.extend(frame_vec)
+  return features
+ def _reward(self,previous,current):
+  delta_a=float(current.get("A",0))-float(previous.get("A",0))
+  delta_b=float(current.get("B",0))-float(previous.get("B",0))
+  delta_c=float(current.get("C",0))-float(previous.get("C",0))
+  reward=delta_a*1.5-delta_b*1.2+delta_c*1.0
+  if not current.get("hero_alive",True):
+   reward-=3.0
+  if current.get("recalling",False):
+   reward-=1.0
+  return reward
+ def _build_transitions(self):
+  sorted_records=sorted(self.records,key=lambda r:r.get("timestamp",0))
+  left_transitions=[]
+  right_transitions=[]
+  vision_samples=[]
+  last_state=None
+  last_metrics={"A":0,"B":0,"C":0,"hero_alive":True,"recalling":False}
+  pending_left=None
+  pending_right=None
+  for record in sorted_records:
+   self._check_cancel()
+   state=self._state_vector(record)
+   self.state_dim=len(state)
+   metrics={"A":record.get("A",0),"B":record.get("B",0),"C":record.get("C",0),"hero_alive":record.get("hero_alive",True),"recalling":record.get("recalling",False)}
+   vision_target=[1.0 if metrics["hero_alive"] else 0.0,float(metrics["A"])/100.0,float(metrics["B"])/100.0,float(metrics["C"])/100.0]
+   vision_samples.append((state,vision_target))
+   if pending_left:
+    reward=self._reward(pending_left["metrics"],metrics)
+    done=0.0 if metrics["hero_alive"] else 1.0
+    left_transitions.append((pending_left["state"],pending_left["action"],reward,state,done))
+    pending_left=None
+   if pending_right:
+    reward=self._reward(pending_right["metrics"],metrics)
+    done=0.0 if metrics["hero_alive"] else 1.0
+    right_transitions.append((pending_right["state"],pending_right["action"],reward,state,done))
+    pending_right=None
+   source=str(record.get("source",""))
+   action=str(record.get("action",""))
+   pre_state=last_state if last_state is not None else state
+   pre_metrics=last_metrics
+   if source=="ai-left" and action in self.left_actions:
+    pending_left={"state":pre_state,"action":self.left_actions.index(action),"metrics":pre_metrics}
+   if source=="ai-right" and action in self.right_actions:
+    pending_right={"state":pre_state,"action":self.right_actions.index(action),"metrics":pre_metrics}
+   last_state=state
+   last_metrics=metrics
+  self.vision_dim=4
+  return left_transitions,right_transitions,vision_samples
+ def execute(self):
+  self._notify(5)
+  left_transitions,right_transitions,vision_samples=self._build_transitions()
+  self._notify(15)
+  metrics,marker_stats=self.analyzer.evaluate(self.records)
+  input_dim=self.state_dim if self.state_dim>0 else 144+11
+  left_net=RLNetwork(input_dim,len(self.left_actions),64,0.0005,0.2,1.1)
+  right_net=RLNetwork(input_dim,len(self.right_actions),96,0.0005,0.25,1.05)
+  vision_net=RLNetwork(input_dim,self.vision_dim,128,0.0003,0.15,1.2)
+  left_net.load(self.pool.left_model)
+  right_net.load(self.pool.right_model)
+  vision_net.load(self.pool.vision_model)
+  left_net.train_dqn(left_transitions,10,32,0.01,0.95)
+  self._notify(55)
+  right_net.train_dqn(right_transitions,10,32,0.01,0.95)
+  self._notify(85)
+  vision_net.train_supervised(vision_samples,8,64,0.008)
+  self._notify(100)
+  return metrics,marker_stats,{self.pool.left_model:left_net.serialize(),self.pool.right_model:right_net.serialize(),self.pool.vision_model:vision_net.serialize()}
 class AIModelHandler:
  def __init__(self,experience_pool):
   self.pool=experience_pool
@@ -282,32 +513,36 @@ class AIModelHandler:
   self.thread=None
   self.cancel_flag=threading.Event()
   self.analyzer=ReinforcementAnalyzer()
-  self.last_marker_stats={}
-  self.last_metrics={"A":0,"B":0,"C":0}
+ self.last_marker_stats={}
+ self.last_metrics={"A":0,"B":0,"C":0}
  def optimize(self,callback=None,done=None):
   if self.optimizing:
    return
   self.optimizing=True
   self.progress=0
   self.cancel_flag.clear()
-  steps=self.pool.config_manager.data.get("optimize_steps",100)
   def run():
    records=self.pool.get_records()
-   for i in range(steps):
-    if self.cancel_flag.is_set():
-     self.progress=0
-     self.optimizing=False
-     if done:
-      done(False)
-     return
-    time.sleep(0.05)
-    self.progress=int((i+1)/steps*100)
-    if callback:
-     callback(self.progress)
-   metrics,marker_stats=self.analyzer.evaluate(records)
-   models=[self.pool.left_model,self.pool.right_model,self.pool.vision_model]
-   for m in models:
-    m.write_bytes(os.urandom(2048))
+   trainer=RLTrainer(self.pool,self.analyzer,records,lambda value:self._update_progress(value,callback),self.cancel_flag)
+   try:
+    metrics,marker_stats,payload=trainer.execute()
+   except OptimizationCancelled:
+    self.progress=0
+    self.optimizing=False
+    if done:
+     done(False)
+    return
+   except Exception:
+    self.progress=0
+    self.optimizing=False
+    if done:
+     done(False)
+    return
+   for path,data in payload.items():
+    try:
+     path.write_bytes(data)
+    except Exception:
+     path.write_bytes(os.urandom(max(1024,len(data) if data else 0)))
    self.pool.update_metrics(metrics)
    self.last_marker_stats=marker_stats
    self.last_metrics=metrics
@@ -316,6 +551,10 @@ class AIModelHandler:
     done(True)
   self.thread=threading.Thread(target=run,daemon=True)
   self.thread.start()
+  def _update_progress(self,value,callback):
+   self.progress=max(0,min(100,int(value)))
+   if callback:
+    callback(self.progress)
  def cancel(self):
   if self.optimizing:
    self.cancel_flag.set()
@@ -740,38 +979,65 @@ class FrameCapture:
  def __init__(self,app):
   self.app=app
   self.stop_flag=threading.Event()
+  self.fail_count=0
+  self.last_error_time=0
+  self.suspend_until=0
+  self.notified=False
   self.thread=threading.Thread(target=self.run,daemon=True)
   self.thread.start()
  def run(self):
   while not self.stop_flag.is_set():
    freq=max(1,min(120,self.app.resource_monitor.frequency))
+   if time.time()<self.suspend_until:
+    time.sleep(min(0.5,1/max(1,freq)))
+    continue
    if self.app.get_mode() in [Mode.LEARNING,Mode.TRAINING] and self.app.emu_visible:
     path=self._generate_frame()
     if path:
      self.app.last_frame=str(path)
+    else:
+     self.app.last_frame=""
    time.sleep(1/max(1,freq))
  def _generate_frame(self):
   try:
    width,height=self.app.get_emulator_geometry()
    width=max(1,int(width))
    height=max(1,int(height))
-   image=None
-   if platform.system()=="Windows" and width>0 and height>0:
-    left=int(self.app.emu_geometry[0])
-    top=int(self.app.emu_geometry[1])
-    if hasattr(self.app,"emulator_tracker") and self.app.emulator_tracker.handle and win32gui:
-     rect=self.app.emulator_tracker._get_rect(self.app.emulator_tracker.handle)
-     if rect:
-      left=int(rect[0])
-      top=int(rect[1])
-      width=max(1,int(rect[2]-rect[0]))
-      height=max(1,int(rect[3]-rect[1]))
+   for attempt in range(3):
+    image=self._capture_image(width,height)
+    if image:
+     path=self._save_image(image)
+     if path:
+      self._handle_success()
+      return path
+    time.sleep(0.05)
+   self._handle_failure()
+   return None
+  except Exception:
+   self._handle_failure()
+   return None
+ def _capture_image(self,width,height):
+  if platform.system()=="Windows" and width>0 and height>0:
+   left=int(self.app.emu_geometry[0])
+   top=int(self.app.emu_geometry[1])
+   if hasattr(self.app,"emulator_tracker") and self.app.emulator_tracker.handle and win32gui:
+    rect=self.app.emulator_tracker._get_rect(self.app.emulator_tracker.handle)
+    if rect:
+     left=int(rect[0])
+     top=int(rect[1])
+     width=max(1,int(rect[2]-rect[0]))
+     height=max(1,int(rect[3]-rect[1]))
+   try:
     with mss.mss() as sct:
      monitor={"left":left,"top":top,"width":width,"height":height}
      shot=sct.grab(monitor)
-     image=Image.frombytes("RGB",shot.size,shot.rgb)
-   if image is None:
-    image=Image.new("RGB",(width,height),(random.randint(0,255),random.randint(0,255),random.randint(0,255)))
+     if shot.width>0 and shot.height>0:
+      return Image.frombytes("RGB",shot.size,shot.rgb)
+   except Exception:
+    return None
+  return None
+ def _save_image(self,image):
+  try:
    timestamp=int(time.time()*1000)
    self.app.pool.frames_folder.mkdir(exist_ok=True)
    path=self.app.pool.frames_folder/f"frame_{timestamp}.png"
@@ -788,6 +1054,32 @@ class FrameCapture:
    return path
   except Exception:
    return None
+ def _handle_failure(self):
+  self.fail_count+=1
+  if self.fail_count>=3:
+   self.suspend_until=time.time()+2
+   if not self.notified or time.time()-self.last_error_time>1:
+    self.last_error_time=time.time()
+    self.notified=True
+    self.app.root.after(0,lambda:self.app.status_var.set("截屏失败，请检查窗口和权限"))
+ def _handle_success(self):
+  if self.fail_count>0:
+   self.fail_count=0
+  if self.suspend_until>0:
+   self.suspend_until=0
+  if self.notified:
+   self.notified=False
+   self.app.root.after(0,self._restore_status)
+ def _restore_status(self):
+  mode=self.app.get_mode()
+  if mode==Mode.LEARNING:
+   self.app.status_var.set("采集中")
+  elif mode==Mode.TRAINING:
+   self.app.status_var.set("AI执行中")
+  elif mode==Mode.OPTIMIZING:
+   self.app.status_var.set("优化中")
+  elif mode==Mode.CONFIG:
+   self.app.status_var.set("配置中")
  def stop(self):
   self.stop_flag.set()
 class MouseMonitor:
